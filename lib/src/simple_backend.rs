@@ -372,7 +372,7 @@ pub fn commit_to_proto(commit: &Commit) -> crate::protos::simple_store::Commit {
     proto
 }
 
-fn commit_from_proto(mut proto: crate::protos::simple_store::Commit) -> Commit {
+pub(crate) fn commit_from_proto(mut proto: crate::protos::simple_store::Commit) -> Commit {
     // Note how .take() sets the secure_sig field to None before we encode the data.
     // Needs to be done first since proto is partially moved a bunch below
     let secure_sig = proto.secure_sig.take().map(|sig| SecureSig {
@@ -399,7 +399,7 @@ fn commit_from_proto(mut proto: crate::protos::simple_store::Commit) -> Commit {
     }
 }
 
-fn tree_to_proto(tree: &Tree) -> crate::protos::simple_store::Tree {
+pub(crate) fn tree_to_proto(tree: &Tree) -> crate::protos::simple_store::Tree {
     let mut proto = crate::protos::simple_store::Tree::default();
     for entry in tree.entries() {
         proto
@@ -412,7 +412,7 @@ fn tree_to_proto(tree: &Tree) -> crate::protos::simple_store::Tree {
     proto
 }
 
-fn tree_from_proto(proto: crate::protos::simple_store::Tree) -> Tree {
+pub(crate) fn tree_from_proto(proto: crate::protos::simple_store::Tree) -> Tree {
     // Serialized data should be sorted
     let entries = proto
         .entries

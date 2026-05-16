@@ -15,11 +15,13 @@
 mod command_output;
 mod config_schema_defaults;
 mod test_environment;
+mod vex_live;
 
 pub use self::command_output::CommandOutput;
 pub use self::config_schema_defaults::default_config_from_schema;
 pub use self::test_environment::TestEnvironment;
 pub use self::test_environment::TestWorkDir;
+pub use self::vex_live::VexLiveTestHarness;
 
 pub fn fake_bisector_path() -> String {
     let path = assert_cmd::cargo::cargo_bin!("fake-bisector");

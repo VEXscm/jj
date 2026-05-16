@@ -93,6 +93,7 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 regex = { workspace = true }
 ratatui = { workspace = true }
+reqwest = { workspace = true }
 rpassword = { workspace = true }
 sapling-renderdag = { workspace = true }
 sapling-streampager = { workspace = true }
@@ -124,6 +125,7 @@ assert_matches = { workspace = true }
 async-trait = { workspace = true }
 datatest-stable = { workspace = true }
 insta = { workspace = true }
+jj_backend_test_support = { path = "../../jj-backend/crates/jj_backend_test_support" }
 jsonschema = { workspace = true }
 proptest = { workspace = true }
 proptest-state-machine = { workspace = true }

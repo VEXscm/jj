@@ -2744,16 +2744,20 @@ pub fn find_workspace_dir(cwd: &Path) -> &Path {
 fn map_workspace_load_error(err: WorkspaceLoadError, user_wc_path: Option<&str>) -> CommandError {
     match err {
         WorkspaceLoadError::NoWorkspaceHere(wc_path) => {
+            let cli_name = current_cli_name();
+            let repo_name = current_repo_name();
             // Prefer user-specified path instead of absolute wc_path if any.
             let short_wc_path = user_wc_path.map_or(wc_path.as_ref(), Path::new);
-            let message = format!(r#"There is no jj repo in "{}""#, short_wc_path.display());
+            let message = format!(
+                r#"There is no {repo_name} repo in "{}""#,
+                short_wc_path.display()
+            );
             let git_dir = wc_path.join(".git");
             if git_dir.is_dir() {
-                user_error(message).hinted(
-                    "It looks like this is a git repo. You can create a jj repo backed by it by \
-                     running this:
-jj git init",
-                )
+                user_error(message).hinted(format!(
+                    "It looks like this is a git repo. You can create a {repo_name} repo backed \
+                     by it by running this:\n{cli_name} git init"
+                ))
             } else {
                 user_error(message)
             }
@@ -3821,13 +3825,14 @@ fn resolve_default_command(
         } else if let Some(array) = config.get::<Vec<String>>("ui.default-command").optional()? {
             array
         } else {
+            let cli_name = app.get_name();
             writeln!(
                 ui.hint_default(),
-                "Use `jj -h` for a list of available commands."
+                "Use `{cli_name} -h` for a list of available commands."
             )?;
             writeln!(
                 ui.hint_no_heading(),
-                "Run `jj config set --user ui.default-command log` to disable this message."
+                "Run `{cli_name} config set --user ui.default-command log` to disable this message."
             )?;
 
             vec!["log".to_string()]
@@ -3837,6 +3842,23 @@ fn resolve_default_command(
         string_args.splice(1..1, default_command);
     }
     Ok(string_args)
+}
+
+fn current_cli_name() -> String {
+    env::args_os()
+        .next()
+        .and_then(|arg0| Path::new(&arg0).file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "jj".to_string())
+}
+
+fn current_repo_name() -> &'static str {
+    if current_cli_name() == "vex" {
+        "vex"
+    } else {
+        "jj"
+    }
 }
 
 fn resolve_aliases(
@@ -4236,13 +4258,25 @@ impl<'a> CliRunner<'a> {
 
     /// Set the about message to be displayed in help messages.
     pub fn about(mut self, about: &str) -> Self {
-        self.app = self.app.about(about.to_string());
+        self.app = self
+            .app
+            .about(about.to_string())
+            .long_about(about.to_string());
         self
     }
 
     /// Set the version to be displayed by `jj version`.
     pub fn version(mut self, version: &str) -> Self {
         self.app = self.app.version(version.to_string());
+        self
+    }
+
+    /// Applies a transformation to the underlying clap app before parsing.
+    pub fn mutate_app<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Command) -> Command,
+    {
+        self.app = f(self.app);
         self
     }
 

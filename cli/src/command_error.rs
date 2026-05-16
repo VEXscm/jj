@@ -352,6 +352,9 @@ impl From<WorkspaceInitError> for CommandError {
             WorkspaceInitError::CheckOutCommit(err) => {
                 internal_error_with_message("Failed to check out the initial commit", err)
             }
+            WorkspaceInitError::Checkout(err) => {
+                internal_error_with_message("Failed to check out the initial commit", err)
+            }
             WorkspaceInitError::Path(err) => {
                 internal_error_with_message("Failed to access the repository", err)
             }

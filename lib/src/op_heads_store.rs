@@ -157,7 +157,14 @@ where
         return Ok(op_head.clone());
     }
 
-    op_heads.sort_by_key(|op| op.metadata().time.end.timestamp);
+    op_heads.sort_by(|left, right| {
+        left.metadata()
+            .time
+            .end
+            .timestamp
+            .cmp(&right.metadata().time.end.timestamp)
+            .then_with(|| left.id().cmp(right.id()))
+    });
     let new_op = resolver(op_heads).await?;
     let mut old_op_heads = ancestor_op_heads;
     old_op_heads.extend_from_slice(new_op.parent_ids());

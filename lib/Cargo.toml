@@ -48,6 +48,8 @@ indexmap = { workspace = true }
 interim = { workspace = true }
 itertools = { workspace = true }
 jj-lib-proc-macros = { workspace = true }
+jj_backend_api = { path = "../../jj-backend/crates/jj_backend_api" }
+jj_backend_types = { path = "../../jj-backend/crates/jj_backend_types" }
 maplit = { workspace = true }
 once_cell = { workspace = true }
 pest = { workspace = true }
@@ -57,15 +59,19 @@ prost = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rayon = { workspace = true }
+reqwest = { workspace = true }
 ref-cast = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
 smallvec = { workspace = true }
 strsim = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt"] }
 toml_edit = { workspace = true }
+tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-ring"] }
 tracing = { workspace = true }
 watchman_client = { workspace = true, optional = true }
 
@@ -97,7 +103,7 @@ nix = { workspace = true, features = [ "fs" ] }
 [features]
 default = ["git"]
 git = ["dep:gix"]
-watchman = ["dep:watchman_client", "dep:tokio"]
+watchman = ["dep:watchman_client"]
 testing = ["git"]
 
 [lints]

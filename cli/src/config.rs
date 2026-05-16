@@ -714,11 +714,15 @@ pub fn default_config_layers() -> Vec<ConfigLayer> {
     // Syntax error in default config isn't a user error. That's why defaults are
     // loaded by separate builder.
     let parse = |text: &'static str| ConfigLayer::parse(ConfigSource::Default, text).unwrap();
+    let mut misc_layer = parse(include_str!("config/misc.toml"));
+    if current_executable_name().as_deref() == Some("vex") {
+        misc_layer.delete_value("aliases.ci").unwrap();
+    }
     let mut layers = vec![
         parse(include_str!("config/colors.toml")),
         parse(include_str!("config/hints.toml")),
         parse(include_str!("config/merge_tools.toml")),
-        parse(include_str!("config/misc.toml")),
+        misc_layer,
         parse(include_str!("config/revsets.toml")),
         parse(include_str!("config/templates.toml")),
     ];
@@ -729,6 +733,13 @@ pub fn default_config_layers() -> Vec<ConfigLayer> {
         layers.push(parse(include_str!("config/windows.toml")));
     }
     layers
+}
+
+fn current_executable_name() -> Option<String> {
+    env::args_os()
+        .next()
+        .and_then(|arg0| Path::new(&arg0).file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.into_string().ok())
 }
 
 /// Environment variables that override config values

@@ -62,6 +62,7 @@ mod undo;
 mod unsign;
 mod util;
 mod version;
+mod vex;
 mod workspace;
 
 use std::fmt::Debug;
@@ -74,6 +75,8 @@ use clap::builder::styling::AnsiColor;
 use clap_complete::engine::SubcommandCandidates;
 use tracing::instrument;
 
+use self::vex::VexCommand;
+use self::vex::cmd_vex;
 use crate::cli_util::Args;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
@@ -159,6 +162,8 @@ enum Command {
     Util(util::UtilCommand),
     Version(version::VersionArgs),
     #[command(subcommand)]
+    Vex(VexCommand),
+    #[command(subcommand)]
     Workspace(workspace::WorkspaceCommand),
 }
 
@@ -222,6 +227,7 @@ pub async fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<
         Command::Unsign(args) => unsign::cmd_unsign(ui, command_helper, args).await,
         Command::Util(args) => util::cmd_util(ui, command_helper, args).await,
         Command::Version(args) => version::cmd_version(ui, command_helper, args).await,
+        Command::Vex(args) => cmd_vex(ui, command_helper, args).await,
         Command::Workspace(args) => workspace::cmd_workspace(ui, command_helper, args).await,
     }
 }

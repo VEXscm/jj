@@ -39,5 +39,7 @@ mod test_rewrite_duplicate;
 mod test_rewrite_transform;
 mod test_signing;
 mod test_ssh_signing;
+mod test_vex_config;
 mod test_view;
+mod test_virtual_working_copy;
 mod test_workspace;

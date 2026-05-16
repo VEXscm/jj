@@ -18,7 +18,12 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use jj_cli::cli_util::CliRunner;
+use jj_lib::vex::create_store_factories;
 
 fn main() -> std::process::ExitCode {
-    CliRunner::init().version(env!("JJ_VERSION")).run().into()
+    CliRunner::init()
+        .add_store_factories(create_store_factories())
+        .version(env!("JJ_VERSION"))
+        .run()
+        .into()
 }

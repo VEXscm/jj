@@ -71,6 +71,7 @@ use crate::ref_name::WorkspaceNameBuf;
 // BLAKE2b-512 hash length in bytes
 const OPERATION_ID_LENGTH: usize = 64;
 const VIEW_ID_LENGTH: usize = 64;
+const ALT_ID_LENGTH: usize = 32;
 
 /// Error that may occur during [`SimpleOpStore`] initialization.
 #[derive(Debug, Error)]
@@ -392,7 +393,7 @@ fn io_to_write_error(err: PathError, object_type: &'static str) -> OpStoreError 
 }
 
 #[derive(Debug, Error)]
-enum PostDecodeError {
+pub(crate) enum PostDecodeError {
     #[error("Invalid hash length (expected {expected} bytes, got {actual} bytes)")]
     InvalidHashLength { expected: usize, actual: usize },
     #[error("Invalid remote ref state value {0}")]
@@ -402,7 +403,7 @@ enum PostDecodeError {
 }
 
 fn operation_id_from_proto(bytes: Vec<u8>) -> Result<OperationId, PostDecodeError> {
-    if bytes.len() != OPERATION_ID_LENGTH {
+    if bytes.len() != OPERATION_ID_LENGTH && bytes.len() != ALT_ID_LENGTH {
         Err(PostDecodeError::InvalidHashLength {
             expected: OPERATION_ID_LENGTH,
             actual: bytes.len(),
@@ -413,7 +414,7 @@ fn operation_id_from_proto(bytes: Vec<u8>) -> Result<OperationId, PostDecodeErro
 }
 
 fn view_id_from_proto(bytes: Vec<u8>) -> Result<ViewId, PostDecodeError> {
-    if bytes.len() != VIEW_ID_LENGTH {
+    if bytes.len() != VIEW_ID_LENGTH && bytes.len() != ALT_ID_LENGTH {
         Err(PostDecodeError::InvalidHashLength {
             expected: VIEW_ID_LENGTH,
             actual: bytes.len(),
@@ -505,7 +506,9 @@ fn commit_predecessors_map_from_proto(
         .collect()
 }
 
-fn operation_to_proto(operation: &Operation) -> crate::protos::simple_op_store::Operation {
+pub(crate) fn operation_to_proto(
+    operation: &Operation,
+) -> crate::protos::simple_op_store::Operation {
     let (commit_predecessors, stores_commit_predecessors) = match &operation.commit_predecessors {
         Some(map) => (commit_predecessors_map_to_proto(map), true),
         None => (vec![], false),
@@ -520,7 +523,7 @@ fn operation_to_proto(operation: &Operation) -> crate::protos::simple_op_store::
     }
 }
 
-fn operation_from_proto(
+pub(crate) fn operation_from_proto(
     proto: crate::protos::simple_op_store::Operation,
 ) -> Result<Operation, PostDecodeError> {
     let parents = proto
@@ -541,7 +544,7 @@ fn operation_from_proto(
     })
 }
 
-fn view_to_proto(view: &View) -> crate::protos::simple_op_store::View {
+pub(crate) fn view_to_proto(view: &View) -> crate::protos::simple_op_store::View {
     let wc_commit_ids = view
         .wc_commit_ids
         .iter()
@@ -593,7 +596,9 @@ fn view_to_proto(view: &View) -> crate::protos::simple_op_store::View {
     }
 }
 
-fn view_from_proto(proto: crate::protos::simple_op_store::View) -> Result<View, PostDecodeError> {
+pub(crate) fn view_from_proto(
+    proto: crate::protos::simple_op_store::View,
+) -> Result<View, PostDecodeError> {
     // TODO: validate commit id length?
     // For compatibility with old repos before we had support for multiple working
     // copies

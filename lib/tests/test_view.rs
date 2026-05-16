@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use itertools::Itertools as _;
+use jj_lib::config::ConfigLayer;
+use jj_lib::config::ConfigSource;
 use jj_lib::op_store::LocalRemoteRefTarget;
 use jj_lib::op_store::RefTarget;
 use jj_lib::op_store::RemoteRef;
@@ -26,6 +28,7 @@ use jj_lib::ref_name::RemoteRefSymbol;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
+use jj_lib::settings::UserSettings;
 use maplit::btreemap;
 use maplit::hashset;
 use pollster::FutureExt as _;
@@ -47,6 +50,18 @@ where
         name: name.as_ref(),
         remote: remote.as_ref(),
     }
+}
+
+fn fixed_op_timestamp_settings() -> UserSettings {
+    let mut config = testutils::base_user_config();
+    config.add_layer(
+        ConfigLayer::parse(
+            ConfigSource::User,
+            "debug.operation-timestamp = 2001-02-03T04:05:06+07:00",
+        )
+        .unwrap(),
+    );
+    UserSettings::from_config(config).unwrap()
 }
 
 #[test]
@@ -203,6 +218,53 @@ fn test_merge_views_checkout() -> TestResult {
     assert_eq!(repo.view().get_wc_commit_id(&ws5_name), None);
     assert_eq!(repo.view().get_wc_commit_id(&ws6_name), Some(commit2.id()));
     assert_eq!(repo.view().get_wc_commit_id(&ws7_name), Some(commit3.id()));
+    Ok(())
+}
+
+#[test]
+fn test_merge_views_checkout_same_timestamp_uses_op_id_tiebreak() -> TestResult {
+    let settings = fixed_op_timestamp_settings();
+    let test_repo = TestRepo::init_with_settings(&settings);
+    let repo = &test_repo.repo;
+
+    let mut initial_tx = repo.start_transaction();
+    let base_commit = write_random_commit(initial_tx.repo_mut());
+    let left_commit = write_random_commit(initial_tx.repo_mut());
+    let right_commit = write_random_commit(initial_tx.repo_mut());
+    let workspace_name = WorkspaceNameBuf::from("ws1");
+    initial_tx
+        .repo_mut()
+        .set_wc_commit(workspace_name.clone(), base_commit.id().clone())?;
+    let repo = initial_tx.commit("test").block_on()?;
+
+    let mut tx1 = repo.start_transaction();
+    tx1.repo_mut()
+        .set_wc_commit(workspace_name.clone(), left_commit.id().clone())?;
+    let repo1 = tx1.commit("test").block_on()?;
+
+    let mut tx2 = repo.start_transaction();
+    tx2.repo_mut()
+        .set_wc_commit(workspace_name.clone(), right_commit.id().clone())?;
+    let repo2 = tx2.commit("test").block_on()?;
+
+    let merged_repo = repo.loader().load_at_head().block_on()?;
+    let (expected_op_ids, expected_wc_commit) = if repo1.op_id() <= repo2.op_id() {
+        (
+            vec![repo1.op_id().clone(), repo2.op_id().clone()],
+            left_commit.id(),
+        )
+    } else {
+        (
+            vec![repo2.op_id().clone(), repo1.op_id().clone()],
+            right_commit.id(),
+        )
+    };
+
+    assert_eq!(merged_repo.operation().parent_ids(), expected_op_ids);
+    assert_eq!(
+        merged_repo.view().get_wc_commit_id(&workspace_name),
+        Some(expected_wc_commit)
+    );
     Ok(())
 }
 

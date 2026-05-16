@@ -1,0 +1,1183 @@
+// Copyright 2026 The Jujutsu Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![expect(missing_docs)]
+
+use std::collections::HashSet;
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::io::{BufReader, Seek, SeekFrom};
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
+use jj_backend_api::GetCloneManifestRequest;
+use jj_backend_api::GetObjectRequest;
+use jj_backend_api::GetObjectsRequest;
+use jj_backend_api::GetRepoRequest;
+use jj_backend_api::InitRepoRequest;
+use jj_backend_api::ObjectId;
+use jj_backend_api::PutObjectRequest;
+use jj_backend_api::ResolveOperationIdPrefixRequest;
+use jj_backend_api::jj_backend_client::JjBackendClient;
+use jj_backend_types::{
+    CloneManifest, ContentId, ObjectKind, decode_object_pack, decode_object_pack_reader,
+    decode_object_pack_with_visitor,
+};
+use serde::Deserialize;
+use serde::Serialize;
+use tempfile::NamedTempFile;
+use thiserror::Error;
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use tonic::transport::Endpoint;
+use tracing::debug;
+
+use crate::repo::StoreFactories;
+use crate::vex_backend::VexBackend;
+use crate::vex_op_heads_store::VexOpHeadsStore;
+use crate::vex_op_store::VexOpStore;
+
+pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
+pub use jj_backend_types::CloneBlobMode;
+
+#[derive(Debug, Error)]
+pub enum VexConfigError {
+    #[error("vex repo metadata file not found at {0}")]
+    MissingMetadata(PathBuf),
+    #[error("vex repo metadata path has no repo parent: {0}")]
+    InvalidStorePath(PathBuf),
+    #[error("vex repo metadata IO")]
+    Io(#[from] std::io::Error),
+    #[error("vex repo metadata JSON")]
+    Json(#[from] serde_json::Error),
+    #[error("invalid Vex endpoint `{endpoint}`: {message}")]
+    InvalidEndpoint { endpoint: String, message: String },
+    #[error("backend did not return repo information")]
+    MissingRepoInfo,
+}
+
+#[derive(Debug, Error)]
+pub enum VexClientError {
+    #[error(transparent)]
+    Config(#[from] VexConfigError),
+    #[error("cache IO")]
+    Io(#[from] std::io::Error),
+    #[error("failed to start grpc runtime")]
+    Runtime(#[source] std::io::Error),
+    #[error(transparent)]
+    Transport(#[from] tonic::transport::Error),
+    #[error(transparent)]
+    Status(#[from] tonic::Status),
+    #[error("invalid grpc authorization metadata: {0}")]
+    InvalidAuthorizationMetadata(String),
+    #[error("invalid binary pack: {0}")]
+    PackDecode(String),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VexRepoConfig {
+    pub endpoint: String,
+    pub tenant_id: String,
+    pub tenant_slug: String,
+    pub repo_id: String,
+    pub repo_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+}
+
+impl VexRepoConfig {
+    pub fn metadata_path_for_repo(repo_path: &Path) -> PathBuf {
+        repo_path.join("vex.json")
+    }
+
+    pub fn metadata_path_for_store(store_path: &Path) -> Result<PathBuf, VexConfigError> {
+        let repo_path = store_path
+            .parent()
+            .ok_or_else(|| VexConfigError::InvalidStorePath(store_path.to_path_buf()))?;
+        Ok(Self::metadata_path_for_repo(repo_path))
+    }
+
+    pub fn load_from_store_path(store_path: &Path) -> Result<Self, VexConfigError> {
+        let path = Self::metadata_path_for_store(store_path)?;
+        Self::load_from_repo_path(path.parent().unwrap())
+    }
+
+    pub fn load_from_repo_path(repo_path: &Path) -> Result<Self, VexConfigError> {
+        let path = Self::metadata_path_for_repo(repo_path);
+        if !path.exists() {
+            return Err(VexConfigError::MissingMetadata(path));
+        }
+        let text = fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub fn write_to_repo_path(&self, repo_path: &Path) -> Result<(), VexConfigError> {
+        let path = Self::metadata_path_for_repo(repo_path);
+        fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VexClient {
+    config: VexRepoConfig,
+    cache_root: Option<PathBuf>,
+    cache_max_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    path: PathBuf,
+    modified: SystemTime,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PackTransferState {
+    pack_content_id: String,
+    chunk_count: usize,
+    next_chunk_index: usize,
+}
+
+fn shared_cache_root(config: &VexRepoConfig) -> Option<PathBuf> {
+    std::env::var_os("JJ_VEX_SHARED_CACHE_DIR")
+        .map(PathBuf::from)
+        .map(|root| root.join(&config.tenant_id).join(&config.repo_id))
+}
+
+fn cache_max_bytes() -> Option<u64> {
+    std::env::var("JJ_VEX_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+impl VexClient {
+    pub fn from_config(config: VexRepoConfig) -> Result<Self, VexConfigError> {
+        Self::endpoint(&config.endpoint)?;
+        Ok(Self {
+            config,
+            cache_root: None,
+            cache_max_bytes: cache_max_bytes(),
+        })
+    }
+
+    pub fn from_store_path(store_path: &Path) -> Result<Self, VexConfigError> {
+        let config = VexRepoConfig::load_from_store_path(store_path)?;
+        Self::endpoint(&config.endpoint)?;
+        let repo_path = store_path
+            .parent()
+            .ok_or_else(|| VexConfigError::InvalidStorePath(store_path.to_path_buf()))?;
+        let cache_root = shared_cache_root(&config).unwrap_or_else(|| repo_path.join("vex-cache"));
+        fs::create_dir_all(&cache_root)?;
+        Ok(Self {
+            config,
+            cache_root: Some(cache_root),
+            cache_max_bytes: cache_max_bytes(),
+        })
+    }
+
+    pub fn config(&self) -> &VexRepoConfig {
+        &self.config
+    }
+
+    fn cache_path(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PathBuf> {
+        self.cache_root
+            .as_ref()
+            .map(|root| root.join(kind_to_str(kind)).join(content_id.to_string()))
+    }
+
+    fn transfer_state_root(&self) -> Option<PathBuf> {
+        self.cache_root
+            .as_ref()
+            .map(|root| root.join(".transfer-state").join("packs"))
+    }
+
+    fn transfer_state_path(&self, pack_content_id: &ContentId) -> Option<PathBuf> {
+        self.transfer_state_root()
+            .map(|root| root.join(format!("{pack_content_id}.json")))
+    }
+
+    fn transfer_partial_path(&self, pack_content_id: &ContentId) -> Option<PathBuf> {
+        self.transfer_state_root()
+            .map(|root| root.join(format!("{pack_content_id}.part")))
+    }
+
+    fn load_pack_transfer_state(
+        &self,
+        pack_content_id: &ContentId,
+    ) -> Result<Option<PackTransferState>, VexClientError> {
+        let Some(path) = self.transfer_state_path(pack_content_id) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        Ok(Some(
+            serde_json::from_slice(&bytes)
+                .map_err(VexConfigError::Json)
+                .map_err(VexClientError::from)?,
+        ))
+    }
+
+    fn save_pack_transfer_state(
+        &self,
+        pack_content_id: &ContentId,
+        state: &PackTransferState,
+    ) -> Result<(), VexClientError> {
+        let Some(path) = self.transfer_state_path(pack_content_id) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let payload = serde_json::to_vec_pretty(state)
+            .map_err(VexConfigError::Json)
+            .map_err(VexClientError::from)?;
+        fs::write(path, payload)?;
+        Ok(())
+    }
+
+    fn clear_pack_transfer_state(&self, pack_content_id: &ContentId) -> Result<(), VexClientError> {
+        if let Some(state_path) = self.transfer_state_path(pack_content_id) {
+            drop(fs::remove_file(state_path));
+        }
+        if let Some(partial_path) = self.transfer_partial_path(pack_content_id) {
+            drop(fs::remove_file(partial_path));
+        }
+        Ok(())
+    }
+
+    fn read_cached_object(&self, kind: ObjectKind, content_id: &ContentId) -> Option<Vec<u8>> {
+        let path = self.cache_path(kind, content_id)?;
+        let bytes = fs::read(&path).ok()?;
+        debug!(kind = kind_to_str(kind), %content_id, bytes = bytes.len(), cache_path = %path.display(), "vex cache hit");
+        Some(bytes)
+    }
+
+    fn write_cached_object(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+        data: &[u8],
+    ) -> Result<(), VexClientError> {
+        let Some(path) = self.cache_path(kind, content_id) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut temp = NamedTempFile::new_in(path.parent().expect("cache file has parent"))?;
+        use std::io::Write as _;
+        temp.write_all(data)?;
+        temp.flush()?;
+        temp.persist(&path).map_err(|err| err.error)?;
+        debug!(kind = kind_to_str(kind), %content_id, bytes = data.len(), cache_path = %path.display(), "vex cache write");
+        self.prune_cache_if_needed()?;
+        Ok(())
+    }
+
+    fn prune_cache_if_needed(&self) -> Result<(), VexClientError> {
+        let (Some(cache_root), Some(limit_bytes)) = (&self.cache_root, self.cache_max_bytes) else {
+            return Ok(());
+        };
+        let mut entries = Vec::new();
+        collect_cache_entries(cache_root, &mut entries)?;
+        let mut total_bytes = entries.iter().map(|entry| entry.size_bytes).sum::<u64>();
+        if total_bytes <= limit_bytes {
+            return Ok(());
+        }
+        entries.sort_by_key(|entry| entry.modified);
+        let target_bytes = limit_bytes.saturating_mul(9).saturating_div(10);
+        let mut removed_files = 0_u64;
+        let mut reclaimed_bytes = 0_u64;
+        for entry in entries {
+            if total_bytes <= target_bytes {
+                break;
+            }
+            if fs::remove_file(&entry.path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(entry.size_bytes);
+                removed_files += 1;
+                reclaimed_bytes += entry.size_bytes;
+            }
+        }
+        debug!(
+            cache_root = %cache_root.display(),
+            limit_bytes,
+            target_bytes,
+            total_bytes,
+            removed_files,
+            reclaimed_bytes,
+            "pruned vex cache"
+        );
+        Ok(())
+    }
+
+    fn endpoint(endpoint: &str) -> Result<Endpoint, VexConfigError> {
+        Endpoint::new(endpoint.to_string()).map_err(|err| VexConfigError::InvalidEndpoint {
+            endpoint: endpoint.to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    fn auth_request<T>(
+        message: T,
+        access_token: Option<&str>,
+    ) -> Result<tonic::Request<T>, tonic::Status> {
+        let mut request = tonic::Request::new(message);
+        if let Some(access_token) = access_token.filter(|value| !value.is_empty()) {
+            let metadata = MetadataValue::try_from(format!("Bearer {access_token}"))
+                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            request.metadata_mut().insert("authorization", metadata);
+        }
+        Ok(request)
+    }
+
+    fn block_on_grpc<T, F, Fut>(endpoint: &str, f: F) -> Result<T, VexClientError>
+    where
+        F: FnOnce(JjBackendClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, tonic::Status>>,
+    {
+        let endpoint = Self::endpoint(endpoint)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(VexClientError::Runtime)?;
+        runtime.block_on(async move {
+            let channel = endpoint.connect().await?;
+            let client = JjBackendClient::new(channel);
+            f(client).await.map_err(Into::into)
+        })
+    }
+
+    fn block_on_http_get(
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<u8>, VexClientError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(VexClientError::Runtime)?;
+        runtime.block_on(async move {
+            let client = reqwest::Client::new();
+            let mut request = client.get(url);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().await?.error_for_status()?;
+            let bytes = response.bytes().await?;
+            Ok(bytes.to_vec())
+        })
+    }
+
+    fn block_on_http_get_to_file(
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        out: &mut dyn Write,
+    ) -> Result<(), VexClientError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(VexClientError::Runtime)?;
+        runtime.block_on(async move {
+            let client = reqwest::Client::new();
+            let mut request = client.get(url);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let mut response = request.send().await?.error_for_status()?;
+            while let Some(chunk) = response.chunk().await? {
+                out.write_all(&chunk)?;
+            }
+            out.flush()?;
+            Ok(())
+        })
+    }
+
+    fn direct_fetch_pack_bytes(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        hints: &[jj_backend_api::PresignedGet],
+    ) -> Result<Option<Vec<u8>>, VexClientError> {
+        let Some(hint) = hints
+            .iter()
+            .find(|hint| hint.object_key.ends_with(&pack.content_id.to_string()))
+        else {
+            return Ok(None);
+        };
+        if hint.url.is_empty() {
+            return Ok(None);
+        }
+        Self::block_on_http_get(&hint.url, &hint.headers).map(Some)
+    }
+
+    fn direct_fetch_pack_blob_bytes(
+        &self,
+        content_id: &ContentId,
+        hints: &[jj_backend_api::PresignedGet],
+    ) -> Result<Option<Vec<u8>>, VexClientError> {
+        let Some(hint) = hints
+            .iter()
+            .find(|hint| hint.object_key.ends_with(&content_id.to_string()))
+        else {
+            return Ok(None);
+        };
+        if hint.url.is_empty() {
+            return Ok(None);
+        }
+        Self::block_on_http_get(&hint.url, &hint.headers).map(Some)
+    }
+
+    fn direct_fetch_pack_to_file(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        hints: &[jj_backend_api::PresignedGet],
+        out: &mut dyn Write,
+    ) -> Result<bool, VexClientError> {
+        let Some(hint) = hints
+            .iter()
+            .find(|hint| hint.object_key.ends_with(&pack.content_id.to_string()))
+        else {
+            return Ok(false);
+        };
+        if hint.url.is_empty() {
+            return Ok(false);
+        }
+        Self::block_on_http_get_to_file(&hint.url, &hint.headers, out)?;
+        Ok(true)
+    }
+
+    fn prefetch_pack_entries_from_file(
+        &self,
+        path: &Path,
+        prefetched_objects: &mut u64,
+    ) -> Result<(), VexClientError> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut write_error: Option<VexClientError> = None;
+        let decode_result = decode_object_pack_with_visitor(reader, |entry| {
+            match self.write_cached_object(entry.kind, &entry.content_id, &entry.data) {
+                Ok(()) => {
+                    *prefetched_objects += 1;
+                    Ok(())
+                }
+                Err(err) => {
+                    write_error = Some(err);
+                    Err(jj_backend_types::PackCodecError::Compression(
+                        "cache write failed".to_string(),
+                    ))
+                }
+            }
+        });
+        if let Some(err) = write_error {
+            return Err(err);
+        }
+        decode_result.map_err(|err| VexClientError::PackDecode(err.to_string()))
+    }
+
+    async fn fetch_pack_blob_with_retry(
+        &self,
+        content_id: &ContentId,
+        hints: &[jj_backend_api::PresignedGet],
+    ) -> Result<Vec<u8>, VexClientError> {
+        let mut last_hint_err: Option<VexClientError> = None;
+        for _ in 0..2 {
+            match self.direct_fetch_pack_blob_bytes(content_id, hints) {
+                Ok(Some(bytes)) => return Ok(bytes),
+                Ok(None) => break,
+                Err(err) => last_hint_err = Some(err),
+            }
+        }
+        if let Some(err) = last_hint_err {
+            debug!(%content_id, error = %err, "direct chunk fetch failed, falling back to grpc");
+        }
+        self.get_object(ObjectKind::Pack, content_id).await
+    }
+
+    async fn prefetch_pack_via_chunks(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        hints: &[jj_backend_api::PresignedGet],
+        prefetched_objects: &mut u64,
+    ) -> Result<bool, VexClientError> {
+        let Some(chunks) = normalized_valid_pack_chunks(pack) else {
+            return Ok(false);
+        };
+        let Some(partial_path) = self.transfer_partial_path(&pack.content_id) else {
+            return Ok(false);
+        };
+        if let Some(parent) = partial_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut state =
+            self.load_pack_transfer_state(&pack.content_id)?
+                .unwrap_or(PackTransferState {
+                    pack_content_id: pack.content_id.to_string(),
+                    chunk_count: chunks.len(),
+                    next_chunk_index: 0,
+                });
+        if state.chunk_count != chunks.len() || state.next_chunk_index > chunks.len() {
+            state.chunk_count = chunks.len();
+            state.next_chunk_index = 0;
+            drop(fs::remove_file(&partial_path));
+        }
+        let mut partial_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&partial_path)?;
+        let expected_prefix_bytes: u64 = chunks
+            .iter()
+            .take(state.next_chunk_index)
+            .map(|chunk| chunk.size_bytes)
+            .sum();
+        if partial_file.metadata()?.len() != expected_prefix_bytes {
+            partial_file.set_len(0)?;
+            partial_file.seek(SeekFrom::Start(0))?;
+            state.next_chunk_index = 0;
+        }
+        for (idx, chunk) in chunks.iter().enumerate().skip(state.next_chunk_index) {
+            let chunk_bytes = self
+                .fetch_pack_blob_with_retry(&chunk.content_id, hints)
+                .await?;
+            if u64::try_from(chunk_bytes.len()).unwrap_or(u64::MAX) != chunk.size_bytes {
+                // Keep state file for debugging, but restart next attempt from scratch.
+                state.next_chunk_index = 0;
+                self.save_pack_transfer_state(&pack.content_id, &state)?;
+                return Err(VexClientError::PackDecode(format!(
+                    "chunk size mismatch for pack {} chunk {}",
+                    pack.content_id, idx
+                )));
+            }
+            partial_file.write_all(&chunk_bytes)?;
+            state.next_chunk_index = idx + 1;
+            self.save_pack_transfer_state(&pack.content_id, &state)?;
+        }
+        partial_file.flush()?;
+        drop(partial_file);
+        self.prefetch_pack_entries_from_file(&partial_path, prefetched_objects)?;
+        self.clear_pack_transfer_state(&pack.content_id)?;
+        Ok(true)
+    }
+
+    pub async fn init_repo(
+        endpoint: &str,
+        tenant_slug: &str,
+        repo_slug: &str,
+        access_token: Option<&str>,
+    ) -> Result<VexRepoConfig, VexClientError> {
+        let response = Self::block_on_grpc(endpoint, |mut client| async move {
+            client
+                .init_repo(Self::auth_request(
+                    InitRepoRequest {
+                        tenant_slug: tenant_slug.to_string(),
+                        repo_slug: repo_slug.to_string(),
+                    },
+                    access_token,
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        let repo = response.repo.ok_or(VexConfigError::MissingRepoInfo)?;
+        Ok(VexRepoConfig {
+            endpoint: endpoint.to_string(),
+            tenant_id: repo.tenant_id,
+            tenant_slug: repo.tenant_slug,
+            repo_id: repo.repo_id,
+            repo_slug: repo.repo_slug,
+            access_token: access_token.map(ToOwned::to_owned),
+        })
+    }
+
+    pub async fn get_repo(
+        endpoint: &str,
+        tenant_slug: &str,
+        repo_slug: &str,
+        access_token: Option<&str>,
+    ) -> Result<VexRepoConfig, VexClientError> {
+        let response = Self::block_on_grpc(endpoint, |mut client| async move {
+            client
+                .get_repo(Self::auth_request(
+                    GetRepoRequest {
+                        tenant_slug: tenant_slug.to_string(),
+                        repo_slug: repo_slug.to_string(),
+                    },
+                    access_token,
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        let repo = response.repo.ok_or(VexConfigError::MissingRepoInfo)?;
+        Ok(VexRepoConfig {
+            endpoint: endpoint.to_string(),
+            tenant_id: repo.tenant_id,
+            tenant_slug: repo.tenant_slug,
+            repo_id: repo.repo_id,
+            repo_slug: repo.repo_slug,
+            access_token: access_token.map(ToOwned::to_owned),
+        })
+    }
+
+    pub async fn put_object(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+        data: Vec<u8>,
+    ) -> Result<(), VexClientError> {
+        let cache_bytes = data.clone();
+        Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .put_object(Self::auth_request(
+                    PutObjectRequest {
+                        repo_id: self.config.repo_id.clone(),
+                        object: Some(ObjectId {
+                            kind: kind_to_str(kind).to_string(),
+                            content_id: content_id.to_string(),
+                        }),
+                        data,
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|_| ())
+        })?;
+        self.write_cached_object(kind, content_id, &cache_bytes)?;
+        Ok(())
+    }
+
+    pub async fn get_object(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+    ) -> Result<Vec<u8>, VexClientError> {
+        if let Some(bytes) = self.read_cached_object(kind, content_id) {
+            return Ok(bytes);
+        }
+        debug!(kind = kind_to_str(kind), %content_id, "vex cache miss");
+        let bytes = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .get_object(Self::auth_request(
+                    GetObjectRequest {
+                        repo_id: self.config.repo_id.clone(),
+                        object: Some(ObjectId {
+                            kind: kind_to_str(kind).to_string(),
+                            content_id: content_id.to_string(),
+                        }),
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner().data)
+        })?;
+        self.write_cached_object(kind, content_id, &bytes)?;
+        Ok(bytes)
+    }
+
+    pub async fn get_op_heads(&self) -> Result<Vec<ContentId>, VexClientError> {
+        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .get_op_heads(Self::auth_request(
+                    jj_backend_api::GetOpHeadsRequest {
+                        tenant_id: self.config.tenant_id.clone(),
+                        repo_id: self.config.repo_id.clone(),
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        response
+            .op_content_ids
+            .into_iter()
+            .map(|id| {
+                ContentId::from_hex(&id).map_err(|err| {
+                    tonic::Status::internal(format!("invalid op head from server: {err}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn commit_op_heads(
+        &self,
+        expected: &[ContentId],
+        new_head: &ContentId,
+        new_view: &ContentId,
+    ) -> Result<jj_backend_api::CommitOperationResponse, VexClientError> {
+        Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .commit_operation(Self::auth_request(
+                    jj_backend_api::CommitOperationRequest {
+                        tenant_id: self.config.tenant_id.clone(),
+                        repo_id: self.config.repo_id.clone(),
+                        expected_op_head_ids: expected.iter().map(ToString::to_string).collect(),
+                        new_op_content_id: new_head.to_string(),
+                        new_view_content_id: new_view.to_string(),
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })
+    }
+
+    pub async fn resolve_operation_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<ContentId>, VexClientError> {
+        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .resolve_operation_id_prefix(Self::auth_request(
+                    ResolveOperationIdPrefixRequest {
+                        repo_id: self.config.repo_id.clone(),
+                        prefix: prefix.to_string(),
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        response
+            .matches
+            .into_iter()
+            .map(|id| {
+                ContentId::from_hex(&id).map_err(|err| {
+                    tonic::Status::internal(format!("invalid operation id from server: {err}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn get_clone_manifest(
+        &self,
+        blob_mode: CloneBlobMode,
+    ) -> Result<CloneManifest, VexClientError> {
+        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .get_clone_manifest(Self::auth_request(
+                    GetCloneManifestRequest {
+                        tenant_id: self.config.tenant_id.clone(),
+                        repo_id: self.config.repo_id.clone(),
+                        clone_blob_mode: match blob_mode {
+                            CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
+                            CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
+                        },
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        serde_json::from_slice(&response.manifest_json)
+            .map_err(VexConfigError::Json)
+            .map_err(Into::into)
+    }
+
+    async fn get_object_fetch_hints(
+        &self,
+        objects: &[(ObjectKind, ContentId)],
+    ) -> Result<Vec<jj_backend_api::PresignedGet>, VexClientError> {
+        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .get_objects(Self::auth_request(
+                    GetObjectsRequest {
+                        tenant_id: self.config.tenant_id.clone(),
+                        repo_id: self.config.repo_id.clone(),
+                        objects: objects
+                            .iter()
+                            .map(|(kind, content_id)| ObjectId {
+                                kind: kind_to_str(*kind).to_string(),
+                                content_id: content_id.to_string(),
+                            })
+                            .collect(),
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        Ok(response.get_instructions)
+    }
+
+    pub async fn prefetch_clone_manifest(
+        &self,
+        manifest: &CloneManifest,
+    ) -> Result<(), VexClientError> {
+        let prefetch_started = std::time::Instant::now();
+        let mut prefetched_objects = 0_u64;
+        let hinted_pack_ids = manifest
+            .packs
+            .iter()
+            .flat_map(|pack| {
+                std::iter::once(pack.content_id)
+                    .chain(pack.chunks.iter().map(|chunk| chunk.content_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        let pack_hints = self
+            .get_object_fetch_hints(
+                &hinted_pack_ids
+                    .into_iter()
+                    .map(|content_id| (ObjectKind::Pack, content_id))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        for pack in &manifest.packs {
+            match self
+                .prefetch_pack_via_chunks(pack, &pack_hints, &mut prefetched_objects)
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    debug!(
+                        pack_content_id = %pack.content_id,
+                        error = %err,
+                        "chunk path failed, using full-pack fallback"
+                    );
+                }
+            }
+            let mut temp_pack = NamedTempFile::new()?;
+            let streamed = self
+                .direct_fetch_pack_to_file(pack, &pack_hints, temp_pack.as_file_mut())
+                .unwrap_or(false);
+            if streamed {
+                self.prefetch_pack_entries_from_file(temp_pack.path(), &mut prefetched_objects)?;
+                continue;
+            }
+
+            let pack_bytes = match self.direct_fetch_pack_bytes(pack, &pack_hints) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) | Err(_) => self.get_object(ObjectKind::Pack, &pack.content_id).await?,
+            };
+            let object_pack = decode_object_pack(&pack_bytes)
+                .or_else(|_| decode_object_pack_reader(BufReader::new(pack_bytes.as_slice())))
+                .map_err(|err| VexClientError::PackDecode(err.to_string()))?;
+            for entry in object_pack.objects {
+                self.write_cached_object(entry.kind, &entry.content_id, &entry.data)?;
+                prefetched_objects += 1;
+            }
+        }
+        for object in &manifest.objects {
+            if self
+                .read_cached_object(object.kind, &object.content_id)
+                .is_some()
+            {
+                continue;
+            }
+            let bytes = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+                client
+                    .get_object(Self::auth_request(
+                        GetObjectRequest {
+                            repo_id: self.config.repo_id.clone(),
+                            object: Some(ObjectId {
+                                kind: kind_to_str(object.kind).to_string(),
+                                content_id: object.content_id.to_string(),
+                            }),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner().data)
+            })?;
+            self.write_cached_object(object.kind, &object.content_id, &bytes)?;
+            prefetched_objects += 1;
+        }
+        debug!(
+            repo_id = %self.config.repo_id,
+            blob_mode = ?manifest.blob_mode,
+            pack_count = manifest.packs.len(),
+            deferred_object_count = manifest.deferred_object_count,
+            deferred_object_bytes = manifest.deferred_object_bytes,
+            prefetched_objects,
+            elapsed_ms = prefetch_started.elapsed().as_millis(),
+            "prefetched clone manifest"
+        );
+        Ok(())
+    }
+}
+
+fn normalize_pack_chunks(
+    chunks: &[jj_backend_types::PackChunkDescriptor],
+) -> Vec<jj_backend_types::PackChunkDescriptor> {
+    let mut normalized = chunks.to_vec();
+    normalized.sort_by_key(|chunk| (chunk.chunk_index, chunk.offset_bytes));
+    normalized
+}
+
+fn normalized_valid_pack_chunks(
+    pack: &jj_backend_types::PackDescriptor,
+) -> Option<Vec<jj_backend_types::PackChunkDescriptor>> {
+    if pack.chunks.is_empty() {
+        return None;
+    }
+    let chunks = normalize_pack_chunks(&pack.chunks);
+    let expected_count = chunks.len() as u32;
+    let mut expected_offset = 0_u64;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.chunk_count != expected_count {
+            return None;
+        }
+        if chunk.chunk_index != index as u32 {
+            return None;
+        }
+        if chunk.offset_bytes != expected_offset {
+            return None;
+        }
+        expected_offset = expected_offset.saturating_add(chunk.size_bytes);
+    }
+    if expected_offset != pack.size_bytes {
+        return None;
+    }
+    Some(chunks)
+}
+
+fn collect_cache_entries(root: &Path, entries: &mut Vec<CacheEntry>) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_cache_entries(&path, entries)?;
+        } else if metadata.is_file() {
+            entries.push(CacheEntry {
+                path,
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn kind_to_str(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Blob => "blob",
+        ObjectKind::Tree => "tree",
+        ObjectKind::Commit => "commit",
+        ObjectKind::Tag => "tag",
+        ObjectKind::Symlink => "symlink",
+        ObjectKind::Copy => "copy",
+        ObjectKind::View => "view",
+        ObjectKind::Op => "op",
+        ObjectKind::Pack => "pack",
+        ObjectKind::Manifest => "manifest",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jj_backend_api::PresignedGet;
+    use jj_backend_types::{ClonePackScope, PackChunkDescriptor, PackDescriptor};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn sample_client() -> VexClient {
+        VexClient::from_config(VexRepoConfig {
+            endpoint: "http://127.0.0.1:50051".to_string(),
+            tenant_id: "tenant".to_string(),
+            tenant_slug: "tenant".to_string(),
+            repo_id: "repo".to_string(),
+            repo_slug: "repo".to_string(),
+            access_token: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn pack_transfer_state_round_trip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let pack_id = ContentId::hash_bytes(b"pack-state");
+        let state = PackTransferState {
+            pack_content_id: pack_id.to_string(),
+            chunk_count: 4,
+            next_chunk_index: 2,
+        };
+        client.save_pack_transfer_state(&pack_id, &state).unwrap();
+        let loaded = client.load_pack_transfer_state(&pack_id).unwrap().unwrap();
+        assert_eq!(loaded, state);
+        client.clear_pack_transfer_state(&pack_id).unwrap();
+        assert!(client.load_pack_transfer_state(&pack_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn normalize_pack_chunks_prefers_chunk_index_then_offset() {
+        let chunks = vec![
+            PackChunkDescriptor {
+                content_id: ContentId::hash_bytes(b"2"),
+                chunk_index: 2,
+                chunk_count: 3,
+                offset_bytes: 200,
+                size_bytes: 10,
+            },
+            PackChunkDescriptor {
+                content_id: ContentId::hash_bytes(b"0"),
+                chunk_index: 0,
+                chunk_count: 3,
+                offset_bytes: 0,
+                size_bytes: 10,
+            },
+            PackChunkDescriptor {
+                content_id: ContentId::hash_bytes(b"1"),
+                chunk_index: 1,
+                chunk_count: 3,
+                offset_bytes: 100,
+                size_bytes: 10,
+            },
+        ];
+        let normalized = normalize_pack_chunks(&chunks);
+        assert_eq!(normalized[0].chunk_index, 0);
+        assert_eq!(normalized[1].chunk_index, 1);
+        assert_eq!(normalized[2].chunk_index, 2);
+    }
+
+    #[test]
+    fn normalized_valid_pack_chunks_accepts_well_formed_chunks() {
+        let pack = PackDescriptor {
+            content_id: ContentId::hash_bytes(b"pack"),
+            size_bytes: 30,
+            scope: ClonePackScope::Full,
+            chunks: vec![
+                PackChunkDescriptor {
+                    content_id: ContentId::hash_bytes(b"c2"),
+                    chunk_index: 2,
+                    chunk_count: 3,
+                    offset_bytes: 20,
+                    size_bytes: 10,
+                },
+                PackChunkDescriptor {
+                    content_id: ContentId::hash_bytes(b"c0"),
+                    chunk_index: 0,
+                    chunk_count: 3,
+                    offset_bytes: 0,
+                    size_bytes: 10,
+                },
+                PackChunkDescriptor {
+                    content_id: ContentId::hash_bytes(b"c1"),
+                    chunk_index: 1,
+                    chunk_count: 3,
+                    offset_bytes: 10,
+                    size_bytes: 10,
+                },
+            ],
+            objects: vec![],
+        };
+        let chunks = normalized_valid_pack_chunks(&pack).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[1].chunk_index, 1);
+        assert_eq!(chunks[2].chunk_index, 2);
+    }
+
+    #[test]
+    fn normalized_valid_pack_chunks_rejects_non_contiguous_offset() {
+        let pack = PackDescriptor {
+            content_id: ContentId::hash_bytes(b"pack"),
+            size_bytes: 30,
+            scope: ClonePackScope::Full,
+            chunks: vec![
+                PackChunkDescriptor {
+                    content_id: ContentId::hash_bytes(b"c0"),
+                    chunk_index: 0,
+                    chunk_count: 2,
+                    offset_bytes: 0,
+                    size_bytes: 10,
+                },
+                PackChunkDescriptor {
+                    content_id: ContentId::hash_bytes(b"c1"),
+                    chunk_index: 1,
+                    chunk_count: 2,
+                    offset_bytes: 15,
+                    size_bytes: 20,
+                },
+            ],
+            objects: vec![],
+        };
+        assert!(normalized_valid_pack_chunks(&pack).is_none());
+    }
+
+    #[test]
+    fn direct_fetch_pack_bytes_uses_http_hint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = b"pack-bytes".to_vec();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let content_id = ContentId::hash_bytes(b"pack");
+        let pack = PackDescriptor {
+            content_id,
+            size_bytes: 4,
+            scope: ClonePackScope::Full,
+            chunks: vec![],
+            objects: vec![],
+        };
+        let hints = vec![PresignedGet {
+            object_key: format!("packs/sha256/{content_id}"),
+            url: format!("http://{addr}/objects/pack/{content_id}"),
+            headers: Default::default(),
+        }];
+
+        let bytes = sample_client()
+            .direct_fetch_pack_bytes(&pack, &hints)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bytes, b"pack-bytes");
+        server.join().unwrap();
+    }
+}
+
+pub fn create_store_factories() -> StoreFactories {
+    let mut store_factories = StoreFactories::empty();
+    store_factories.add_backend(
+        VexBackend::name_static(),
+        Box::new(|_settings, store_path| Ok(Box::new(VexBackend::load(store_path)?))),
+    );
+    store_factories.add_op_store(
+        VexOpStore::name_static(),
+        Box::new(|_settings, store_path, root_data| {
+            Ok(Box::new(VexOpStore::load(store_path, root_data)?))
+        }),
+    );
+    store_factories.add_op_heads_store(
+        VexOpHeadsStore::name_static(),
+        Box::new(|_settings, store_path| Ok(Box::new(VexOpHeadsStore::load(store_path)?))),
+    );
+    store_factories
+}
