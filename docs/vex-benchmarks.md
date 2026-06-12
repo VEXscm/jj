@@ -83,7 +83,26 @@ These numbers are **environment-specific**. One run on a developer machine (Appl
 - Compare **release** `jj` + **release** `jj-backend`.
 - After a true path-faulting read API exists, add benchmarks for **per-path open/read** comparable to Eden/Sapling-style access.
 
+## Vexd virtual working copy benchmark path
+
+PRD 004 now tracks the daemon-backed virtual working copy under the top-level Vex workspace. Stage 1 has non-privileged tests for the contracts that will feed the real FUSE benchmark path:
+
+| Contract | Current check |
+| --- | --- |
+| Daemon/RPC mount shape | `cargo test -p vex-rpc --tests` |
+| Read-through cache cold/warm behavior | `cargo test -p vex-cache --tests` |
+| One-level read-only tree semantics | `cargo test -p vex-fs --tests` |
+| Mount registry and FUSE capability gating | `cargo test -p vexd --tests` |
+| CLI daemon/mount dry-run surface | `cargo test -p vex-cli --test vexd_cli` |
+| Non-privileged VFS operation timings | `cargo test -p vexd --test benchmarks -- --nocapture` |
+
+`crates/vexd/tests/benchmarks.rs` builds a local JJ repo, registers a read-write mount, prepares the FUSE core, and emits a markdown timing table for `mount_startup`, `lookup`, `readdir`, `cold_read`, `warm_read`, `overlay_write`, `changed_files`, `hash_query`, `snapshot`, and `goto`. The harness uses `VfsBenchmarkReport` in `crates/vexd/src/benchmarks.rs` so future benchmark tests can record comparable operation rows without depending on a kernel mount.
+
+These checks do **not** replace the future privileged benchmark. Once the Linux FUSE adapter can be exercised on a Linux host with `/dev/fuse`, keep the non-privileged report and add a `VEX_TEST_FUSE=1` ignored test that records real kernel mount startup, `readdir`, cold `open/read`, warm `open/read`, overlay write, snapshot, goto, changed-files, hash query, and cache bytes materialized.
+
 ## Changelog
 
+- **2026-06-09:** Added a non-privileged `vexd` benchmark report for mount startup, FUSE-core lookup/readdir/cold-read/warm-read, overlay write, changed-files, hash, snapshot, and goto paths.
+- **2026-06-09:** Added `vexd` Stage 1 benchmark path and contract checks for the daemon-backed VFS work.
 - **2026-04-03:** Initial document; matches `test_vex_bench_clone_profiles_and_file_show` and one recorded sample run.
 - **2026-04-03:** Renamed user-facing “agent” profile to **`--fs=system` / `--fs=virtual`**; benchmarks doc updated accordingly.
