@@ -763,6 +763,31 @@ impl VexClient {
         Ok(ids)
     }
 
+    /// Bulk-upload pre-serialized tree objects (canonical bytes). Ids are
+    /// derived from the bytes, matching the backend's content addressing.
+    pub async fn put_tree_blobs(&self, blobs: Vec<Vec<u8>>) -> Result<(), VexClientError> {
+        let objects = blobs
+            .into_iter()
+            .map(|data| {
+                let id = Self::blob_content_id(&data);
+                (ObjectKind::Tree, id, data)
+            })
+            .collect();
+        self.put_objects(objects).await
+    }
+
+    /// Bulk-upload pre-serialized commit objects (canonical bytes).
+    pub async fn put_commit_blobs(&self, blobs: Vec<Vec<u8>>) -> Result<(), VexClientError> {
+        let objects = blobs
+            .into_iter()
+            .map(|data| {
+                let id = Self::blob_content_id(&data);
+                (ObjectKind::Commit, id, data)
+            })
+            .collect();
+        self.put_objects(objects).await
+    }
+
     pub async fn get_object(
         &self,
         kind: ObjectKind,

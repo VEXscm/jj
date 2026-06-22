@@ -73,6 +73,23 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Serialize a tree exactly as [`VexBackend::write_tree`] would, returning its
+/// content-addressed [`TreeId`] and canonical bytes. Lets callers pre-address
+/// trees so they can be uploaded in bulk instead of one round trip each.
+pub fn serialize_tree(tree: &crate::backend::Tree) -> (crate::backend::TreeId, Vec<u8>) {
+    let data = crate::simple_backend::tree_to_proto(tree).encode_to_vec();
+    let id = crate::backend::TreeId::new(sha256_bytes(&data).to_vec());
+    (id, data)
+}
+
+/// Serialize a commit exactly as [`VexBackend::write_commit`] would (without
+/// signing), returning its content-addressed [`CommitId`] and canonical bytes.
+pub fn serialize_commit(commit: &Commit) -> (CommitId, Vec<u8>) {
+    let data = crate::simple_backend::commit_to_proto(commit).encode_to_vec();
+    let id = CommitId::new(sha256_bytes(&data).to_vec());
+    (id, data)
+}
+
 fn to_content_id(id: &[u8], object_type: &str) -> BackendResult<jj_backend_types::ContentId> {
     if id.len() != ID_LENGTH {
         return Err(BackendError::InvalidHashLength {
