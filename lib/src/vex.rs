@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -21,6 +22,8 @@ use std::io::Write;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
@@ -29,8 +32,10 @@ use jj_backend_api::GetObjectRequest;
 use jj_backend_api::GetObjectsRequest;
 use jj_backend_api::GetRepoRequest;
 use jj_backend_api::InitRepoRequest;
+use jj_backend_api::InlineObject;
 use jj_backend_api::ObjectId;
 use jj_backend_api::PutObjectRequest;
+use jj_backend_api::PutObjectsRequest;
 use jj_backend_api::ResolveOperationIdPrefixRequest;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
@@ -349,18 +354,47 @@ impl VexClient {
         Ok(request)
     }
 
+    /// Shared multi-threaded runtime for all blocking gRPC calls. Reused across
+    /// every call so we don't pay runtime-construction cost per request and so
+    /// batches can be issued concurrently over one HTTP/2 connection.
+    fn shared_grpc_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("failed to build shared gRPC runtime")
+        })
+    }
+
+    /// Return a cached, connected `Channel` for `endpoint_url`, establishing one
+    /// on first use. tonic `Channel`s are cheap to clone and multiplex requests
+    /// over a single connection, so reusing them avoids a fresh TCP+TLS+HTTP/2
+    /// handshake on every object — the dominant cost when uploading thousands.
+    fn cached_channel(endpoint_url: &str) -> Result<Channel, VexClientError> {
+        static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
+        let channels = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(channel) = channels.lock().unwrap().get(endpoint_url) {
+            return Ok(channel.clone());
+        }
+        let endpoint = Self::endpoint(endpoint_url)?;
+        let channel =
+            Self::shared_grpc_runtime().block_on(async move { endpoint.connect().await })?;
+        channels
+            .lock()
+            .unwrap()
+            .insert(endpoint_url.to_string(), channel.clone());
+        Ok(channel)
+    }
+
     fn block_on_grpc<T, F, Fut>(endpoint: &str, f: F) -> Result<T, VexClientError>
     where
         F: FnOnce(JjBackendClient<Channel>) -> Fut,
         Fut: Future<Output = Result<T, tonic::Status>>,
     {
-        let endpoint = Self::endpoint(endpoint)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(VexClientError::Runtime)?;
-        runtime.block_on(async move {
-            let channel = endpoint.connect().await?;
+        let channel = Self::cached_channel(endpoint)?;
+        Self::shared_grpc_runtime().block_on(async move {
             let client = JjBackendClient::new(channel);
             f(client).await.map_err(Into::into)
         })
@@ -660,6 +694,73 @@ impl VexClient {
         })?;
         self.write_cached_object(kind, content_id, &cache_bytes)?;
         Ok(())
+    }
+
+    /// Content id of a blob (file) object: the SHA-256 of its bytes. Matches the
+    /// id [`crate::vex_backend::VexBackend`] would assign, so callers can
+    /// pre-compute blob ids for bulk upload without a round trip.
+    pub fn blob_content_id(data: &[u8]) -> ContentId {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(data);
+        let digest: [u8; 32] = hasher.finalize().into();
+        ContentId::from_bytes(digest)
+    }
+
+    /// Upload many already-addressed objects in a single batched RPC. The caller
+    /// is responsible for chunking so each call stays under the server's gRPC
+    /// message size limit. Skips the local object cache (intended for bulk
+    /// import where the objects are not needed locally afterwards).
+    pub async fn put_objects(
+        &self,
+        objects: Vec<(ObjectKind, ContentId, Vec<u8>)>,
+    ) -> Result<(), VexClientError> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let inline: Vec<InlineObject> = objects
+            .into_iter()
+            .map(|(kind, content_id, data)| InlineObject {
+                object: Some(ObjectId {
+                    kind: kind_to_str(kind).to_string(),
+                    content_id: content_id.to_string(),
+                }),
+                data,
+            })
+            .collect();
+        Self::block_on_grpc(&self.config.endpoint, |client| async move {
+            client
+                .max_encoding_message_size(64 * 1024 * 1024)
+                .put_objects(Self::auth_request(
+                    PutObjectsRequest {
+                        repo_id: self.config.repo_id.clone(),
+                        objects: inline,
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    /// Bulk-upload file blobs, returning their backend [`crate::backend::FileId`]s
+    /// in the same order. Ids are computed locally (SHA-256), so this avoids a
+    /// per-file round trip; the caller should chunk to stay under the gRPC
+    /// message size limit.
+    pub async fn put_file_blobs(
+        &self,
+        blobs: Vec<Vec<u8>>,
+    ) -> Result<Vec<crate::backend::FileId>, VexClientError> {
+        let mut objects = Vec::with_capacity(blobs.len());
+        let mut ids = Vec::with_capacity(blobs.len());
+        for data in blobs {
+            let content_id = Self::blob_content_id(&data);
+            ids.push(crate::backend::FileId::new(content_id.as_bytes().to_vec()));
+            objects.push((ObjectKind::Blob, content_id, data));
+        }
+        self.put_objects(objects).await?;
+        Ok(ids)
     }
 
     pub async fn get_object(
