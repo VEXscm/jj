@@ -763,6 +763,98 @@ impl VexClient {
         Ok(ids)
     }
 
+    /// Upload many object batches with bounded request pipelining: up to
+    /// `concurrency` `put_objects` RPCs are in flight at once over the shared
+    /// cached connection, overlapping their round trips. This is the key win
+    /// for bulk ingestion from a single-threaded (pollster) caller: the plain
+    /// per-batch `put_objects` blocks the calling thread on the shared runtime,
+    /// so successive batches cannot overlap; here all batches are driven inside
+    /// one `block_on`, so the runtime can keep several requests in flight.
+    pub async fn put_object_batches_pipelined(
+        &self,
+        batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        let inline_batches: Vec<Vec<InlineObject>> = batches
+            .into_iter()
+            .filter(|batch| !batch.is_empty())
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(|(kind, content_id, data)| InlineObject {
+                        object: Some(ObjectId {
+                            kind: kind_to_str(kind).to_string(),
+                            content_id: content_id.to_string(),
+                        }),
+                        data,
+                    })
+                    .collect()
+            })
+            .collect();
+        if inline_batches.is_empty() {
+            return Ok(());
+        }
+        let channel = Self::cached_channel(&self.config.endpoint)?;
+        let repo_id = self.config.repo_id.clone();
+        let token = self.config.access_token.clone();
+        let concurrency = concurrency.max(1);
+        Self::shared_grpc_runtime().block_on(async move {
+            use futures::stream::TryStreamExt as _;
+            futures::stream::iter(inline_batches.into_iter().map(Ok::<_, VexClientError>))
+                .try_for_each_concurrent(concurrency, |objects| {
+                    let channel = channel.clone();
+                    let repo_id = repo_id.clone();
+                    let token = token.clone();
+                    async move {
+                        JjBackendClient::new(channel)
+                            .max_encoding_message_size(64 * 1024 * 1024)
+                            .put_objects(Self::auth_request(
+                                PutObjectsRequest { repo_id, objects },
+                                token.as_deref(),
+                            )?)
+                            .await?;
+                        Ok(())
+                    }
+                })
+                .await
+        })
+    }
+
+    /// Like [`Self::put_file_blobs`], but batches by object count/byte size and
+    /// uploads the batches with bounded request pipelining (see
+    /// [`Self::put_object_batches_pipelined`]). Returns the destination file ids
+    /// in input order. Computing ids is local, so the mapping is known without
+    /// waiting for the uploads.
+    pub async fn put_file_blobs_pipelined(
+        &self,
+        blobs: Vec<Vec<u8>>,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+        concurrency: usize,
+    ) -> Result<Vec<crate::backend::FileId>, VexClientError> {
+        let mut ids = Vec::with_capacity(blobs.len());
+        let mut batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> = Vec::new();
+        let mut current: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::new();
+        let mut current_bytes = 0usize;
+        let max_objects = max_batch_objects.max(1);
+        for data in blobs {
+            let content_id = Self::blob_content_id(&data);
+            ids.push(crate::backend::FileId::new(content_id.as_bytes().to_vec()));
+            current_bytes += data.len();
+            current.push((ObjectKind::Blob, content_id, data));
+            if current.len() >= max_objects || current_bytes >= max_batch_bytes {
+                batches.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+        self.put_object_batches_pipelined(batches, concurrency)
+            .await?;
+        Ok(ids)
+    }
+
     /// Bulk-upload pre-serialized tree objects (canonical bytes). Ids are
     /// derived from the bytes, matching the backend's content addressing.
     pub async fn put_tree_blobs(&self, blobs: Vec<Vec<u8>>) -> Result<(), VexClientError> {
