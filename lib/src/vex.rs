@@ -409,6 +409,58 @@ impl VexClient {
         })
     }
 
+    /// Whether a gRPC status is worth retrying. Transient transport/edge
+    /// failures (a Cloudflare/Caddy 502 mid-stream surfaces as `Internal` or
+    /// `Unknown`, connection resets as `Unavailable`) are retryable; semantic
+    /// errors (NotFound, InvalidArgument, auth) are not.
+    fn is_transient_status(status: &tonic::Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::Internal
+                | tonic::Code::Unknown
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Aborted
+                | tonic::Code::ResourceExhausted
+        )
+    }
+
+    /// Like [`Self::block_on_grpc`] but retries the call on transient errors
+    /// with linear backoff. Used for hot read paths (e.g. the per-file
+    /// `GetObject` calls a working-copy checkout makes thousands of times),
+    /// where a single transient edge blip would otherwise abort the whole
+    /// operation. The closure is `Fn` so it can be re-invoked per attempt.
+    fn block_on_grpc_retry<T, F, Fut>(
+        endpoint: &str,
+        attempts: usize,
+        f: F,
+    ) -> Result<T, VexClientError>
+    where
+        F: Fn(JjBackendClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, tonic::Status>>,
+    {
+        let channel = Self::cached_channel(endpoint)?;
+        let attempts = attempts.max(1);
+        Self::shared_grpc_runtime().block_on(async move {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let client = JjBackendClient::new(channel.clone())
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+                match f(client).await {
+                    Ok(value) => return Ok(value),
+                    Err(status) if Self::is_transient_status(&status) && attempt < attempts => {
+                        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    Err(status) => return Err(status.into()),
+                }
+            }
+        })
+    }
+
     fn block_on_http_get(
         url: &str,
         headers: &std::collections::HashMap<String, String>,
@@ -899,7 +951,7 @@ impl VexClient {
             return Ok(bytes);
         }
         debug!(kind = kind_to_str(kind), %content_id, "vex cache miss");
-        let bytes = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+        let bytes = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
             client
                 .get_object(Self::auth_request(
                     GetObjectRequest {
