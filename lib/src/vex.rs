@@ -57,6 +57,13 @@ use crate::vex_op_heads_store::VexOpHeadsStore;
 use crate::vex_op_store::VexOpStore;
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
+
+/// Max gRPC message size for both directions. The default tonic decode limit is
+/// 4 MiB, which is smaller than legitimately large objects (e.g. a >4 MiB file
+/// blob fetched inline via `GetObject` during checkout), so reads would fail
+/// with "decoded message length too large". The server already allows 64 MiB
+/// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
+const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub use jj_backend_types::CloneBlobMode;
 
 #[derive(Debug, Error)]
@@ -395,7 +402,9 @@ impl VexClient {
     {
         let channel = Self::cached_channel(endpoint)?;
         Self::shared_grpc_runtime().block_on(async move {
-            let client = JjBackendClient::new(channel);
+            let client = JjBackendClient::new(channel)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
             f(client).await.map_err(Into::into)
         })
     }
@@ -807,7 +816,8 @@ impl VexClient {
                     let token = token.clone();
                     async move {
                         JjBackendClient::new(channel)
-                            .max_encoding_message_size(64 * 1024 * 1024)
+                            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                             .put_objects(Self::auth_request(
                                 PutObjectsRequest { repo_id, objects },
                                 token.as_deref(),
