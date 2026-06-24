@@ -707,7 +707,7 @@ impl VexClient {
         repo_slug: &str,
         access_token: Option<&str>,
     ) -> Result<VexRepoConfig, VexClientError> {
-        let response = Self::block_on_grpc(endpoint, |mut client| async move {
+        let response = Self::block_on_grpc_retry(endpoint, 5, |mut client| async move {
             client
                 .get_repo(Self::auth_request(
                     GetRepoRequest {
@@ -971,7 +971,7 @@ impl VexClient {
     }
 
     pub async fn get_op_heads(&self) -> Result<Vec<ContentId>, VexClientError> {
-        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
             client
                 .get_op_heads(Self::auth_request(
                     jj_backend_api::GetOpHeadsRequest {
@@ -1022,7 +1022,7 @@ impl VexClient {
         &self,
         prefix: &str,
     ) -> Result<Vec<ContentId>, VexClientError> {
-        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
             client
                 .resolve_operation_id_prefix(Self::auth_request(
                     ResolveOperationIdPrefixRequest {
@@ -1050,7 +1050,7 @@ impl VexClient {
         &self,
         blob_mode: CloneBlobMode,
     ) -> Result<CloneManifest, VexClientError> {
-        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
             client
                 .get_clone_manifest(Self::auth_request(
                     GetCloneManifestRequest {
@@ -1075,7 +1075,7 @@ impl VexClient {
         &self,
         objects: &[(ObjectKind, ContentId)],
     ) -> Result<Vec<jj_backend_api::PresignedGet>, VexClientError> {
-        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
             client
                 .get_objects(Self::auth_request(
                     GetObjectsRequest {
@@ -1163,7 +1163,7 @@ impl VexClient {
             {
                 continue;
             }
-            let bytes = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            let bytes = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
                 client
                     .get_object(Self::auth_request(
                         GetObjectRequest {
