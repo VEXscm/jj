@@ -66,6 +66,55 @@ pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub use jj_backend_types::CloneBlobMode;
 
+/// Progress events emitted while a Vex clone runs.
+///
+/// These are reported through the optional [`CloneProgressFn`] passed to
+/// [`crate::workspace::Workspace::clone_vex`] so a caller (e.g. the CLI) can
+/// render a live progress UI. They are advisory only: the clone behaves
+/// identically whether or not a sink is provided.
+#[derive(Debug, Clone)]
+pub enum CloneProgress {
+    /// Contacting the backend and resolving repo metadata.
+    Connecting,
+    /// The clone manifest has been fetched; totals are now known.
+    ManifestReady {
+        /// Number of packs to prefetch.
+        packs: u64,
+        /// Number of immutable objects bundled inside those packs.
+        pack_objects: u64,
+        /// Number of loose (non-packed) objects to prefetch.
+        loose_objects: u64,
+        /// Approximate total bytes to transfer for the prefetch step.
+        total_bytes: u64,
+        /// Objects deferred for on-demand (lazy / shallow) hydration.
+        deferred_objects: u64,
+    },
+    /// A pack finished downloading and unpacking.
+    PackFetched {
+        /// Packs completed so far.
+        done: u64,
+        /// Total packs in the manifest.
+        total: u64,
+        /// Cumulative immutable objects written to the local cache.
+        objects: u64,
+    },
+    /// A loose object finished downloading.
+    LooseObjectFetched {
+        /// Loose objects completed so far.
+        done: u64,
+        /// Total loose objects in the manifest.
+        total: u64,
+    },
+    /// Prefetch finished; the working copy is about to be materialized.
+    CheckingOut,
+    /// The clone is complete.
+    Done,
+}
+
+/// Sink for [`CloneProgress`] events. `Send + Sync` so it can be invoked from
+/// the blocking gRPC worker as well as the dedicated clone thread.
+pub type CloneProgressFn = dyn Fn(CloneProgress) + Send + Sync;
+
 #[derive(Debug, Error)]
 pub enum VexConfigError {
     #[error("vex repo metadata file not found at {0}")]
@@ -971,18 +1020,19 @@ impl VexClient {
     }
 
     pub async fn get_op_heads(&self) -> Result<Vec<ContentId>, VexClientError> {
-        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-            client
-                .get_op_heads(Self::auth_request(
-                    jj_backend_api::GetOpHeadsRequest {
-                        tenant_id: self.config.tenant_id.clone(),
-                        repo_id: self.config.repo_id.clone(),
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner())
-        })?;
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .get_op_heads(Self::auth_request(
+                        jj_backend_api::GetOpHeadsRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
         response
             .op_content_ids
             .into_iter()
@@ -1022,18 +1072,19 @@ impl VexClient {
         &self,
         prefix: &str,
     ) -> Result<Vec<ContentId>, VexClientError> {
-        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-            client
-                .resolve_operation_id_prefix(Self::auth_request(
-                    ResolveOperationIdPrefixRequest {
-                        repo_id: self.config.repo_id.clone(),
-                        prefix: prefix.to_string(),
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner())
-        })?;
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .resolve_operation_id_prefix(Self::auth_request(
+                        ResolveOperationIdPrefixRequest {
+                            repo_id: self.config.repo_id.clone(),
+                            prefix: prefix.to_string(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
         response
             .matches
             .into_iter()
@@ -1050,22 +1101,23 @@ impl VexClient {
         &self,
         blob_mode: CloneBlobMode,
     ) -> Result<CloneManifest, VexClientError> {
-        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-            client
-                .get_clone_manifest(Self::auth_request(
-                    GetCloneManifestRequest {
-                        tenant_id: self.config.tenant_id.clone(),
-                        repo_id: self.config.repo_id.clone(),
-                        clone_blob_mode: match blob_mode {
-                            CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
-                            CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .get_clone_manifest(Self::auth_request(
+                        GetCloneManifestRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            clone_blob_mode: match blob_mode {
+                                CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
+                                CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
+                            },
                         },
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner())
-        })?;
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
         serde_json::from_slice(&response.manifest_json)
             .map_err(VexConfigError::Json)
             .map_err(Into::into)
@@ -1075,31 +1127,33 @@ impl VexClient {
         &self,
         objects: &[(ObjectKind, ContentId)],
     ) -> Result<Vec<jj_backend_api::PresignedGet>, VexClientError> {
-        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-            client
-                .get_objects(Self::auth_request(
-                    GetObjectsRequest {
-                        tenant_id: self.config.tenant_id.clone(),
-                        repo_id: self.config.repo_id.clone(),
-                        objects: objects
-                            .iter()
-                            .map(|(kind, content_id)| ObjectId {
-                                kind: kind_to_str(*kind).to_string(),
-                                content_id: content_id.to_string(),
-                            })
-                            .collect(),
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner())
-        })?;
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .get_objects(Self::auth_request(
+                        GetObjectsRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            objects: objects
+                                .iter()
+                                .map(|(kind, content_id)| ObjectId {
+                                    kind: kind_to_str(*kind).to_string(),
+                                    content_id: content_id.to_string(),
+                                })
+                                .collect(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
         Ok(response.get_instructions)
     }
 
     pub async fn prefetch_clone_manifest(
         &self,
         manifest: &CloneManifest,
+        progress: Option<&CloneProgressFn>,
     ) -> Result<(), VexClientError> {
         let prefetch_started = std::time::Instant::now();
         let mut prefetched_objects = 0_u64;
@@ -1120,66 +1174,58 @@ impl VexClient {
                     .collect::<Vec<_>>(),
             )
             .await?;
-        for pack in &manifest.packs {
-            match self
-                .prefetch_pack_via_chunks(pack, &pack_hints, &mut prefetched_objects)
-                .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(err) => {
-                    debug!(
-                        pack_content_id = %pack.content_id,
-                        error = %err,
-                        "chunk path failed, using full-pack fallback"
-                    );
-                }
-            }
-            let mut temp_pack = NamedTempFile::new()?;
-            let streamed = self
-                .direct_fetch_pack_to_file(pack, &pack_hints, temp_pack.as_file_mut())
-                .unwrap_or(false);
-            if streamed {
-                self.prefetch_pack_entries_from_file(temp_pack.path(), &mut prefetched_objects)?;
-                continue;
-            }
-
-            let pack_bytes = match self.direct_fetch_pack_bytes(pack, &pack_hints) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) | Err(_) => self.get_object(ObjectKind::Pack, &pack.content_id).await?,
-            };
-            let object_pack = decode_object_pack(&pack_bytes)
-                .or_else(|_| decode_object_pack_reader(BufReader::new(pack_bytes.as_slice())))
-                .map_err(|err| VexClientError::PackDecode(err.to_string()))?;
-            for entry in object_pack.objects {
-                self.write_cached_object(entry.kind, &entry.content_id, &entry.data)?;
-                prefetched_objects += 1;
+        let total_packs = manifest.packs.len() as u64;
+        for (index, pack) in manifest.packs.iter().enumerate() {
+            self.prefetch_one_pack(pack, &pack_hints, &mut prefetched_objects)
+                .await?;
+            if let Some(progress) = progress {
+                progress(CloneProgress::PackFetched {
+                    done: index as u64 + 1,
+                    total: total_packs,
+                    objects: prefetched_objects,
+                });
             }
         }
+        let total_loose = manifest.objects.len() as u64;
+        let mut loose_done = 0_u64;
         for object in &manifest.objects {
+            loose_done += 1;
             if self
                 .read_cached_object(object.kind, &object.content_id)
                 .is_some()
             {
+                if let Some(progress) = progress {
+                    progress(CloneProgress::LooseObjectFetched {
+                        done: loose_done,
+                        total: total_loose,
+                    });
+                }
                 continue;
             }
-            let bytes = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-                client
-                    .get_object(Self::auth_request(
-                        GetObjectRequest {
-                            repo_id: self.config.repo_id.clone(),
-                            object: Some(ObjectId {
-                                kind: kind_to_str(object.kind).to_string(),
-                                content_id: object.content_id.to_string(),
-                            }),
-                        },
-                        self.config.access_token.as_deref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner().data)
-            })?;
+            let bytes =
+                Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                    client
+                        .get_object(Self::auth_request(
+                            GetObjectRequest {
+                                repo_id: self.config.repo_id.clone(),
+                                object: Some(ObjectId {
+                                    kind: kind_to_str(object.kind).to_string(),
+                                    content_id: object.content_id.to_string(),
+                                }),
+                            },
+                            self.config.access_token.as_deref(),
+                        )?)
+                        .await
+                        .map(|response| response.into_inner().data)
+                })?;
             self.write_cached_object(object.kind, &object.content_id, &bytes)?;
             prefetched_objects += 1;
+            if let Some(progress) = progress {
+                progress(CloneProgress::LooseObjectFetched {
+                    done: loose_done,
+                    total: total_loose,
+                });
+            }
         }
         debug!(
             repo_id = %self.config.repo_id,
@@ -1191,6 +1237,52 @@ impl VexClient {
             elapsed_ms = prefetch_started.elapsed().as_millis(),
             "prefetched clone manifest"
         );
+        Ok(())
+    }
+
+    /// Fetch and unpack a single clone pack into the local object cache,
+    /// trying the chunked path first and falling back to streamed and then
+    /// whole-pack reads. `prefetched_objects` is incremented per object written.
+    async fn prefetch_one_pack(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        pack_hints: &[jj_backend_api::PresignedGet],
+        prefetched_objects: &mut u64,
+    ) -> Result<(), VexClientError> {
+        match self
+            .prefetch_pack_via_chunks(pack, pack_hints, prefetched_objects)
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err) => {
+                debug!(
+                    pack_content_id = %pack.content_id,
+                    error = %err,
+                    "chunk path failed, using full-pack fallback"
+                );
+            }
+        }
+        let mut temp_pack = NamedTempFile::new()?;
+        let streamed = self
+            .direct_fetch_pack_to_file(pack, pack_hints, temp_pack.as_file_mut())
+            .unwrap_or(false);
+        if streamed {
+            self.prefetch_pack_entries_from_file(temp_pack.path(), prefetched_objects)?;
+            return Ok(());
+        }
+
+        let pack_bytes = match self.direct_fetch_pack_bytes(pack, pack_hints) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => self.get_object(ObjectKind::Pack, &pack.content_id).await?,
+        };
+        let object_pack = decode_object_pack(&pack_bytes)
+            .or_else(|_| decode_object_pack_reader(BufReader::new(pack_bytes.as_slice())))
+            .map_err(|err| VexClientError::PackDecode(err.to_string()))?;
+        for entry in object_pack.objects {
+            self.write_cached_object(entry.kind, &entry.content_id, &entry.data)?;
+            *prefetched_objects += 1;
+        }
         Ok(())
     }
 }

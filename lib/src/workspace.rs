@@ -483,7 +483,11 @@ impl Workspace {
         config: VexRepoConfig,
         blob_mode: CloneBlobMode,
         working_copy_factory: &dyn WorkingCopyFactory,
+        progress: Option<&crate::vex::CloneProgressFn>,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
+        if let Some(progress) = progress {
+            progress(crate::vex::CloneProgress::Connecting);
+        }
         let jj_dir = create_jj_dir(workspace_root)?;
         async {
             let repo_dir = jj_dir.join("repo");
@@ -531,8 +535,32 @@ impl Workspace {
                 .get_clone_manifest(blob_mode)
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+            if let Some(progress) = progress {
+                let pack_objects = clone_manifest
+                    .packs
+                    .iter()
+                    .map(|pack| pack.objects.len() as u64)
+                    .sum();
+                let total_bytes = clone_manifest
+                    .packs
+                    .iter()
+                    .map(|pack| pack.size_bytes)
+                    .sum::<u64>()
+                    + clone_manifest
+                        .objects
+                        .iter()
+                        .filter_map(|object| object.size_bytes)
+                        .sum::<u64>();
+                progress(crate::vex::CloneProgress::ManifestReady {
+                    packs: clone_manifest.packs.len() as u64,
+                    pack_objects,
+                    loose_objects: clone_manifest.objects.len() as u64,
+                    total_bytes,
+                    deferred_objects: clone_manifest.deferred_object_count,
+                });
+            }
             prefetch_client
-                .prefetch_clone_manifest(&clone_manifest)
+                .prefetch_clone_manifest(&clone_manifest, progress)
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
 
@@ -547,6 +575,9 @@ impl Workspace {
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
             let start_commit = clone_vex_start_commit(&repo).await?;
+            if let Some(progress) = progress {
+                progress(crate::vex::CloneProgress::CheckingOut);
+            }
             let workspace_name = vex_clone_workspace_name(workspace_root);
             let (working_copy, repo) = init_working_copy_at(
                 &repo,
@@ -561,6 +592,9 @@ impl Workspace {
             let repo_dir = dunce::canonicalize(&repo_dir).context(&repo_dir)?;
             let workspace = Self::new(workspace_root, repo_dir, working_copy, repo_loader)?;
             workspace_store.add(workspace.workspace_name(), workspace.workspace_root())?;
+            if let Some(progress) = progress {
+                progress(crate::vex::CloneProgress::Done);
+            }
             Ok((workspace, repo))
         }
         .await

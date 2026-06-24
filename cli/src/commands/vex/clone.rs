@@ -111,6 +111,7 @@ pub(crate) async fn cmd_vex_clone(
             config,
             blob_mode,
             &*working_copy_factory,
+            None,
         )
         .await?;
         Ok(())
