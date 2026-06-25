@@ -24,6 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
@@ -64,6 +65,15 @@ pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
 /// with "decoded message length too large". The server already allows 64 MiB
 /// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read a non-negative seconds value from `name`, falling back to `default` when
+/// unset or unparseable. Used for env-tunable gRPC connection timeouts.
+fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 pub use jj_backend_types::CloneBlobMode;
 
 /// Progress events emitted while a Vex clone runs.
@@ -402,10 +412,24 @@ impl VexClient {
     }
 
     fn endpoint(endpoint: &str) -> Result<Endpoint, VexConfigError> {
-        Endpoint::new(endpoint.to_string()).map_err(|err| VexConfigError::InvalidEndpoint {
-            endpoint: endpoint.to_string(),
-            message: err.to_string(),
-        })
+        let endpoint =
+            Endpoint::new(endpoint.to_string()).map_err(|err| VexConfigError::InvalidEndpoint {
+                endpoint: endpoint.to_string(),
+                message: err.to_string(),
+            })?;
+        // Bound cold-start tail latency: a `vex` process is short-lived and pays
+        // a fresh TCP+TLS+HTTP/2 handshake on its first call, so cap how long a
+        // hung connect/request can stall a command. HTTP/2 keepalive keeps the
+        // pooled channel healthy across the calls within one command and guards
+        // against an idle edge-proxy reset mid-command. Values are conservative
+        // to avoid tripping server-side `too_many_pings` (ENHANCE_YOUR_CALM).
+        let endpoint = endpoint
+            .connect_timeout(Duration::from_secs(env_secs("VEX_GRPC_CONNECT_TIMEOUT_SECS", 10)))
+            .timeout(Duration::from_secs(env_secs("VEX_GRPC_REQUEST_TIMEOUT_SECS", 120)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10));
+        Ok(endpoint)
     }
 
     fn auth_request<T>(
