@@ -1,2 +1,3 @@
 [hints]
 resolving-conflicts = true
+fsmonitor = true

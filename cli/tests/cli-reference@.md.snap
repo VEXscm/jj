@@ -72,6 +72,10 @@ This document contains the help content for the `jj` command-line program.
 * [`jj git remote set-url`↴](#jj-git-remote-set-url)
 * [`jj git root`↴](#jj-git-root)
 * [`jj help`↴](#jj-help)
+* [`jj hint`↴](#jj-hint)
+* [`jj hint disable`↴](#jj-hint-disable)
+* [`jj hint enable`↴](#jj-hint-enable)
+* [`jj hint list`↴](#jj-hint-list)
 * [`jj interdiff`↴](#jj-interdiff)
 * [`jj log`↴](#jj-log)
 * [`jj metaedit`↴](#jj-metaedit)
@@ -119,6 +123,9 @@ This document contains the help content for the `jj` command-line program.
 * [`jj util markdown-help`↴](#jj-util-markdown-help)
 * [`jj util snapshot`↴](#jj-util-snapshot)
 * [`jj version`↴](#jj-version)
+* [`jj vex`↴](#jj-vex)
+* [`jj vex clone`↴](#jj-vex-clone)
+* [`jj vex init`↴](#jj-vex-init)
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
 * [`jj workspace forget`↴](#jj-workspace-forget)
@@ -160,6 +167,7 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `gerrit` — Interact with Gerrit Code Review
 * `git` — Commands for working with Git remotes and the underlying Git repo
 * `help` — Print this message or the help of the given subcommand(s)
+* `hint` — Enable or disable the CLI's occasional hints
 * `interdiff` — Show differences between the diffs of two revisions
 * `log` — Show revision history
 * `metaedit` — Modify the metadata of a revision without changing its content
@@ -186,6 +194,7 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `unsign` — Drop a cryptographic signature
 * `util` — Infrequently used commands such as for generating shell completions
 * `version` — Display version information
+* `vex` — Commands for working with Vex-backed JJ repositories
 * `workspace` — Commands for working with workspaces
 
 ###### **Options:**
@@ -1941,6 +1950,62 @@ Print this message or the help of the given subcommand(s)
 
 
 
+## `jj hint`
+
+Enable or disable the CLI's occasional hints
+
+**Usage:** `jj hint <COMMAND>`
+
+###### **Subcommands:**
+
+* `disable` — Stop printing a hint
+* `enable` — Resume printing a previously disabled hint
+* `list` — List the hints that can be toggled and their current state
+
+
+
+## `jj hint disable`
+
+Stop printing a hint
+
+**Usage:** `jj hint disable [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the hint to toggle (see `vex hint list`)
+
+###### **Options:**
+
+* `--user` — Write the preference to the user-level config (default)
+* `--repo` — Write the preference to the repo-level config
+
+
+
+## `jj hint enable`
+
+Resume printing a previously disabled hint
+
+**Usage:** `jj hint enable [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the hint to toggle (see `vex hint list`)
+
+###### **Options:**
+
+* `--user` — Write the preference to the user-level config (default)
+* `--repo` — Write the preference to the repo-level config
+
+
+
+## `jj hint list`
+
+List the hints that can be toggled and their current state
+
+**Usage:** `jj hint list`
+
+
+
 ## `jj interdiff`
 
 Show differences between the diffs of two revisions
@@ -3541,6 +3606,93 @@ If you want to see the ID of the current operation after this command, run `jj o
 Display version information
 
 **Usage:** `jj version`
+
+
+
+## `jj vex`
+
+Commands for working with Vex-backed JJ repositories
+
+**Usage:** `jj vex <COMMAND>`
+
+###### **Subcommands:**
+
+* `clone` — Clone an existing repo backed directly by a Vex backend
+* `init` — Create a new repo backed directly by a Vex backend
+
+
+
+## `jj vex clone`
+
+Clone an existing repo backed directly by a Vex backend
+
+**Usage:** `jj vex clone [OPTIONS] <REPO> [DESTINATION]`
+
+###### **Arguments:**
+
+* `<REPO>` — Vex repository in the form `<tenant>/<repo>`
+* `<DESTINATION>` — The destination directory for the cloned repository
+
+###### **Options:**
+
+* `--endpoint <ENDPOINT>` — gRPC endpoint for the Vex backend
+* `--token <TOKEN>` — Repository access token issued by the Vex control plane
+* `--api-base-url <API_BASE_URL>` — Vex control-plane API base URL used for auto-authenticated clone/init
+* `--api-token <API_TOKEN>` — Vex control-plane API token used for auto-authenticated clone/init
+* `--fs <FS>` — Working tree layout and clone-time blob prefetch: `system` (default) or `virtual`
+
+  Default value: `system`
+
+  Possible values:
+  - `system`:
+    Full materialization on the local filesystem; clone prefetches blob bodies (default)
+  - `virtual`:
+    Virtual working copy (`vex-virtual`); clone uses lazy blob prefetch
+
+* `--blob-mode <BLOB_MODE>` — Clone-time blob hydration policy
+
+  Possible values: `eager`, `lazy`
+
+* `--working-copy <WORKING_COPY>` — Working-copy implementation to initialize
+
+  Possible values: `local`, `virtual`
+
+
+
+
+## `jj vex init`
+
+Create a new repo backed directly by a Vex backend
+
+**Usage:** `jj vex init [OPTIONS] <REPO> [DESTINATION]`
+
+###### **Arguments:**
+
+* `<REPO>` — Vex repository in the form `<tenant>/<repo>`
+* `<DESTINATION>` — The destination directory where the `jj` repo will be created
+
+  Default value: `.`
+
+###### **Options:**
+
+* `--endpoint <ENDPOINT>` — gRPC endpoint for the Vex backend
+* `--token <TOKEN>` — Repository access token issued by the Vex control plane
+* `--api-base-url <API_BASE_URL>` — Vex control-plane API base URL used for auto-authenticated clone/init
+* `--api-token <API_TOKEN>` — Vex control-plane API token used for auto-authenticated clone/init
+* `--fs <FS>` — Working tree layout: `system` (default, on-disk) or `virtual` (`vex-virtual`)
+
+  Default value: `system`
+
+  Possible values:
+  - `system`:
+    Full materialization on the local filesystem; clone prefetches blob bodies (default)
+  - `virtual`:
+    Virtual working copy (`vex-virtual`); clone uses lazy blob prefetch
+
+* `--working-copy <WORKING_COPY>` — Working-copy implementation to initialize
+
+  Possible values: `local`, `virtual`
+
 
 
 

@@ -2015,6 +2015,10 @@ to the current parents may contain changes from multiple commits.
             jj_lib::fsmonitor::FsmonitorSettings::from_settings(self.settings()),
             Ok(jj_lib::fsmonitor::FsmonitorSettings::None)
         );
+        // Captured here too so the slow-snapshot hint below can be silenced via
+        // `hints.fsmonitor` (see `vex hint disable watchman`) without re-borrowing
+        // `self` while the working copy is locked for mutation.
+        let fsmonitor_hint_enabled = self.settings().get_bool("hints.fsmonitor").unwrap_or(true);
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
         let mut locked_ws = self
@@ -2043,7 +2047,12 @@ to the current parents may contain changes from multiple commits.
                 .await
                 .map_err(snapshot_command_error)?
         };
-        hint_install_fsmonitor(ui, fsmonitor_disabled, snapshot_start.elapsed());
+        hint_install_fsmonitor(
+            ui,
+            fsmonitor_disabled,
+            fsmonitor_hint_enabled,
+            snapshot_start.elapsed(),
+        );
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
             let mut tx = start_repo_transaction(
                 &self.user_repo.repo,
@@ -3086,9 +3095,17 @@ pub fn print_untracked_files(
 /// user toward installing one. Vex working copies can be large (tens of
 /// thousands of files), and without a monitor every snapshot must `stat` the
 /// whole tree; watchman makes snapshots incremental instead.
-fn hint_install_fsmonitor(ui: &Ui, fsmonitor_disabled: bool, snapshot_elapsed: std::time::Duration) {
+///
+/// The nudge can be silenced per the `hints.fsmonitor` config, e.g. via
+/// `vex hint disable watchman`.
+fn hint_install_fsmonitor(
+    ui: &Ui,
+    fsmonitor_disabled: bool,
+    hint_enabled: bool,
+    snapshot_elapsed: std::time::Duration,
+) {
     const SLOW_SNAPSHOT: std::time::Duration = std::time::Duration::from_secs(1);
-    if !fsmonitor_disabled || snapshot_elapsed < SLOW_SNAPSHOT {
+    if !hint_enabled || !fsmonitor_disabled || snapshot_elapsed < SLOW_SNAPSHOT {
         return;
     }
     writeln!(
@@ -3872,11 +3889,12 @@ fn resolve_default_command(
     Ok(string_args)
 }
 
-fn current_cli_name() -> String {
+pub(crate) fn current_cli_name() -> String {
     env::args_os()
         .next()
         .and_then(|arg0| Path::new(&arg0).file_name().map(|name| name.to_owned()))
         .and_then(|name| name.into_string().ok())
+        .map(|name| name.strip_suffix(".exe").unwrap_or(&name).to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "jj".to_string())
 }
