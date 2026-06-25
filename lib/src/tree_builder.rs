@@ -17,11 +17,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::future::BoxFuture;
+use futures::stream;
 use futures::stream::FuturesUnordered;
 
 use crate::backend;
+use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
@@ -98,35 +101,76 @@ impl TreeBuilder {
             }
         }
 
-        // Write trees in reverse lexicographical order, starting with trees without
-        // children.
-        // TODO: Writing trees concurrently should help on high-latency backends
-        let store = &self.store;
-        while let Some((dir, cur_entries)) = trees_to_write.pop_last() {
-            if let Some((parent, basename)) = dir.split() {
-                let parent_entries = trees_to_write.get_mut(parent).unwrap();
+        // Write trees deepest-first, one depth level at a time. Within a level
+        // every tree is mutually independent (no same-depth tree is an ancestor
+        // of another) and all of its children live in deeper levels that were
+        // already written, so the whole level can be written concurrently —
+        // which collapses the per-directory round-trip chain on high-latency
+        // backends (e.g. the Vex remote object store). Parent-entry updates are
+        // applied serially after each level, preserving the child-before-parent
+        // ordering the previous serial implementation relied on.
+        let concurrency = self.store.concurrency().max(1);
+
+        // Bucket directories by depth (component count); root is depth 0.
+        let mut dirs_by_depth: BTreeMap<usize, Vec<RepoPathBuf>> = BTreeMap::new();
+        for dir in trees_to_write.keys() {
+            dirs_by_depth
+                .entry(dir.components().count())
+                .or_default()
+                .push(dir.clone());
+        }
+
+        // Process from the deepest level down to (but excluding) the root.
+        let depths: Vec<usize> = dirs_by_depth.keys().copied().filter(|d| *d > 0).rev().collect();
+        for depth in depths {
+            let dirs = dirs_by_depth.remove(&depth).unwrap();
+            let mut pending_writes = Vec::new();
+            for dir in dirs {
+                let cur_entries = trees_to_write.remove(&dir).unwrap();
                 if cur_entries.is_empty() {
+                    // Empty subtree: drop it from its parent (unless the entry was
+                    // already replaced with a file override above).
+                    let (parent, basename) = dir.split().unwrap();
+                    let parent_entries = trees_to_write.get_mut(parent).unwrap();
                     if let Some(TreeValue::Tree(_)) = parent_entries.get(basename) {
                         parent_entries.remove(basename);
-                    } else {
-                        // Entry would have been replaced with file (see above)
                     }
                 } else {
                     let data =
                         backend::Tree::from_sorted_entries(cur_entries.into_iter().collect());
-                    let tree = store.write_tree(&dir, data).await?;
-                    parent_entries.insert(basename.to_owned(), TreeValue::Tree(tree.id().clone()));
+                    pending_writes.push((dir, data));
                 }
-            } else {
-                // We're writing the root tree. Write it even if empty. Return its id.
-                assert!(trees_to_write.is_empty());
-                let data = backend::Tree::from_sorted_entries(cur_entries.into_iter().collect());
-                let written_tree = store.write_tree(&dir, data).await?;
-                return Ok(written_tree.id().clone());
+            }
+
+            // Write every non-empty tree at this depth concurrently.
+            let written: Vec<(RepoPathBuf, TreeId)> = stream::iter(pending_writes.into_iter().map(
+                |(dir, data)| {
+                    let store = self.store.clone();
+                    async move {
+                        let tree = store.write_tree(&dir, data).await?;
+                        Ok::<(RepoPathBuf, TreeId), BackendError>((dir, tree.id().clone()))
+                    }
+                },
+            ))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+
+            // Now that the level is durable, link each written tree into its parent.
+            for (dir, tree_id) in written {
+                let (parent, basename) = dir.split().unwrap();
+                let parent_entries = trees_to_write.get_mut(parent).unwrap();
+                parent_entries.insert(basename.to_owned(), TreeValue::Tree(tree_id));
             }
         }
 
-        unreachable!("trees_to_write must contain the root tree");
+        // Finally write the root tree (depth 0), even if empty, and return its id.
+        let root_entries = trees_to_write
+            .remove(&RepoPathBuf::root())
+            .expect("trees_to_write must contain the root tree");
+        let data = backend::Tree::from_sorted_entries(root_entries.into_iter().collect());
+        let written_root = self.store.write_tree(&RepoPathBuf::root(), data).await?;
+        Ok(written_root.id().clone())
     }
 
     async fn get_base_trees(
