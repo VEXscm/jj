@@ -1542,6 +1542,42 @@ fn test_gitignores() -> TestResult {
 }
 
 #[test]
+fn test_jjignore_and_vexignore_are_respected() -> TestResult {
+    // .jjignore and .vexignore are honored alongside .gitignore.
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    let gitignore_path = repo_path(".gitignore");
+    let jjignore_path = repo_path(".jjignore");
+    let vexignore_path = repo_path(".vexignore");
+    let kept_path = repo_path("kept");
+    let git_ignored_path = repo_path("git_ignored");
+    let jj_ignored_path = repo_path("jj_ignored");
+    let vex_ignored_path = repo_path("vex_ignored");
+
+    testutils::write_working_copy_file(&workspace_root, gitignore_path, "git_ignored\n");
+    testutils::write_working_copy_file(&workspace_root, jjignore_path, "jj_ignored\n");
+    testutils::write_working_copy_file(&workspace_root, vexignore_path, "vex_ignored\n");
+    testutils::write_working_copy_file(&workspace_root, kept_path, "1");
+    testutils::write_working_copy_file(&workspace_root, git_ignored_path, "1");
+    testutils::write_working_copy_file(&workspace_root, jj_ignored_path, "1");
+    testutils::write_working_copy_file(&workspace_root, vex_ignored_path, "1");
+
+    let tree = test_workspace.snapshot()?;
+    let files = tree.entries().map(|(name, _value)| name).collect_vec();
+    assert_eq!(
+        files,
+        to_owned_path_vec(&[
+            gitignore_path,
+            jjignore_path,
+            vexignore_path,
+            kept_path,
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn test_gitignores_walk() -> TestResult {
     // Tests that .gitignore files are respected.
 

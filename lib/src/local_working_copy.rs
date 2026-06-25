@@ -818,6 +818,13 @@ fn can_create_new_file(disk_path: &Path) -> Result<bool, CheckoutError> {
 
 const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
 
+/// Per-directory ignore files honored during snapshotting, in increasing
+/// precedence (a later file's rules override an earlier file's). `.gitignore`
+/// keeps Git compatibility; `.jjignore` and `.vexignore` let a repo add
+/// jj/vex-specific excludes (e.g. to prune large generated trees that aren't in
+/// `.gitignore`).
+const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".jjignore", ".vexignore"];
+
 fn file_identity_from_symlink_path(disk_path: &Path) -> io::Result<Option<FileIdentity>> {
     match FileIdentity::from_symlink_path(disk_path) {
         Ok(identity) => Ok(Some(identity)),
@@ -1438,13 +1445,14 @@ impl TreeState {
                             .iter()
                             .filter_map(|path| RepoPathBuf::from_relative_path(path).ok())
                             .collect_vec();
-                        // .gitignore changes require rescanning parent directories to pick up newly
-                        // unignored files.
+                        // Ignore-file changes require rescanning parent directories to pick up
+                        // newly (un)ignored files.
                         let gitignore_prefixes = repo_paths
                             .iter()
                             .filter_map(|repo_path| {
                                 let (parent, basename) = repo_path.split()?;
-                                (basename.as_internal_str() == ".gitignore")
+                                IGNORE_FILE_NAMES
+                                    .contains(&basename.as_internal_str())
                                     .then(|| parent.to_owned())
                             })
                             .collect_vec();
@@ -1543,7 +1551,10 @@ impl FileSnapshotter<'_> {
             file_states,
         } = directory_to_visit;
 
-        let git_ignore = git_ignore.chain_with_file(&dir, disk_dir.join(".gitignore"))?;
+        let mut git_ignore = git_ignore;
+        for ignore_name in IGNORE_FILE_NAMES {
+            git_ignore = git_ignore.chain_with_file(&dir, disk_dir.join(ignore_name))?;
+        }
         let dir_entries: Vec<_> = disk_dir
             .read_dir()
             .and_then(|entries| entries.try_collect())

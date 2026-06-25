@@ -2009,6 +2009,12 @@ to the current parents may contain changes from multiple commits.
         let options = self
             .snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)
             .map_err(snapshot_command_error)?;
+        // Captured before the working-copy mutation borrows `self`, so the slow
+        // snapshot hint below doesn't need to re-borrow it.
+        let fsmonitor_disabled = matches!(
+            jj_lib::fsmonitor::FsmonitorSettings::from_settings(self.settings()),
+            Ok(jj_lib::fsmonitor::FsmonitorSettings::None)
+        );
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
         let mut locked_ws = self
@@ -2026,6 +2032,7 @@ to the current parents may contain changes from multiple commits.
         };
 
         self.user_repo = ReadonlyUserRepo::new(repo);
+        let snapshot_start = std::time::Instant::now();
         let (new_tree, stats) = {
             let mut options = options;
             let progress = crate::progress::snapshot_progress(ui);
@@ -2036,6 +2043,7 @@ to the current parents may contain changes from multiple commits.
                 .await
                 .map_err(snapshot_command_error)?
         };
+        hint_install_fsmonitor(ui, fsmonitor_disabled, snapshot_start.elapsed());
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
             let mut tx = start_repo_transaction(
                 &self.user_repo.repo,
@@ -3072,6 +3080,26 @@ pub fn print_untracked_files(
     }
 
     Ok(())
+}
+
+/// When a snapshot is slow and no filesystem monitor is configured, nudge the
+/// user toward installing one. Vex working copies can be large (tens of
+/// thousands of files), and without a monitor every snapshot must `stat` the
+/// whole tree; watchman makes snapshots incremental instead.
+fn hint_install_fsmonitor(ui: &Ui, fsmonitor_disabled: bool, snapshot_elapsed: std::time::Duration) {
+    const SLOW_SNAPSHOT: std::time::Duration = std::time::Duration::from_secs(1);
+    if !fsmonitor_disabled || snapshot_elapsed < SLOW_SNAPSHOT {
+        return;
+    }
+    writeln!(
+        ui.hint_default(),
+        "Snapshotting the working copy took {:.1}s. Install a filesystem monitor to make \
+         snapshots incremental and fast:\n  brew install watchman   (see \
+         https://facebook.github.io/watchman/docs/install/)\nthen enable it for this repo:\n  \
+         vex config set --repo fsmonitor.backend watchman",
+        snapshot_elapsed.as_secs_f64(),
+    )
+    .ok();
 }
 
 pub fn print_snapshot_stats(
