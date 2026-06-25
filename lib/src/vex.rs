@@ -332,6 +332,17 @@ impl VexClient {
         Some(bytes)
     }
 
+    /// Whether an object is present in the local cache, without reading it.
+    ///
+    /// The cache is content-addressed and only populated after a successful
+    /// upload (or by clone prefetch of server-resident objects), so a hit means
+    /// the object is already on the server. Callers use this to skip redundant
+    /// uploads cheaply (no disk read of the blob body).
+    fn has_cached_object(&self, kind: ObjectKind, content_id: &ContentId) -> bool {
+        self.cache_path(kind, content_id)
+            .is_some_and(|path| path.exists())
+    }
+
     fn write_cached_object(
         &self,
         kind: ObjectKind,
@@ -785,6 +796,13 @@ impl VexClient {
         content_id: &ContentId,
         data: Vec<u8>,
     ) -> Result<(), VexClientError> {
+        // Content-addressed short circuit: if this object is already cached it
+        // was already uploaded, so skip the round trip. This is the hot path
+        // during working-copy snapshots (`vex status`), where unchanged or
+        // recurring blob/tree/commit content would otherwise be re-PUT.
+        if self.has_cached_object(kind, content_id) {
+            return Ok(());
+        }
         let cache_bytes = data.clone();
         Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
             client
