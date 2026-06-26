@@ -262,15 +262,6 @@ struct PackTransferState {
     next_chunk_index: usize,
 }
 
-/// On-disk, short-TTL cache of a repo's operation heads. Lets a fresh `vex`
-/// process skip the cold-connection op-heads round trip; correctness is bounded
-/// by the TTL and the server-side CAS on writes (see `op_heads_cache_ttl_secs`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpHeadsCache {
-    op_head_ids: Vec<String>,
-    cached_at_unix: u64,
-}
-
 fn shared_cache_root(config: &VexRepoConfig) -> Option<PathBuf> {
     std::env::var_os("JJ_VEX_SHARED_CACHE_DIR")
         .map(PathBuf::from)
@@ -316,81 +307,6 @@ impl VexClient {
         self.cache_root
             .as_ref()
             .map(|root| root.join(kind_to_str(kind)).join(content_id.to_string()))
-    }
-
-    /// Path to the per-repo op-heads cache file. Keyed by repo id so a shared
-    /// cache root never crosses repos.
-    fn op_heads_cache_path(&self) -> Option<PathBuf> {
-        self.cache_root
-            .as_ref()
-            .map(|root| root.join("op_heads").join(format!("{}.json", self.config.repo_id)))
-    }
-
-    /// TTL for the op-heads cache. Every `vex` invocation is a fresh process
-    /// that otherwise pays a full TCP+TLS+HTTP/2 handshake before the op-heads
-    /// read, so serving a very-recently-read head lets read-only commands (e.g.
-    /// `vex status`) skip that cold round trip entirely. Bounded-staleness is
-    /// safe: op-head *writes* go through a server-side CAS in `commit_op_heads`,
-    /// so a stale head can never be committed — it just forces a live reload.
-    /// `VEX_OP_HEADS_CACHE_TTL_SECS=0` disables the cache.
-    fn op_heads_cache_ttl_secs() -> u64 {
-        static TTL: OnceLock<u64> = OnceLock::new();
-        *TTL.get_or_init(|| env_secs("VEX_OP_HEADS_CACHE_TTL_SECS", 10))
-    }
-
-    /// Return cached op heads if the cache exists and is younger than the TTL.
-    fn read_fresh_op_heads_cache(&self) -> Option<Vec<ContentId>> {
-        let ttl = Self::op_heads_cache_ttl_secs();
-        if ttl == 0 {
-            return None;
-        }
-        let path = self.op_heads_cache_path()?;
-        let cache: OpHeadsCache = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
-        if now.saturating_sub(cache.cached_at_unix) > ttl {
-            return None;
-        }
-        cache
-            .op_head_ids
-            .iter()
-            .map(|id| ContentId::from_hex(id).ok())
-            .collect()
-    }
-
-    fn write_op_heads_cache(&self, ids: &[ContentId]) {
-        if Self::op_heads_cache_ttl_secs() == 0 {
-            return;
-        }
-        let Some(path) = self.op_heads_cache_path() else {
-            return;
-        };
-        let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
-            return;
-        };
-        let cache = OpHeadsCache {
-            op_head_ids: ids.iter().map(ToString::to_string).collect(),
-            cached_at_unix: now.as_secs(),
-        };
-        let Ok(bytes) = serde_json::to_vec(&cache) else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            drop(fs::create_dir_all(parent));
-        }
-        // Best-effort atomic-ish write; a torn/garbage file just yields a cache
-        // miss (TTL re-fetch), never incorrect heads.
-        if let Ok(mut temp) = NamedTempFile::new_in(path.parent().unwrap_or(&path)) {
-            use std::io::Write as _;
-            if temp.write_all(&bytes).is_ok() {
-                drop(temp.persist(&path));
-            }
-        }
-    }
-
-    fn invalidate_op_heads_cache(&self) {
-        if let Some(path) = self.op_heads_cache_path() {
-            drop(fs::remove_file(path));
-        }
     }
 
     fn transfer_state_root(&self) -> Option<PathBuf> {
@@ -1185,12 +1101,12 @@ impl VexClient {
     }
 
     pub async fn get_op_heads(&self) -> Result<Vec<ContentId>, VexClientError> {
-        // Fast path: serve recently-read heads from the local cache, skipping the
-        // cold-connection round trip. Safe within the TTL because writes CAS on
-        // the server (a stale head can't be committed).
-        if let Some(cached) = self.read_fresh_op_heads_cache() {
-            return Ok(cached);
-        }
+        // Always read op heads live from the server. A client-side cache is
+        // unsafe here: jj records the working-copy operation locally *before* the
+        // commit's server-side CAS runs, so serving a stale head lets jj build a
+        // working-copy op on it; when the CAS then rejects the stale head the
+        // working copy is left pinned to an orphan op, diverging from the backend
+        // head (a "sibling operation" that blocks all further commands).
         let _t = RpcTimer::start(|| "get_op_heads".to_string());
         let response =
             Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
@@ -1214,7 +1130,6 @@ impl VexClient {
                 })
             })
             .collect::<Result<Vec<_>, tonic::Status>>()?;
-        self.write_op_heads_cache(&ids);
         Ok(ids)
     }
 
@@ -1240,14 +1155,6 @@ impl VexClient {
                 .await
                 .map(|response| response.into_inner())
         })?;
-        // Keep the op-heads cache coherent with the authoritative server state:
-        // on a successful CAS the new head is current; on a rejected CAS our
-        // cached head was stale, so drop it to force a live re-read next time.
-        if response.ok {
-            self.write_op_heads_cache(std::slice::from_ref(new_head));
-        } else {
-            self.invalidate_op_heads_cache();
-        }
         Ok(response)
     }
 
@@ -1558,34 +1465,6 @@ mod tests {
             access_token: None,
         })
         .unwrap()
-    }
-
-    #[test]
-    fn op_heads_cache_serves_fresh_and_ignores_stale() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut client = sample_client();
-        client.cache_root = Some(temp_dir.path().to_path_buf());
-
-        let heads = vec![ContentId::hash_bytes(b"op-head-1")];
-
-        // A just-written entry is served from the cache (no network).
-        client.write_op_heads_cache(&heads);
-        assert_eq!(client.read_fresh_op_heads_cache(), Some(heads.clone()));
-
-        // An entry older than the TTL is ignored (forces a live re-read).
-        let path = client.op_heads_cache_path().unwrap();
-        let stale = OpHeadsCache {
-            op_head_ids: heads.iter().map(ToString::to_string).collect(),
-            cached_at_unix: 1, // 1970 — older than any TTL
-        };
-        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
-        assert_eq!(client.read_fresh_op_heads_cache(), None);
-
-        // Invalidation drops the entry entirely.
-        client.write_op_heads_cache(&heads);
-        assert!(client.read_fresh_op_heads_cache().is_some());
-        client.invalidate_op_heads_cache();
-        assert_eq!(client.read_fresh_op_heads_cache(), None);
     }
 
     #[test]
