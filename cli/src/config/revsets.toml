@@ -18,7 +18,14 @@ bookmark-advance-to = "@"
 bookmark-advance-from = "heads(::to & bookmarks())"
 
 [revset-aliases]
-# trunk() can be overridden as '<bookmark>@<remote>'.
+# trunk() can be overridden as '<bookmark>@<remote>', or per-repo via
+#   vex config set --repo 'revset-aliases."trunk()"' '<bookmark>'
+# (the import/clone flow writes that automatically; see vex-cli clone).
+#
+# Vex repos frequently carry the default branch as a *local* bookmark (no
+# `@origin` tracking), so after the remote candidates we also fall back to the
+# local main/master/trunk bookmark before giving up at root(). Without this,
+# trunk() silently resolved to root() in a fresh Vex clone.
 'trunk()' = '''
 latest(
   remote_bookmarks(exact:"main", exact:"origin") |
@@ -27,6 +34,9 @@ latest(
   remote_bookmarks(exact:"main", exact:"upstream") |
   remote_bookmarks(exact:"master", exact:"upstream") |
   remote_bookmarks(exact:"trunk", exact:"upstream") |
+  bookmarks(exact:"main") |
+  bookmarks(exact:"master") |
+  bookmarks(exact:"trunk") |
   root()
 )
 '''
