@@ -588,83 +588,58 @@ impl CommandHelper {
         let op_id = workspace.working_copy().operation_id();
 
         match workspace.repo_loader().load_operation(op_id).await {
-            Ok(op) => {
-                let repo = workspace.repo_loader().load_at(&op).await?;
-                let mut workspace_command = self.for_workable_repo(ui, workspace, repo)?;
-                workspace_command.check_working_copy_writable()?;
-
-                // Snapshot the current working copy on top of the last known working-copy
-                // operation, then merge the divergent operations. The wc_commit_id of the
-                // merged repo wouldn't change because the old one wins, but it's probably
-                // fine if we picked the new wc_commit_id.
-                let stale_stats = workspace_command
-                    .snapshot_working_copy(ui)
-                    .await
-                    .map_err(|err| err.into_command_error())?;
-
-                let wc_commit_id = workspace_command.get_wc_commit_id().unwrap();
-                let repo = workspace_command.repo().clone();
-                let stale_wc_commit = repo.store().get_commit_async(wc_commit_id).await?;
-
+            Ok(_op) => {
+                // The working copy's recorded operation is no longer an op head.
+                //
+                // jj's upstream recovery snapshots the working copy on top of that *stale*
+                // op and relies on the op-heads store *merging* the resulting divergent
+                // operation (and the later wc-update op) back into the head. That requires
+                // an op-heads store that can hold more than one head transiently. The Vex
+                // op-heads store instead enforces a strict single-head CAS: every recorded
+                // operation must be parented on the current head, and anything else is
+                // rejected with a "CAS conflict on op heads". So the upstream merge-based
+                // recovery dies partway through and leaves the working copy permanently
+                // pinned to a stale op the backend will never accept (the recurring
+                // "working copy is stale" / "sibling operation" lockup).
+                //
+                // Recover the way the lost-operation branch below does instead: create a
+                // recovery commit on the *current op head*. Every operation that records
+                // (the recovery commit, then the re-snapshot) is parented on the live head,
+                // which the strict CAS accepts, and the working-copy contents are preserved
+                // as uncommitted changes on the recovered commit. We still honor the
+                // not-actually-stale case so `update-stale` on a fresh workspace is a no-op.
                 let mut workspace_command = self.workspace_helper_no_snapshot(ui).await?;
-
                 let repo = workspace_command.repo().clone();
                 let (mut locked_ws, desired_wc_commit) = workspace_command
                     .unchecked_start_working_copy_mutation()
                     .await?;
-                match WorkingCopyFreshness::check_stale(
+                let freshness = WorkingCopyFreshness::check_stale(
                     locked_ws.locked_wc(),
                     &desired_wc_commit,
                     &repo,
                 )
-                .await?
-                {
+                .await?;
+                drop(locked_ws);
+                match freshness {
                     WorkingCopyFreshness::Fresh | WorkingCopyFreshness::Updated(_) => {
-                        drop(locked_ws);
                         writeln!(
                             ui.status(),
                             "Attempted recovery, but the working copy is not stale"
                         )?;
+                        let stats = workspace_command
+                            .maybe_snapshot_impl(ui)
+                            .await
+                            .map_err(|err| err.into_command_error())?;
+                        Ok((workspace_command, stats))
                     }
                     WorkingCopyFreshness::WorkingCopyStale
                     | WorkingCopyFreshness::SiblingOperation => {
-                        let stats = update_stale_working_copy(
-                            locked_ws,
-                            repo.op_id().clone(),
-                            &stale_wc_commit,
-                            &desired_wc_commit,
-                        )
-                        .await?;
-                        workspace_command.print_updated_working_copy_stats(
-                            ui,
-                            Some(&stale_wc_commit),
-                            &desired_wc_commit,
-                            &stats,
-                        )?;
-                        writeln!(
-                            ui.status(),
-                            "Updated working copy to fresh commit {}",
-                            short_commit_hash(desired_wc_commit.id())
-                        )?;
+                        let stats = workspace_command
+                            .create_and_check_out_recovery_commit(ui)
+                            .await?;
+                        Ok((workspace_command, stats))
                     }
                 }
-
-                // There may be Git refs to import, so snapshot again. Git HEAD
-                // will also be imported if it was updated after the working
-                // copy became stale. The result wouldn't be ideal, but there
-                // should be no data loss at least.
-                let fresh_stats = workspace_command
-                    .maybe_snapshot_impl(ui)
-                    .await
-                    .map_err(|err| err.into_command_error())?;
-                let merged_stats = {
-                    let SnapshotStats {
-                        mut untracked_paths,
-                    } = stale_stats;
-                    untracked_paths.extend(fresh_stats.untracked_paths);
-                    SnapshotStats { untracked_paths }
-                };
-                Ok((workspace_command, merged_stats))
             }
             Err(e @ OpStoreError::ObjectNotFound { .. }) => {
                 writeln!(
@@ -2906,34 +2881,6 @@ See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy \
         }
         Err(e) => Err(snapshot_command_error(e)),
     }
-}
-
-async fn update_stale_working_copy(
-    mut locked_ws: LockedWorkspace<'_>,
-    op_id: OperationId,
-    stale_commit: &Commit,
-    new_commit: &Commit,
-) -> Result<CheckoutStats, CommandError> {
-    // The same check as start_working_copy_mutation(), but with the stale
-    // working-copy commit.
-    if stale_commit.tree().tree_ids_and_labels()
-        != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
-    {
-        return Err(user_error("Concurrent working copy operation. Try again."));
-    }
-    let stats = locked_ws
-        .locked_wc()
-        .check_out(new_commit)
-        .await
-        .map_err(|err| {
-            internal_error_with_message(
-                format!("Failed to check out commit {}", new_commit.id().hex()),
-                err,
-            )
-        })?;
-    locked_ws.finish(op_id).await?;
-
-    Ok(stats)
 }
 
 /// Prints a list of commits by the given summary template. The list may be
