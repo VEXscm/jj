@@ -24,6 +24,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -58,6 +60,49 @@ use crate::vex_op_heads_store::VexOpHeadsStore;
 use crate::vex_op_store::VexOpStore;
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
+
+/// Set when the command's paged output has been closed by its reader (e.g. the
+/// user quit the pager). In-flight blocking backend RPCs observe this and abort
+/// promptly with a broken-pipe error so the process can exit instead of running
+/// work nobody will read. Process-global because there is exactly one command
+/// per process.
+static OUTPUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Signal that paged output has been closed by the reader. Called by the CLI
+/// pager watcher when the pager process (external) or pager thread (builtin)
+/// goes away.
+pub fn signal_output_closed() {
+    OUTPUT_CLOSED.store(true, Ordering::SeqCst);
+}
+
+fn output_closed() -> bool {
+    OUTPUT_CLOSED.load(Ordering::SeqCst)
+}
+
+/// Drive `fut` to completion, but bail out promptly with a broken-pipe error if
+/// the paged output is closed while we're waiting. Polls the cancellation flag
+/// on a short interval so a blocking RPC (including its retry backoff) unwinds
+/// within ~100ms of the pager being quit, instead of leaving the process alive
+/// until the request finishes.
+async fn with_output_cancel<T, Fut>(fut: Fut) -> Result<T, VexClientError>
+where
+    Fut: std::future::Future<Output = Result<T, VexClientError>>,
+{
+    tokio::pin!(fut);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), &mut fut).await {
+            Ok(result) => return result,
+            Err(_elapsed) => {
+                if output_closed() {
+                    return Err(VexClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "output closed before backend request completed (pager quit)",
+                    )));
+                }
+            }
+        }
+    }
+}
 
 /// Max gRPC message size for both directions. The default tonic decode limit is
 /// 4 MiB, which is smaller than legitimately large objects (e.g. a >4 MiB file
@@ -206,6 +251,14 @@ pub struct VexRepoConfig {
     pub repo_slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
+    /// When true, `put_object` writes objects only to the local content-addressed
+    /// cache and never issues a gRPC `PutObject` to the backend. Used by the
+    /// READ_ONLY ephemeral CI runner so cloning a workspace (which creates an
+    /// editable `@` working-copy commit + op-log) does not require Write access to
+    /// the backend. Opt-in only; defaults to false so normal clones/commits/pushes
+    /// continue to persist to the backend.
+    #[serde(default)]
+    pub local_writes: bool,
 }
 
 impl VexRepoConfig {
@@ -246,6 +299,9 @@ pub struct VexClient {
     config: VexRepoConfig,
     cache_root: Option<PathBuf>,
     cache_max_bytes: Option<u64>,
+    /// Mirror of `config.local_writes`. When true, `put_object` short-circuits to
+    /// the local cache instead of issuing a gRPC `PutObject` (READ_ONLY CI runner).
+    local_writes: bool,
 }
 
 #[derive(Debug)]
@@ -277,10 +333,12 @@ fn cache_max_bytes() -> Option<u64> {
 impl VexClient {
     pub fn from_config(config: VexRepoConfig) -> Result<Self, VexConfigError> {
         Self::endpoint(&config.endpoint)?;
+        let local_writes = config.local_writes;
         Ok(Self {
             config,
             cache_root: None,
             cache_max_bytes: cache_max_bytes(),
+            local_writes,
         })
     }
 
@@ -292,15 +350,24 @@ impl VexClient {
             .ok_or_else(|| VexConfigError::InvalidStorePath(store_path.to_path_buf()))?;
         let cache_root = shared_cache_root(&config).unwrap_or_else(|| repo_path.join("vex-cache"));
         fs::create_dir_all(&cache_root)?;
+        let local_writes = config.local_writes;
         Ok(Self {
             config,
             cache_root: Some(cache_root),
             cache_max_bytes: cache_max_bytes(),
+            local_writes,
         })
     }
 
     pub fn config(&self) -> &VexRepoConfig {
         &self.config
+    }
+
+    /// Whether this client is in local-write mode (READ_ONLY CI runner): writes
+    /// resolve to the local cache instead of the backend. See `put_object` and
+    /// [`crate::vex_op_heads_store::VexOpHeadsStore`].
+    pub fn local_writes(&self) -> bool {
+        self.local_writes
     }
 
     fn cache_path(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PathBuf> {
@@ -521,12 +588,12 @@ impl VexClient {
         Fut: Future<Output = Result<T, tonic::Status>>,
     {
         let channel = Self::cached_channel(endpoint)?;
-        Self::shared_grpc_runtime().block_on(async move {
+        Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
             let client = JjBackendClient::new(channel)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
             f(client).await.map_err(Into::into)
-        })
+        }))
     }
 
     /// Whether a gRPC status is worth retrying. Transient transport/edge
@@ -561,7 +628,7 @@ impl VexClient {
     {
         let channel = Self::cached_channel(endpoint)?;
         let attempts = attempts.max(1);
-        Self::shared_grpc_runtime().block_on(async move {
+        Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
             let mut attempt = 0;
             loop {
                 attempt += 1;
@@ -578,7 +645,7 @@ impl VexClient {
                     Err(status) => return Err(status.into()),
                 }
             }
-        })
+        }))
     }
 
     fn block_on_http_get(
@@ -589,7 +656,7 @@ impl VexClient {
             .enable_all()
             .build()
             .map_err(VexClientError::Runtime)?;
-        runtime.block_on(async move {
+        runtime.block_on(with_output_cancel(async move {
             let client = reqwest::Client::new();
             let mut request = client.get(url);
             for (name, value) in headers {
@@ -598,7 +665,7 @@ impl VexClient {
             let response = request.send().await?.error_for_status()?;
             let bytes = response.bytes().await?;
             Ok(bytes.to_vec())
-        })
+        }))
     }
 
     fn block_on_http_get_to_file(
@@ -610,7 +677,7 @@ impl VexClient {
             .enable_all()
             .build()
             .map_err(VexClientError::Runtime)?;
-        runtime.block_on(async move {
+        runtime.block_on(with_output_cancel(async move {
             let client = reqwest::Client::new();
             let mut request = client.get(url);
             for (name, value) in headers {
@@ -622,7 +689,7 @@ impl VexClient {
             }
             out.flush()?;
             Ok(())
-        })
+        }))
     }
 
     fn direct_fetch_pack_bytes(
@@ -818,6 +885,7 @@ impl VexClient {
             repo_id: repo.repo_id,
             repo_slug: repo.repo_slug,
             access_token: access_token.map(ToOwned::to_owned),
+            local_writes: false,
         })
     }
 
@@ -847,6 +915,7 @@ impl VexClient {
             repo_id: repo.repo_id,
             repo_slug: repo.repo_slug,
             access_token: access_token.map(ToOwned::to_owned),
+            local_writes: false,
         })
     }
 
@@ -857,6 +926,16 @@ impl VexClient {
         data: Vec<u8>,
     ) -> Result<(), VexClientError> {
         let _t = RpcTimer::start(|| format!("put_object/{}", kind_to_str(kind)));
+        // Local-write mode (READ_ONLY CI runner): persist the object only to the
+        // local content-addressed cache and never contact the backend. The clone's
+        // editable `@` working-copy commit (+ its tree) and the op-log objects
+        // (view/operation/op-head) are written here; reads check the cache before
+        // the network (see `get_object`), so they resolve back correctly without
+        // requiring Write access to the backend.
+        if self.local_writes {
+            self.write_cached_object(kind, content_id, &data)?;
+            return Ok(());
+        }
         // Content-addressed short circuit: if this object is already cached it
         // was already uploaded, so skip the round trip. This is the hot path
         // during working-copy snapshots (`vex status`), where unchanged or
@@ -1463,6 +1542,7 @@ mod tests {
             repo_id: "repo".to_string(),
             repo_slug: "repo".to_string(),
             access_token: None,
+            local_writes: false,
         })
         .unwrap()
     }

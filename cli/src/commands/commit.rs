@@ -212,12 +212,13 @@ new working-copy commit.
         let description = description_template(ui, &tx, intro, &temp_commit)?;
         let description = edit_description(&text_editor, &description)?;
         if description.is_empty() {
+            let cli_name = crate::cli_util::current_cli_name();
             writedoc!(
                 ui.hint_default(),
                 "
                 The commit message was left empty.
-                If this was not intentional, run `jj undo` to restore the previous state.
-                Or run `jj desc @-` to add a description to the parent commit.
+                If this was not intentional, run `{cli_name} undo` to restore the previous state.
+                Or run `{cli_name} desc @-` to add a description to the parent commit.
                 "
             )?;
         }

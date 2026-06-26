@@ -160,6 +160,30 @@ fn test_commit_with_empty_description_from_editor() -> TestResult {
 }
 
 #[test]
+fn test_commit_with_empty_description_from_editor_uses_current_cli_name_in_hint() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    std::fs::write(&edit_script, ["dump editor0"].join("\0"))?;
+    let output = work_dir
+        .run_jj_with_executable_name("vex", ["commit"])
+        .success();
+
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Hint: The commit message was left empty.
+    If this was not intentional, run `vex undo` to restore the previous state.
+    Or run `vex desc @-` to add a description to the parent commit.
+    Working copy  (@) now at: rlvkpnrz 51b556e2 (empty) (no description set)
+    Parent commit (@-)      : qpvuntsm cc8ff228 (empty) (no description set)
+    [EOF]
+    ");
+    Ok(())
+}
+
+#[test]
 fn test_commit_interactive() -> TestResult {
     let mut test_env = TestEnvironment::default();
     let edit_script = test_env.set_up_fake_editor();

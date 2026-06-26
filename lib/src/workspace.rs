@@ -27,6 +27,7 @@ use std::time::UNIX_EPOCH;
 use thiserror::Error;
 
 use crate::backend::BackendInitError;
+use crate::backend::CommitId;
 use crate::commit::Commit;
 use crate::file_util;
 use crate::file_util::BadPathEncoding;
@@ -444,8 +445,11 @@ impl Workspace {
                         root_data,
                     )?))
                 },
-                &move |_settings, _store_path| {
-                    Ok(Box::new(VexOpHeadsStore::init(op_heads_config.clone())?))
+                &move |_settings, store_path| {
+                    Ok(Box::new(VexOpHeadsStore::init(
+                        op_heads_config.clone(),
+                        store_path,
+                    )?))
                 },
                 ReadonlyRepo::default_index_store_initializer(),
                 ReadonlyRepo::default_submodule_store_initializer(),
@@ -482,6 +486,10 @@ impl Workspace {
         workspace_root: &Path,
         config: VexRepoConfig,
         blob_mode: CloneBlobMode,
+        // When `Some`, the working copy is checked out at this exact commit
+        // instead of the bookmark head `clone_vex_start_commit` would pick. CI
+        // runners use this to materialize the pipeline's `commit_sha` directly.
+        target_commit: Option<&CommitId>,
         working_copy_factory: &dyn WorkingCopyFactory,
         progress: Option<&crate::vex::CloneProgressFn>,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
@@ -574,7 +582,14 @@ impl Workspace {
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
-            let start_commit = clone_vex_start_commit(&repo).await?;
+            let start_commit = match target_commit {
+                Some(commit_id) => repo
+                    .store()
+                    .get_commit_async(commit_id)
+                    .await
+                    .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
+                None => clone_vex_start_commit(&repo).await?,
+            };
             if let Some(progress) = progress {
                 progress(crate::vex::CloneProgress::CheckingOut);
             }

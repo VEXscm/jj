@@ -110,6 +110,7 @@ pub(crate) async fn cmd_vex_clone(
             &canonical_wc_path,
             config,
             blob_mode,
+            None,
             &*working_copy_factory,
             None,
         )

@@ -124,7 +124,24 @@ impl TestEnvironment {
     #[must_use]
     pub fn new_jj_cmd(&self) -> assert_cmd::Command {
         let jj_path = assert_cmd::cargo::cargo_bin!("jj");
-        let mut cmd = assert_cmd::Command::new(jj_path);
+        self.new_jj_cmd_at(jj_path)
+    }
+
+    #[must_use]
+    pub fn new_jj_cmd_with_executable_name(&self, executable_name: &str) -> assert_cmd::Command {
+        let jj_path = assert_cmd::cargo::cargo_bin!("jj");
+        let mut named_path = self.env_root.join(executable_name);
+        if cfg!(windows) && named_path.extension().is_none() {
+            named_path.set_extension("exe");
+        }
+        if !named_path.exists() {
+            std::fs::copy(jj_path, &named_path).unwrap();
+        }
+        self.new_jj_cmd_at(named_path)
+    }
+
+    fn new_jj_cmd_at(&self, jj_path: impl AsRef<Path>) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::new(jj_path.as_ref());
         cmd.current_dir(&self.env_root);
         cmd.env_clear();
         cmd.env("COLUMNS", "100");
@@ -360,6 +377,23 @@ impl TestWorkDir<'_> {
         let env = &self.env;
         let mut cmd = env.new_jj_cmd();
         let output = configure(cmd.current_dir(&self.root)).output().unwrap();
+        CommandOutput {
+            stdout: env.normalize_output(String::from_utf8(output.stdout).unwrap()),
+            stderr: env.normalize_output(String::from_utf8(output.stderr).unwrap()),
+            status: output.status,
+        }
+    }
+
+    /// Runs the `jj` binary through a chosen executable filename.
+    #[must_use = "either snapshot the output or assert the exit status with .success()"]
+    pub fn run_jj_with_executable_name<I>(&self, executable_name: &str, args: I) -> CommandOutput
+    where
+        I: IntoIterator,
+        I::Item: AsRef<OsStr>,
+    {
+        let env = &self.env;
+        let mut cmd = env.new_jj_cmd_with_executable_name(executable_name);
+        let output = cmd.current_dir(&self.root).args(args).output().unwrap();
         CommandOutput {
             stdout: env.normalize_output(String::from_utf8(output.stdout).unwrap()),
             stderr: env.normalize_output(String::from_utf8(output.stderr).unwrap()),

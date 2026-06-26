@@ -244,6 +244,18 @@ impl From<io::Error> for CommandError {
     }
 }
 
+/// Returns true if `err` or any error in its `source()` chain is a broken-pipe
+/// I/O error. Backend/op-store work that was aborted because the reader went
+/// away (e.g. the user quit the pager) surfaces this way; treating it as a
+/// broken pipe lets the process exit gracefully instead of reporting an
+/// internal error.
+fn is_broken_pipe(err: &(dyn error::Error + 'static)) -> bool {
+    iter::successors(Some(err), |&e| e.source()).any(|e| {
+        e.downcast_ref::<io::Error>()
+            .is_some_and(|io_err| io_err.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
 impl From<jj_lib::file_util::PathError> for CommandError {
     fn from(err: jj_lib::file_util::PathError) -> Self {
         user_error(err)
@@ -317,6 +329,9 @@ impl From<RenameWorkspaceError> for CommandError {
 
 impl From<BackendError> for CommandError {
     fn from(err: BackendError) -> Self {
+        if is_broken_pipe(&err) {
+            return CommandError::new(CommandErrorKind::BrokenPipe, err);
+        }
         match &err {
             BackendError::Unsupported(_) => user_error(err),
             _ => internal_error_with_message("Unexpected error from backend", err),
@@ -332,6 +347,9 @@ impl From<IndexError> for CommandError {
 
 impl From<OpHeadsStoreError> for CommandError {
     fn from(err: OpHeadsStoreError) -> Self {
+        if is_broken_pipe(&err) {
+            return CommandError::new(CommandErrorKind::BrokenPipe, err);
+        }
         internal_error_with_message("Unexpected error from operation heads store", err)
     }
 }
@@ -410,12 +428,18 @@ impl From<SnapshotError> for CommandError {
 
 impl From<OpStoreError> for CommandError {
     fn from(err: OpStoreError) -> Self {
+        if is_broken_pipe(&err) {
+            return CommandError::new(CommandErrorKind::BrokenPipe, err);
+        }
         internal_error_with_message("Failed to load an operation", err)
     }
 }
 
 impl From<RepoLoaderError> for CommandError {
     fn from(err: RepoLoaderError) -> Self {
+        if is_broken_pipe(&err) {
+            return CommandError::new(CommandErrorKind::BrokenPipe, err);
+        }
         internal_error_with_message("Failed to load the repo", err)
     }
 }

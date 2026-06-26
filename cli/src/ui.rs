@@ -64,6 +64,46 @@ enum UiOutput {
     Null,
 }
 
+/// Watch the pager's output pipe and, when its reader goes away (the external
+/// pager process exits, or the builtin pager thread drops its read end), tell
+/// the backend so any in-flight blocking RPC aborts instead of running to
+/// completion. Without this, quitting the pager while the backend is mid-request
+/// leaves the process alive until that request finishes and only then notices
+/// the broken pipe. Fire-and-forget: the thread exits on hangup, on our side
+/// closing the pipe during normal teardown (`POLLNVAL`), or when the process
+/// exits.
+#[cfg(unix)]
+fn spawn_pager_close_watcher(fd: std::os::fd::RawFd) {
+    thread::spawn(move || {
+        loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: 0,
+                revents: 0,
+            };
+            // POLLHUP/POLLERR/POLLNVAL are reported regardless of `events`; the
+            // 1s timeout just lets the thread wake periodically.
+            let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            if ret < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if ret == 0 {
+                continue; // timeout; pager still alive
+            }
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                jj_lib::vex::signal_output_closed();
+                break;
+            }
+            if pfd.revents & libc::POLLNVAL != 0 {
+                break; // our write end was closed during normal teardown
+            }
+        }
+    });
+}
+
 impl UiOutput {
     fn new_terminal() -> Self {
         Self::Terminal {
@@ -77,6 +117,11 @@ impl UiOutput {
         tracing::info!(?cmd, "spawning pager");
         let mut child = cmd.stdin(Stdio::piped()).spawn()?;
         let child_stdin = child.stdin.take().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            spawn_pager_close_watcher(child_stdin.as_raw_fd());
+        }
         Ok(Self::Paged { child, child_stdin })
     }
 
@@ -105,6 +150,11 @@ impl UiOutput {
         pager.add_stream(out_rd, "")?;
         pager.add_error_stream(err_rd, "stderr")?;
 
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            spawn_pager_close_watcher(out_wr.as_raw_fd());
+        }
         Ok(Self::BuiltinPaged {
             out_wr,
             err_wr,
