@@ -71,7 +71,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 toml_edit = { workspace = true }
-tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-ring"] }
+tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-webpki-roots", "tls-ring"] }
 tracing = { workspace = true }
 watchman_client = { workspace = true, optional = true }
 

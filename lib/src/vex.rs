@@ -330,9 +330,42 @@ fn cache_max_bytes() -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+/// Max buffered upload bytes before an inline flush during a snapshot. Bounds
+/// peak memory for very large snapshots while still letting a normal snapshot
+/// (a handful of small objects) coalesce into a single batched upload.
+const PENDING_FLUSH_BYTES: usize = 32 * 1024 * 1024;
+/// Companion object-count cap to [`PENDING_FLUSH_BYTES`].
+const PENDING_FLUSH_OBJECTS: usize = 256;
+
+/// Objects written this process that have not yet been uploaded, keyed by repo
+/// (`endpoint` + `repo_id`) so the three Vex stores of one repo — object
+/// backend, op store, op heads store — share a single buffer even though each
+/// holds its own [`VexClient`].
+///
+/// Snapshotting the working copy writes a dependency chain — the file blob, the
+/// trees above it, the working-copy commit, then the operation and view — whose
+/// ids are all content hashes computed locally. Uploading them one blocking
+/// `put_object` round trip at a time makes `vex status` after an edit pay the
+/// backend latency several times over; buffering them here lets a single
+/// pipelined `put_objects` batch publish the whole set just before the op-head
+/// CAS references it (see [`VexClient::commit_op_heads`]).
+///
+/// Invariant: an object is written to the on-disk cache only *after* it has been
+/// uploaded, so the content-addressed "cached ⟹ present on server" short circuit
+/// in [`VexClient::put_object`] stays sound across processes even if this one
+/// dies mid-snapshot. Reads consult this buffer before the network so a
+/// within-process read of a just-written object still resolves.
+static PENDING_UPLOADS: OnceLock<Mutex<HashMap<String, PendingUploads>>> = OnceLock::new();
+
+#[derive(Default)]
+struct PendingUploads {
+    objects: HashMap<(ObjectKind, ContentId), Vec<u8>>,
+    bytes: usize,
+}
+
 impl VexClient {
     pub fn from_config(config: VexRepoConfig) -> Result<Self, VexConfigError> {
-        Self::endpoint(&config.endpoint)?;
+        Self::validate_endpoint(&config.endpoint)?;
         let local_writes = config.local_writes;
         Ok(Self {
             config,
@@ -344,7 +377,7 @@ impl VexClient {
 
     pub fn from_store_path(store_path: &Path) -> Result<Self, VexConfigError> {
         let config = VexRepoConfig::load_from_store_path(store_path)?;
-        Self::endpoint(&config.endpoint)?;
+        Self::validate_endpoint(&config.endpoint)?;
         let repo_path = store_path
             .parent()
             .ok_or_else(|| VexConfigError::InvalidStorePath(store_path.to_path_buf()))?;
@@ -514,12 +547,68 @@ impl VexClient {
         Ok(())
     }
 
-    fn endpoint(endpoint: &str) -> Result<Endpoint, VexConfigError> {
-        let endpoint =
-            Endpoint::new(endpoint.to_string()).map_err(|err| VexConfigError::InvalidEndpoint {
+    /// Validate that `endpoint` is a well-formed URI without building a TLS
+    /// connector.
+    ///
+    /// Each `vex` command opens three Vex stores — the object backend, the op
+    /// store, and the op heads store — and every one validates the same endpoint
+    /// on open. `Endpoint::from_shared` performs the same URI parsing that
+    /// [`Self::endpoint`] relies on (same error surface) but attaches no TLS
+    /// connector, so validation is effectively free. The one connector we
+    /// actually need is built lazily, once per process, in
+    /// [`Self::cached_channel`].
+    fn validate_endpoint(endpoint: &str) -> Result<(), VexConfigError> {
+        Endpoint::from_shared(endpoint.to_string())
+            .map(|_| ())
+            .map_err(|err| VexConfigError::InvalidEndpoint {
                 endpoint: endpoint.to_string(),
                 message: err.to_string(),
-            })?;
+            })
+    }
+
+    /// Whether `endpoint` speaks TLS (its scheme is `https`). Plaintext `http`
+    /// endpoints (e.g. a local dev backend) get no TLS connector attached.
+    fn endpoint_is_https(endpoint: &str) -> bool {
+        endpoint
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    }
+
+    /// Whether to verify the server against the system trust store instead of
+    /// the compiled-in webpki roots. Off by default (webpki, which needs no
+    /// keychain read); set `VEX_TLS_NATIVE_ROOTS=1` when the backend is reached
+    /// through a TLS-intercepting proxy that presents a private/corporate root
+    /// CA the system trusts but the webpki (Mozilla) set does not.
+    fn native_tls_roots_requested() -> bool {
+        matches!(
+            std::env::var("VEX_TLS_NATIVE_ROOTS").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    }
+
+    fn endpoint(endpoint: &str) -> Result<Endpoint, VexConfigError> {
+        let mkerr = |err: tonic::transport::Error| VexConfigError::InvalidEndpoint {
+            endpoint: endpoint.to_string(),
+            message: err.to_string(),
+        };
+        // Build with `from_shared` rather than `Endpoint::new`: `new`
+        // auto-attaches, for every `https` URI, a TLS connector built from the
+        // *system* root store — a ~100ms macOS keychain read + cert parse paid
+        // on every short-lived `vex` command. Attach the connector ourselves
+        // from the compiled-in webpki (Mozilla) roots instead — instant, no
+        // keychain — falling back to the system trust store only when
+        // `VEX_TLS_NATIVE_ROOTS` is set (see `native_tls_roots_requested`).
+        let is_https = Self::endpoint_is_https(endpoint);
+        let mut endpoint = Endpoint::from_shared(endpoint.to_string()).map_err(mkerr)?;
+        if is_https {
+            let tls = tonic::transport::ClientTlsConfig::new();
+            let tls = if Self::native_tls_roots_requested() {
+                tls.with_native_roots()
+            } else {
+                tls.with_webpki_roots()
+            };
+            endpoint = endpoint.tls_config(tls).map_err(mkerr)?;
+        }
         // Bound cold-start tail latency: a `vex` process is short-lived and pays
         // a fresh TCP+TLS+HTTP/2 handshake on its first call, so cap how long a
         // hung connect/request can stall a command. HTTP/2 keepalive keeps the
@@ -919,6 +1008,150 @@ impl VexClient {
         })
     }
 
+    /// Buffer key for [`PENDING_UPLOADS`]: one entry per repo, shared by every
+    /// `VexClient` (backend / op store / op heads store) pointing at it.
+    fn pending_key(&self) -> String {
+        format!("{}\u{0}{}", self.config.endpoint, self.config.repo_id)
+    }
+
+    /// Whether snapshot writes should be buffered and uploaded in one batch
+    /// rather than one blocking round trip per object. On by default; set
+    /// `VEX_BATCH_SNAPSHOT_UPLOADS=0` (or `false`/`no`) to fall back to
+    /// immediate per-object PUTs. Never batches in local-write mode, where puts
+    /// already stay local and there is no backend round trip to coalesce.
+    fn defer_uploads_enabled(&self) -> bool {
+        if self.local_writes {
+            return false;
+        }
+        !matches!(
+            std::env::var("VEX_BATCH_SNAPSHOT_UPLOADS").ok().as_deref(),
+            Some("0") | Some("false") | Some("no")
+        )
+    }
+
+    /// Buffer one object for later batched upload. Returns `true` when the
+    /// buffer has reached its byte/object cap and the caller should flush. A
+    /// no-op (returns `false`) if the object is already buffered.
+    fn buffer_pending_object(&self, kind: ObjectKind, content_id: &ContentId, data: Vec<u8>) -> bool {
+        let map = PENDING_UPLOADS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap();
+        let pending = guard.entry(self.pending_key()).or_default();
+        if pending.objects.contains_key(&(kind, *content_id)) {
+            return false;
+        }
+        pending.bytes += data.len();
+        pending.objects.insert((kind, *content_id), data);
+        pending.bytes >= PENDING_FLUSH_BYTES || pending.objects.len() >= PENDING_FLUSH_OBJECTS
+    }
+
+    /// Whether `content_id` is already buffered for upload by this process.
+    fn has_pending_object(&self, kind: ObjectKind, content_id: &ContentId) -> bool {
+        PENDING_UPLOADS
+            .get()
+            .map(|map| {
+                map.lock()
+                    .unwrap()
+                    .get(&self.pending_key())
+                    .is_some_and(|pending| pending.objects.contains_key(&(kind, *content_id)))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Read a buffered-but-not-yet-uploaded object — lets a within-process read
+    /// of an object just written this snapshot resolve before it is flushed.
+    fn read_pending_object(&self, kind: ObjectKind, content_id: &ContentId) -> Option<Vec<u8>> {
+        PENDING_UPLOADS.get().and_then(|map| {
+            map.lock()
+                .unwrap()
+                .get(&self.pending_key())
+                .and_then(|pending| pending.objects.get(&(kind, *content_id)).cloned())
+        })
+    }
+
+    /// Upload every buffered object for this repo in one pipelined set of
+    /// `put_objects` batches, then record them in the on-disk cache. Called
+    /// before the op-head CAS (and when the in-memory buffer hits its cap) so
+    /// every object an operation references is durable on the server first, and
+    /// so the cache only ever names objects that are already uploaded.
+    ///
+    /// This is a blocking call (it drives the shared gRPC runtime) intended for
+    /// the same single-threaded executor that drives the other `VexClient`
+    /// methods; it must not be invoked from within the shared runtime.
+    pub fn flush_pending_uploads(&self) -> Result<(), VexClientError> {
+        let drained: Vec<(ObjectKind, ContentId, Vec<u8>)> = {
+            let Some(map) = PENDING_UPLOADS.get() else {
+                return Ok(());
+            };
+            let mut guard = map.lock().unwrap();
+            match guard.get_mut(&self.pending_key()) {
+                Some(pending) if !pending.objects.is_empty() => {
+                    pending.bytes = 0;
+                    pending
+                        .objects
+                        .drain()
+                        .map(|((kind, id), data)| (kind, id, data))
+                        .collect()
+                }
+                _ => return Ok(()),
+            }
+        };
+        let _t = RpcTimer::start(|| format!("flush_pending_uploads/{}", drained.len()));
+
+        // Split into size/count-bounded batches and upload them concurrently
+        // over the one cached connection.
+        let mut batches: Vec<Vec<InlineObject>> = Vec::new();
+        let mut current: Vec<InlineObject> = Vec::new();
+        let mut current_bytes = 0usize;
+        for (kind, id, data) in &drained {
+            current_bytes += data.len();
+            current.push(InlineObject {
+                object: Some(ObjectId {
+                    kind: kind_to_str(*kind).to_string(),
+                    content_id: id.to_string(),
+                }),
+                data: data.clone(),
+            });
+            if current.len() >= PENDING_FLUSH_OBJECTS || current_bytes >= PENDING_FLUSH_BYTES {
+                batches.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+
+        let channel = Self::cached_channel(&self.config.endpoint)?;
+        let repo_id = self.config.repo_id.clone();
+        let token = self.config.access_token.clone();
+        Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
+            use futures::stream::TryStreamExt as _;
+            futures::stream::iter(batches.into_iter().map(Ok::<_, VexClientError>))
+                .try_for_each_concurrent(16, |objects| {
+                    let channel = channel.clone();
+                    let repo_id = repo_id.clone();
+                    let token = token.clone();
+                    async move {
+                        JjBackendClient::new(channel)
+                            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                            .put_objects(Self::auth_request(
+                                PutObjectsRequest { repo_id, objects },
+                                token.as_deref(),
+                            )?)
+                            .await?;
+                        Ok(())
+                    }
+                })
+                .await
+        }))?;
+
+        // Now — and only now — is "cached ⟹ uploaded" true for these objects.
+        for (kind, id, data) in &drained {
+            self.write_cached_object(*kind, id, data)?;
+        }
+        Ok(())
+    }
+
     pub async fn put_object(
         &self,
         kind: ObjectKind,
@@ -941,6 +1174,20 @@ impl VexClient {
         // during working-copy snapshots (`vex status`), where unchanged or
         // recurring blob/tree/commit content would otherwise be re-PUT.
         if self.has_cached_object(kind, content_id) {
+            return Ok(());
+        }
+        // Snapshot batching: buffer the object instead of uploading it inline,
+        // so the blob/tree/commit/op/view chain a snapshot writes is published
+        // in one pipelined `put_objects` batch at the op-head CAS rather than
+        // one blocking round trip each (see [`PENDING_UPLOADS`]). Already-buffered
+        // objects are deduplicated by `buffer_pending_object`.
+        if self.defer_uploads_enabled() {
+            if !self.has_pending_object(kind, content_id) {
+                let over_cap = self.buffer_pending_object(kind, content_id, data);
+                if over_cap {
+                    self.flush_pending_uploads()?;
+                }
+            }
             return Ok(());
         }
         let cache_bytes = data.clone();
@@ -1159,6 +1406,11 @@ impl VexClient {
         if let Some(bytes) = self.read_cached_object(kind, content_id) {
             return Ok(bytes);
         }
+        // An object written earlier this process may still be buffered for batch
+        // upload (not yet on disk or the server); serve it from the buffer.
+        if let Some(bytes) = self.read_pending_object(kind, content_id) {
+            return Ok(bytes);
+        }
         debug!(kind = kind_to_str(kind), %content_id, "vex cache miss");
         let bytes = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
             client
@@ -1219,6 +1471,11 @@ impl VexClient {
         new_view: &ContentId,
     ) -> Result<jj_backend_api::CommitOperationResponse, VexClientError> {
         let _t = RpcTimer::start(|| "commit_op_heads".to_string());
+        // Publish every object buffered this process before advancing the op
+        // head, so the operation the CAS installs never references an object
+        // that is missing on the server. A flush failure aborts here, leaving
+        // the head unchanged (the un-uploaded objects are simply unreferenced).
+        self.flush_pending_uploads()?;
         let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
             client
                 .commit_operation(Self::auth_request(
@@ -1545,6 +1802,45 @@ mod tests {
             local_writes: false,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn validate_endpoint_accepts_valid_uris_without_building_a_connector() {
+        // `validate_endpoint` exists to avoid the native-root cert load that
+        // `Endpoint::new` performs for https URIs; it must still accept the
+        // same well-formed endpoints the real connect path uses.
+        for endpoint in [
+            "https://jj.vex.sc",
+            "http://127.0.0.1:50051",
+            "https://example.com:443/path",
+        ] {
+            assert!(
+                VexClient::validate_endpoint(endpoint).is_ok(),
+                "expected {endpoint} to validate"
+            );
+            // The full connect-path builder must also accept it, so validation
+            // never diverges from what `cached_channel` will later parse.
+            assert!(VexClient::endpoint(endpoint).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_malformed_uris() {
+        for endpoint in ["", "ht tp://has space", "::::"] {
+            assert!(
+                VexClient::validate_endpoint(endpoint).is_err(),
+                "expected {endpoint:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_is_https_detects_scheme() {
+        // Only https endpoints get a TLS connector; http (local dev) must not.
+        assert!(VexClient::endpoint_is_https("https://jj.vex.sc"));
+        assert!(VexClient::endpoint_is_https("HTTPS://jj.vex.sc"));
+        assert!(!VexClient::endpoint_is_https("http://127.0.0.1:50051"));
+        assert!(!VexClient::endpoint_is_https("127.0.0.1:50051"));
     }
 
     #[test]
