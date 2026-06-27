@@ -490,6 +490,11 @@ impl Workspace {
         // instead of the bookmark head `clone_vex_start_commit` would pick. CI
         // runners use this to materialize the pipeline's `commit_sha` directly.
         target_commit: Option<&CommitId>,
+        // The trunk the server registered for this repo (`default_branch` from
+        // the repo-access catalog). On the default (`target_commit == None`)
+        // path this selects the start commit; ignored when `target_commit` is
+        // `Some`. `None` falls back to the local main/master/trunk heuristic.
+        server_trunk: Option<&str>,
         working_copy_factory: &dyn WorkingCopyFactory,
         progress: Option<&crate::vex::CloneProgressFn>,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
@@ -588,7 +593,7 @@ impl Workspace {
                     .get_commit_async(commit_id)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
-                None => clone_vex_start_commit(&repo).await?,
+                None => clone_vex_start_commit(&repo, server_trunk).await?,
             };
             if let Some(progress) = progress {
                 progress(crate::vex::CloneProgress::CheckingOut);
@@ -848,21 +853,103 @@ pub fn get_working_copy_factory<'a>(
     }
 }
 
-async fn clone_vex_start_commit(repo: &Arc<ReadonlyRepo>) -> Result<Commit, WorkspaceInitError> {
+/// Resolve the head commit for the bookmark `bookmark_name`, considering both
+/// the local bookmark and every remote-tracking bookmark of that name. After
+/// `vex clone` the trunk is typically a remote-tracking bookmark (e.g.
+/// `master@vex`), so a local-only check would miss it. Within a single name,
+/// when multiple candidates exist, pick the newest by committer timestamp.
+///
+/// When `require_head` is true, only candidates whose target is in
+/// `head_id_set` are considered (used by the local main/master/trunk fallback,
+/// which legitimately wants a current DAG tip). When `require_head` is false the
+/// `head_id_set` filter is skipped, so a bookmark that points at an ancestor of
+/// a head still resolves — this is what the authoritative server-trunk lookup
+/// needs, since the server can register a trunk (e.g. `master`) that already has
+/// descendant commits and is therefore not a view head.
+/// Returns `None` when no candidate matches.
+async fn clone_vex_bookmark_head(
+    repo: &Arc<ReadonlyRepo>,
+    bookmark_name: &str,
+    head_id_set: &HashSet<CommitId>,
+    require_head: bool,
+) -> Result<Option<Commit>, WorkspaceInitError> {
+    let mut candidate_ids: Vec<&CommitId> = Vec::new();
+    if let Some(head_id) = repo
+        .view()
+        .get_local_bookmark(bookmark_name.as_ref())
+        .as_normal()
+        .filter(|id| !require_head || head_id_set.contains(*id))
+    {
+        candidate_ids.push(head_id);
+    }
+    for (symbol, remote_ref) in repo.view().all_remote_bookmarks() {
+        if symbol.name.as_str() != bookmark_name {
+            continue;
+        }
+        if let Some(head_id) = remote_ref
+            .target
+            .as_normal()
+            .filter(|id| !require_head || head_id_set.contains(*id))
+        {
+            candidate_ids.push(head_id);
+        }
+    }
+    candidate_ids.sort();
+    candidate_ids.dedup();
+    let mut selected_commit: Option<Commit> = None;
+    for head_id in candidate_ids {
+        let commit = repo
+            .store()
+            .get_commit_async(head_id)
+            .await
+            .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+        let should_replace = selected_commit.as_ref().is_none_or(|selected: &Commit| {
+            commit.committer().timestamp.timestamp > selected.committer().timestamp.timestamp
+        });
+        if should_replace {
+            selected_commit = Some(commit);
+        }
+    }
+    Ok(selected_commit)
+}
+
+async fn clone_vex_start_commit(
+    repo: &Arc<ReadonlyRepo>,
+    // The trunk the SERVER registered for this repo (`Repository#default_branch`,
+    // surfaced to the clone flow via the repo-access catalog `default_branch`).
+    // It is authoritative: when set and the named bookmark exists (local or
+    // remote-tracking) we check out its target, regardless of name AND regardless
+    // of whether that target is a current view head — the server may register a
+    // trunk that already has descendant commits. Only when it is `None` or the
+    // bookmark genuinely doesn't exist do we fall back to the local
+    // main/master/trunk guesses below.
+    server_trunk: Option<&str>,
+) -> Result<Commit, WorkspaceInitError> {
     let mut head_ids = repo.view().heads().iter().cloned().collect::<Vec<_>>();
     if head_ids.is_empty() {
         return Ok(repo.store().root_commit());
     }
     head_ids.sort();
     let head_id_set = head_ids.iter().cloned().collect::<HashSet<_>>();
+    // The server registers the trunk; honor it before any local-name heuristic.
+    // This is authoritative, so do not require the target to be a view head:
+    // the server's trunk (e.g. `master`) may already have descendant commits.
+    if let Some(server_trunk) = server_trunk {
+        if let Some(commit) =
+            clone_vex_bookmark_head(repo, server_trunk, &head_id_set, false).await?
+        {
+            return Ok(commit);
+        }
+    }
+    // Fallback when the server didn't supply a trunk (or its bookmark doesn't
+    // exist): prefer trunk bookmarks (main, then master, then trunk) that are
+    // current heads. This mirrors the default `trunk()` revset alias (see
+    // jj/cli/src/config/revsets.toml).
     for bookmark_name in ["main", "master", "trunk"] {
-        let target = repo.view().get_local_bookmark(bookmark_name.as_ref());
-        if let Some(head_id) = target.as_normal().filter(|id| head_id_set.contains(*id)) {
-            return repo
-                .store()
-                .get_commit_async(head_id)
-                .await
-                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())));
+        if let Some(commit) =
+            clone_vex_bookmark_head(repo, bookmark_name, &head_id_set, true).await?
+        {
+            return Ok(commit);
         }
     }
     for (_, target) in repo.view().local_bookmarks() {
@@ -1196,9 +1283,176 @@ mod tests {
         );
         let repo = tx.commit("create multiple heads").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo).block_on()?;
+        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), main_head.id());
         assert_ne!(start_commit.id(), fallback_head.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_start_commit_prefers_remote_trunk_bookmark()
+    -> Result<(), WorkspaceInitError> {
+        // Regression: after `vex clone`, the trunk is a remote-tracking bookmark
+        // (e.g. `master@vex`), while unrelated local bookmarks may exist. The
+        // start commit must be the remote trunk head, not an arbitrary local one.
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let codex_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("codex")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let master_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_local_bookmark_target(
+            "codex/dev-agent-local-guidance".as_ref(),
+            crate::op_store::RefTarget::normal(codex_head.id().clone()),
+        );
+        tx.repo_mut().set_remote_bookmark(
+            crate::ref_name::RemoteRefSymbol {
+                name: "master".as_ref(),
+                remote: "vex".as_ref(),
+            },
+            crate::op_store::RemoteRef {
+                target: crate::op_store::RefTarget::normal(master_head.id().clone()),
+                state: crate::op_store::RemoteRefState::Tracked,
+            },
+        );
+        let repo = tx.commit("create remote trunk and local bookmark").block_on()?;
+
+        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
+        assert_eq!(start_commit.id(), master_head.id());
+        assert_ne!(start_commit.id(), codex_head.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_start_commit_uses_server_trunk() -> Result<(), WorkspaceInitError> {
+        // The server registers the trunk (`Repository#default_branch`), surfaced
+        // to clone via the repo-access catalog `default_branch`. Given a remote
+        // `master@vex` head and an unrelated local `codex/...` head, passing
+        // `server_trunk = Some("master")` must check out the remote master head,
+        // not the arbitrary local bookmark.
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let codex_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("codex")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let master_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_local_bookmark_target(
+            "codex/dev-agent-local-guidance".as_ref(),
+            crate::op_store::RefTarget::normal(codex_head.id().clone()),
+        );
+        tx.repo_mut().set_remote_bookmark(
+            crate::ref_name::RemoteRefSymbol {
+                name: "master".as_ref(),
+                remote: "vex".as_ref(),
+            },
+            crate::op_store::RemoteRef {
+                target: crate::op_store::RefTarget::normal(master_head.id().clone()),
+                state: crate::op_store::RemoteRefState::Tracked,
+            },
+        );
+        let repo = tx
+            .commit("create remote trunk and local bookmark")
+            .block_on()?;
+
+        let start_commit = clone_vex_start_commit(&repo, Some("master")).block_on()?;
+        assert_eq!(start_commit.id(), master_head.id());
+        assert_ne!(start_commit.id(), codex_head.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_start_commit_server_trunk_not_a_head() -> Result<(), WorkspaceInitError> {
+        // The server-registered trunk is authoritative even when its target is
+        // not a current view head. Real clones see `master` already carrying
+        // descendant commits (so it is an ancestor, not a DAG tip), while an
+        // unrelated branch (e.g. `codex/...`) IS a tip. Passing
+        // `server_trunk = Some("master")` must still check out the master head,
+        // not the arbitrary head branch.
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        // `master` points here, but a child is committed on top so this commit is
+        // an ancestor (not a head) of the visible DAG.
+        let master_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let master_child = tx
+            .repo_mut()
+            .new_commit(vec![master_head.id().clone()], root.tree())
+            .set_description("master child")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        // Unrelated branch that IS a view head.
+        let codex_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("codex")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_local_bookmark_target(
+            "codex/feat-workspace-spaces".as_ref(),
+            crate::op_store::RefTarget::normal(codex_head.id().clone()),
+        );
+        // The server trunk is a remote-tracking bookmark pointing at the
+        // non-head `master_head`.
+        tx.repo_mut().set_remote_bookmark(
+            crate::ref_name::RemoteRefSymbol {
+                name: "master".as_ref(),
+                remote: "vex".as_ref(),
+            },
+            crate::op_store::RemoteRef {
+                target: crate::op_store::RefTarget::normal(master_head.id().clone()),
+                state: crate::op_store::RemoteRefState::Tracked,
+            },
+        );
+        let repo = tx
+            .commit("server trunk behind a descendant commit")
+            .block_on()?;
+
+        // Sanity: master_head is NOT a view head; master_child and codex_head are.
+        let heads = repo.view().heads();
+        assert!(!heads.contains(master_head.id()));
+        assert!(heads.contains(master_child.id()));
+        assert!(heads.contains(codex_head.id()));
+
+        let start_commit = clone_vex_start_commit(&repo, Some("master")).block_on()?;
+        assert_eq!(start_commit.id(), master_head.id());
+        assert_ne!(start_commit.id(), codex_head.id());
+        assert_ne!(start_commit.id(), master_child.id());
         Ok(())
     }
 
@@ -1238,7 +1492,7 @@ mod tests {
         tx.set_workspace_name("secondary".as_ref());
         let repo = tx.commit("record secondary workspace").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo).block_on()?;
+        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), other_head.id());
         assert_ne!(start_commit.id(), default_head.id());
         Ok(())
@@ -1270,7 +1524,7 @@ mod tests {
             .map_err(|err| CheckOutCommitError::EditCommit(err.into()))?;
         let repo = tx.commit("record discardable workspace").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo).block_on()?;
+        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), base.id());
         Ok(())
     }
@@ -1300,7 +1554,7 @@ mod tests {
             .map_err(CheckOutCommitError::CreateCommit)?;
         let repo = tx.commit("create anonymous heads").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo).block_on()?;
+        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), newer_head.id());
         assert_ne!(start_commit.id(), older_head.id());
         Ok(())

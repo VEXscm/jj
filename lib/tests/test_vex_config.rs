@@ -14,6 +14,7 @@ fn sample_config() -> VexRepoConfig {
         repo_id: "repo-id".to_string(),
         repo_slug: "widget".to_string(),
         access_token: None,
+        local_writes: false,
     }
 }
 

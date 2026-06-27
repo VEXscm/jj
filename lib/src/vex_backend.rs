@@ -401,6 +401,7 @@ mod tests {
             repo_id: "repo".to_string(),
             repo_slug: "repo".to_string(),
             access_token: None,
+            local_writes: false,
         })
         .unwrap();
 
