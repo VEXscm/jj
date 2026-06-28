@@ -30,6 +30,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
+use jj_backend_api::CloneViewKind as ProtoCloneViewKind;
 use jj_backend_api::GetCloneManifestRequest;
 use jj_backend_api::GetObjectRequest;
 use jj_backend_api::GetObjectsRequest;
@@ -40,6 +41,7 @@ use jj_backend_api::ObjectId;
 use jj_backend_api::PutObjectRequest;
 use jj_backend_api::PutObjectsRequest;
 use jj_backend_api::ResolveOperationIdPrefixRequest;
+use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
     CloneManifest, ContentId, ObjectKind, decode_object_pack, decode_object_pack_reader,
@@ -250,6 +252,16 @@ pub struct VexRepoConfig {
     pub repo_id: String,
     pub repo_slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_scope_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing_repo_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_root_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_mounts: Vec<VexVirtualRepositoryMount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
     /// When true, `put_object` writes objects only to the local content-addressed
     /// cache and never issues a gRPC `PutObject` to the backend. Used by the
@@ -259,6 +271,26 @@ pub struct VexRepoConfig {
     /// continue to persist to the backend.
     #[serde(default)]
     pub local_writes: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VexVirtualRepositoryMount {
+    pub slug: String,
+    pub root_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bookmark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_source_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_virtual_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_provider_kind: Option<String>,
 }
 
 impl VexRepoConfig {
@@ -328,6 +360,34 @@ fn cache_max_bytes() -> Option<u64> {
     std::env::var("JJ_VEX_CACHE_MAX_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn proto_clone_view_kind(scope: Option<&str>) -> ProtoCloneViewKind {
+    match scope {
+        Some("virtual_repository") | Some("virtual") => ProtoCloneViewKind::Virtual,
+        Some("composed") => ProtoCloneViewKind::Composed,
+        Some("repository") | Some("physical") | None => ProtoCloneViewKind::Physical,
+        Some(_) => ProtoCloneViewKind::Physical,
+    }
+}
+
+fn proto_virtual_repository_mount(
+    mount: &VexVirtualRepositoryMount,
+) -> ProtoVirtualRepositoryMount {
+    ProtoVirtualRepositoryMount {
+        slug: mount.slug.clone(),
+        root_path: mount.root_path.clone(),
+        source_bookmark: mount.source_bookmark.clone().unwrap_or_default(),
+        target_branch: mount.target_branch.clone().unwrap_or_default(),
+        projection_status: mount.projection_status.clone().unwrap_or_default(),
+        projected_source_commit_id: mount.projected_source_commit_id.clone().unwrap_or_default(),
+        projected_virtual_commit_id: mount
+            .projected_virtual_commit_id
+            .clone()
+            .unwrap_or_default(),
+        sync_remote_url: mount.sync_remote_url.clone().unwrap_or_default(),
+        sync_provider_kind: mount.sync_provider_kind.clone().unwrap_or_default(),
+    }
 }
 
 /// Max buffered upload bytes before an inline flush during a snapshot. Bounds
@@ -616,8 +676,14 @@ impl VexClient {
         // against an idle edge-proxy reset mid-command. Values are conservative
         // to avoid tripping server-side `too_many_pings` (ENHANCE_YOUR_CALM).
         let endpoint = endpoint
-            .connect_timeout(Duration::from_secs(env_secs("VEX_GRPC_CONNECT_TIMEOUT_SECS", 10)))
-            .timeout(Duration::from_secs(env_secs("VEX_GRPC_REQUEST_TIMEOUT_SECS", 120)))
+            .connect_timeout(Duration::from_secs(env_secs(
+                "VEX_GRPC_CONNECT_TIMEOUT_SECS",
+                10,
+            )))
+            .timeout(Duration::from_secs(env_secs(
+                "VEX_GRPC_REQUEST_TIMEOUT_SECS",
+                120,
+            )))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10));
@@ -973,6 +1039,11 @@ impl VexClient {
             tenant_slug: repo.tenant_slug,
             repo_id: repo.repo_id,
             repo_slug: repo.repo_slug,
+            repository_scope_kind: Some("repository".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
         })
@@ -1003,6 +1074,11 @@ impl VexClient {
             tenant_slug: repo.tenant_slug,
             repo_id: repo.repo_id,
             repo_slug: repo.repo_slug,
+            repository_scope_kind: Some("repository".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
         })
@@ -1032,7 +1108,12 @@ impl VexClient {
     /// Buffer one object for later batched upload. Returns `true` when the
     /// buffer has reached its byte/object cap and the caller should flush. A
     /// no-op (returns `false`) if the object is already buffered.
-    fn buffer_pending_object(&self, kind: ObjectKind, content_id: &ContentId, data: Vec<u8>) -> bool {
+    fn buffer_pending_object(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+        data: Vec<u8>,
+    ) -> bool {
         let map = PENDING_UPLOADS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = map.lock().unwrap();
         let pending = guard.entry(self.pending_key()).or_default();
@@ -1527,8 +1608,18 @@ impl VexClient {
         &self,
         blob_mode: CloneBlobMode,
     ) -> Result<CloneManifest, VexClientError> {
-        let response =
-            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+        let clone_view_kind = proto_clone_view_kind(self.config.repository_scope_kind.as_deref());
+        let virtual_mounts: Vec<jj_backend_api::VirtualRepositoryMount> = self
+            .config
+            .virtual_mounts
+            .iter()
+            .map(proto_virtual_repository_mount)
+            .collect();
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| {
+            // The retry closure is `Fn` and may run multiple times, so clone
+            // the (non-Copy) mounts vec per attempt instead of moving it.
+            let virtual_mounts = virtual_mounts.clone();
+            async move {
                 client
                     .get_clone_manifest(Self::auth_request(
                         GetCloneManifestRequest {
@@ -1538,12 +1629,20 @@ impl VexClient {
                                 CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
                                 CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
                             },
+                            clone_view_kind: clone_view_kind as i32,
+                            virtual_root_path: self
+                                .config
+                                .virtual_root_path
+                                .clone()
+                                .unwrap_or_default(),
+                            virtual_mounts,
                         },
                         self.config.access_token.as_deref(),
                     )?)
                     .await
                     .map(|response| response.into_inner())
-            })?;
+            }
+        })?;
         serde_json::from_slice(&response.manifest_json)
             .map_err(VexConfigError::Json)
             .map_err(Into::into)
@@ -1798,6 +1897,11 @@ mod tests {
             tenant_slug: "tenant".to_string(),
             repo_id: "repo".to_string(),
             repo_slug: "repo".to_string(),
+            repository_scope_kind: Some("repository".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
         })

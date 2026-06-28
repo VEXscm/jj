@@ -13,6 +13,11 @@ fn sample_config() -> VexRepoConfig {
         tenant_slug: "acme".to_string(),
         repo_id: "repo-id".to_string(),
         repo_slug: "widget".to_string(),
+        repository_scope_kind: Some("repository".to_string()),
+        virtual_repository_id: None,
+        backing_repo_slug: None,
+        virtual_root_path: None,
+        virtual_mounts: Vec::new(),
         access_token: None,
         local_writes: false,
     }

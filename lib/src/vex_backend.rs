@@ -48,6 +48,7 @@ use crate::backend::SigningFn;
 use crate::backend::SymlinkId;
 use crate::backend::Tree;
 use crate::backend::TreeId;
+use crate::backend::TreeValue;
 use crate::backend::make_root_commit;
 use crate::index::Index;
 use crate::object_id::ObjectId as _;
@@ -128,6 +129,7 @@ fn map_status_error(
 #[derive(Debug, Clone)]
 pub struct VexBackend {
     client: VexClient,
+    virtual_root_path: Option<RepoPathBuf>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -152,8 +154,15 @@ impl VexBackend {
     fn new(client: VexClient) -> Self {
         let empty_tree_proto = tree_to_proto(&Tree::default()).encode_to_vec();
         let empty_tree_id = TreeId::new(sha256_bytes(&empty_tree_proto).to_vec());
+        let virtual_root_path = client
+            .config()
+            .virtual_root_path
+            .as_deref()
+            .filter(|path| !path.is_empty() && *path != ".")
+            .and_then(|path| RepoPathBuf::from_internal_string(path.to_string()).ok());
         Self {
             client,
+            virtual_root_path,
             root_commit_id: CommitId::from_bytes(&[0; ID_LENGTH]),
             root_change_id: ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]),
             empty_tree_id,
@@ -187,6 +196,35 @@ impl VexBackend {
                 source: Box::new(err),
             })?;
         Ok(content_id)
+    }
+
+    async fn read_physical_tree(&self, id: &TreeId) -> BackendResult<Tree> {
+        let data = self
+            .read_object_bytes(jj_backend_types::ObjectKind::Tree, id)
+            .await?;
+        let proto = crate::protos::simple_store::Tree::decode(&*data).map_err(|err| {
+            BackendError::ReadObject {
+                object_type: "tree".to_string(),
+                hash: id.hex(),
+                source: err.into(),
+            }
+        })?;
+        Ok(tree_from_proto(proto))
+    }
+
+    async fn project_tree_to_virtual_root(&self, root_tree: Tree) -> BackendResult<Tree> {
+        let Some(virtual_root_path) = &self.virtual_root_path else {
+            return Ok(root_tree);
+        };
+
+        let mut tree = root_tree;
+        for component in virtual_root_path.components() {
+            let Some(TreeValue::Tree(child_tree_id)) = tree.value(component).cloned() else {
+                return Ok(Tree::default());
+            };
+            tree = self.read_physical_tree(&child_tree_id).await?;
+        }
+        Ok(tree)
     }
 }
 
@@ -299,21 +337,16 @@ impl Backend for VexBackend {
         ))
     }
 
-    async fn read_tree(&self, _path: &RepoPath, id: &TreeId) -> BackendResult<Tree> {
+    async fn read_tree(&self, path: &RepoPath, id: &TreeId) -> BackendResult<Tree> {
         if *id == self.empty_tree_id {
             return Ok(Tree::default());
         }
-        let data = self
-            .read_object_bytes(jj_backend_types::ObjectKind::Tree, id)
-            .await?;
-        let proto = crate::protos::simple_store::Tree::decode(&*data).map_err(|err| {
-            BackendError::ReadObject {
-                object_type: "tree".to_string(),
-                hash: id.hex(),
-                source: err.into(),
-            }
-        })?;
-        Ok(tree_from_proto(proto))
+        let tree = self.read_physical_tree(id).await?;
+        if path.is_root() {
+            self.project_tree_to_virtual_root(tree).await
+        } else {
+            Ok(tree)
+        }
     }
 
     async fn write_tree(&self, _path: &RepoPath, tree: &Tree) -> BackendResult<TreeId> {
@@ -400,6 +433,11 @@ mod tests {
             tenant_slug: "tenant".to_string(),
             repo_id: "repo".to_string(),
             repo_slug: "repo".to_string(),
+            repository_scope_kind: Some("repository".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
         })

@@ -542,40 +542,42 @@ impl Workspace {
             fs::write(submodule_store_path.join("type"), submodule_store.name())
                 .context(submodule_store_path.join("type"))?;
 
-            let prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
-                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-            let clone_manifest = prefetch_client
-                .get_clone_manifest(blob_mode)
-                .await
-                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-            if let Some(progress) = progress {
-                let pack_objects = clone_manifest
-                    .packs
-                    .iter()
-                    .map(|pack| pack.objects.len() as u64)
-                    .sum();
-                let total_bytes = clone_manifest
-                    .packs
-                    .iter()
-                    .map(|pack| pack.size_bytes)
-                    .sum::<u64>()
-                    + clone_manifest
-                        .objects
+            if config.virtual_root_path.is_none() {
+                let prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
+                    .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+                let clone_manifest = prefetch_client
+                    .get_clone_manifest(blob_mode)
+                    .await
+                    .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+                if let Some(progress) = progress {
+                    let pack_objects = clone_manifest
+                        .packs
                         .iter()
-                        .filter_map(|object| object.size_bytes)
-                        .sum::<u64>();
-                progress(crate::vex::CloneProgress::ManifestReady {
-                    packs: clone_manifest.packs.len() as u64,
-                    pack_objects,
-                    loose_objects: clone_manifest.objects.len() as u64,
-                    total_bytes,
-                    deferred_objects: clone_manifest.deferred_object_count,
-                });
+                        .map(|pack| pack.objects.len() as u64)
+                        .sum();
+                    let total_bytes = clone_manifest
+                        .packs
+                        .iter()
+                        .map(|pack| pack.size_bytes)
+                        .sum::<u64>()
+                        + clone_manifest
+                            .objects
+                            .iter()
+                            .filter_map(|object| object.size_bytes)
+                            .sum::<u64>();
+                    progress(crate::vex::CloneProgress::ManifestReady {
+                        packs: clone_manifest.packs.len() as u64,
+                        pack_objects,
+                        loose_objects: clone_manifest.objects.len() as u64,
+                        total_bytes,
+                        deferred_objects: clone_manifest.deferred_object_count,
+                    });
+                }
+                prefetch_client
+                    .prefetch_clone_manifest(&clone_manifest, progress)
+                    .await
+                    .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             }
-            prefetch_client
-                .prefetch_clone_manifest(&clone_manifest, progress)
-                .await
-                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
 
             let mut store_factories = StoreFactories::default();
             store_factories.merge(create_store_factories());
@@ -1290,8 +1292,8 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_vex_start_commit_prefers_remote_trunk_bookmark()
-    -> Result<(), WorkspaceInitError> {
+    fn test_clone_vex_start_commit_prefers_remote_trunk_bookmark() -> Result<(), WorkspaceInitError>
+    {
         // Regression: after `vex clone`, the trunk is a remote-tracking bookmark
         // (e.g. `master@vex`), while unrelated local bookmarks may exist. The
         // start commit must be the remote trunk head, not an arbitrary local one.
@@ -1328,7 +1330,9 @@ mod tests {
                 state: crate::op_store::RemoteRefState::Tracked,
             },
         );
-        let repo = tx.commit("create remote trunk and local bookmark").block_on()?;
+        let repo = tx
+            .commit("create remote trunk and local bookmark")
+            .block_on()?;
 
         let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), master_head.id());

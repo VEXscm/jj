@@ -121,7 +121,12 @@ impl TreeBuilder {
         }
 
         // Process from the deepest level down to (but excluding) the root.
-        let depths: Vec<usize> = dirs_by_depth.keys().copied().filter(|d| *d > 0).rev().collect();
+        let depths: Vec<usize> = dirs_by_depth
+            .keys()
+            .copied()
+            .filter(|d| *d > 0)
+            .rev()
+            .collect();
         for depth in depths {
             let dirs = dirs_by_depth.remove(&depth).unwrap();
             let mut pending_writes = Vec::new();
@@ -143,18 +148,17 @@ impl TreeBuilder {
             }
 
             // Write every non-empty tree at this depth concurrently.
-            let written: Vec<(RepoPathBuf, TreeId)> = stream::iter(pending_writes.into_iter().map(
-                |(dir, data)| {
+            let written: Vec<(RepoPathBuf, TreeId)> =
+                stream::iter(pending_writes.into_iter().map(|(dir, data)| {
                     let store = self.store.clone();
                     async move {
                         let tree = store.write_tree(&dir, data).await?;
                         Ok::<(RepoPathBuf, TreeId), BackendError>((dir, tree.id().clone()))
                     }
-                },
-            ))
-            .buffer_unordered(concurrency)
-            .try_collect()
-            .await?;
+                }))
+                .buffer_unordered(concurrency)
+                .try_collect()
+                .await?;
 
             // Now that the level is durable, link each written tree into its parent.
             for (dir, tree_id) in written {

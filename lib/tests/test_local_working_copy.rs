@@ -1567,12 +1567,7 @@ fn test_jjignore_and_vexignore_are_respected() -> TestResult {
     let files = tree.entries().map(|(name, _value)| name).collect_vec();
     assert_eq!(
         files,
-        to_owned_path_vec(&[
-            gitignore_path,
-            jjignore_path,
-            vexignore_path,
-            kept_path,
-        ])
+        to_owned_path_vec(&[gitignore_path, jjignore_path, vexignore_path, kept_path,])
     );
     Ok(())
 }
