@@ -41,6 +41,7 @@ use jj_backend_api::ObjectId;
 use jj_backend_api::PutObjectRequest;
 use jj_backend_api::PutObjectsRequest;
 use jj_backend_api::ResolveOperationIdPrefixRequest;
+use jj_backend_api::ResolveRefsRequest;
 use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
@@ -682,7 +683,7 @@ impl VexClient {
             )))
             .timeout(Duration::from_secs(env_secs(
                 "VEX_GRPC_REQUEST_TIMEOUT_SECS",
-                120,
+                300,
             )))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Duration::from_secs(30))
@@ -1602,6 +1603,26 @@ impl VexClient {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub async fn resolve_ref(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, VexClientError> {
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+            client
+                .resolve_refs(Self::auth_request(
+                    ResolveRefsRequest {
+                        tenant_id: self.config.tenant_id.clone(),
+                        repo_id: self.config.repo_id.clone(),
+                        names: vec![name.to_string()],
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        Ok(response.refs.into_iter().next().map(|r| r.target_commit_id))
     }
 
     pub async fn get_clone_manifest(

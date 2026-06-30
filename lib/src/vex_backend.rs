@@ -42,18 +42,23 @@ use crate::backend::CopyHistory;
 use crate::backend::CopyId;
 use crate::backend::CopyRecord;
 use crate::backend::FileId;
+use crate::backend::MillisSinceEpoch;
 use crate::backend::RelatedCopy;
 use crate::backend::SecureSig;
+use crate::backend::Signature;
 use crate::backend::SigningFn;
 use crate::backend::SymlinkId;
+use crate::backend::Timestamp;
 use crate::backend::Tree;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::backend::make_root_commit;
 use crate::index::Index;
+use crate::merge::Merge;
 use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
+use crate::repo_path::RepoPathComponentBuf;
 use crate::simple_backend::commit_from_proto;
 use crate::simple_backend::commit_to_proto;
 use crate::simple_backend::tree_from_proto;
@@ -226,6 +231,148 @@ impl VexBackend {
         }
         Ok(tree)
     }
+
+    async fn git_mapping(&self, kind: &str, oid_hex: &str) -> BackendResult<Vec<u8>> {
+        let ref_name = format!("git/object/sha1/{kind}/{oid_hex}");
+        let content_id = self
+            .client
+            .resolve_ref(&ref_name)
+            .await
+            .map_err(|err| BackendError::ReadObject {
+                object_type: "git-mapping".to_string(),
+                hash: oid_hex.to_string(),
+                source: Box::new(err),
+            })?
+            .ok_or_else(|| BackendError::ObjectNotFound {
+                object_type: "git-mapping".to_string(),
+                hash: oid_hex.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("missing {ref_name}"),
+                )),
+            })?;
+        Ok(jj_backend_types::ContentId::from_hex(&content_id).map_err(|err| BackendError::ReadObject {
+            object_type: "git-mapping".to_string(),
+            hash: oid_hex.to_string(),
+            source: Box::new(err),
+        })?.as_bytes().to_vec())
+    }
+
+    async fn read_git_tree(&self, data: &[u8]) -> BackendResult<Tree> {
+        let mut entries = Vec::new();
+        let mut index = 0;
+        while index < data.len() {
+            let mode_end = data[index..]
+                .iter()
+                .position(|byte| *byte == b' ')
+                .ok_or_else(|| BackendError::ReadObject {
+                    object_type: "git-tree".to_string(),
+                    hash: "<tree>".to_string(),
+                    source: "invalid git tree".into(),
+                })?
+                + index;
+            let mode = std::str::from_utf8(&data[index..mode_end]).map_err(|err| {
+                BackendError::ReadObject {
+                    object_type: "git-tree".to_string(),
+                    hash: "<tree>".to_string(),
+                    source: err.into(),
+                }
+            })?;
+            index = mode_end + 1;
+            let name_end = data[index..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| BackendError::ReadObject {
+                    object_type: "git-tree".to_string(),
+                    hash: "<tree>".to_string(),
+                    source: "invalid git tree".into(),
+                })?
+                + index;
+            let name = std::str::from_utf8(&data[index..name_end]).map_err(|err| {
+                BackendError::ReadObject {
+                    object_type: "git-tree".to_string(),
+                    hash: "<tree>".to_string(),
+                    source: err.into(),
+                }
+            })?;
+            index = name_end + 1;
+            let oid_end = index + 20;
+            if oid_end > data.len() {
+                return Err(BackendError::ReadObject {
+                    object_type: "git-tree".to_string(),
+                    hash: "<tree>".to_string(),
+                    source: "truncated git tree".into(),
+                });
+            }
+            let oid_hex = hex_bytes(&data[index..oid_end]);
+            index = oid_end;
+            let value = match mode {
+                "40000" | "040000" => {
+                    let id = self.git_mapping("tree", &oid_hex).await?;
+                    TreeValue::Tree(TreeId::new(id))
+                }
+                "120000" => {
+                    let id = self.git_mapping("blob", &oid_hex).await?;
+                    TreeValue::Symlink(SymlinkId::new(id))
+                }
+                "160000" => TreeValue::GitSubmodule(CommitId::from_bytes(&data[index - 20..oid_end])),
+                "100755" => {
+                    let id = self.git_mapping("blob", &oid_hex).await?;
+                    TreeValue::File {
+                        id: FileId::new(id),
+                        executable: true,
+                        copy_id: CopyId::placeholder(),
+                    }
+                }
+                _ => {
+                    let id = self.git_mapping("blob", &oid_hex).await?;
+                    TreeValue::File {
+                        id: FileId::new(id),
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    }
+                }
+            };
+            entries.push((RepoPathComponentBuf::new(name.to_string()).unwrap(), value));
+        }
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(Tree::from_sorted_entries(entries))
+    }
+
+    async fn parse_git_commit(&self, data: &[u8], id: &CommitId) -> BackendResult<Commit> {
+        let text = String::from_utf8_lossy(data);
+        let (headers, message) = text.split_once("\n\n").unwrap_or((text.as_ref(), ""));
+        let mut root_tree = None;
+        for line in headers.lines() {
+            if let Some(rest) = line.strip_prefix("tree ") {
+                root_tree = Some(TreeId::new(self.git_mapping("tree", rest).await?));
+            }
+        }
+        let root_tree = root_tree.ok_or_else(|| BackendError::ReadObject {
+            object_type: "commit".to_string(),
+            hash: id.hex(),
+            source: "git commit missing tree".into(),
+        })?;
+        let signature = Signature {
+            name: String::new(),
+            email: String::new(),
+            timestamp: Timestamp {
+                timestamp: MillisSinceEpoch(0),
+                tz_offset: 0,
+            },
+        };
+        Ok(Commit {
+            parents: vec![self.root_commit_id.clone()],
+            predecessors: vec![id.clone()],
+            root_tree: Merge::resolved(root_tree),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::from_bytes(&sha256_bytes(data)[0..CHANGE_ID_LENGTH]),
+            description: message.to_string(),
+            author: signature.clone(),
+            committer: signature,
+            secure_sig: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -298,9 +445,17 @@ impl Backend for VexBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
-        let data = self
+        let data = match self
             .read_object_bytes(jj_backend_types::ObjectKind::Symlink, id)
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            Err(_) => {
+                let file_id = FileId::new(id.to_bytes());
+                self.read_object_bytes(jj_backend_types::ObjectKind::Blob, &file_id)
+                    .await?
+            }
+        };
         String::from_utf8(data).map_err(|err| BackendError::InvalidUtf8 {
             object_type: "symlink".to_string(),
             hash: id.hex(),
@@ -341,7 +496,13 @@ impl Backend for VexBackend {
         if *id == self.empty_tree_id {
             return Ok(Tree::default());
         }
-        let tree = self.read_physical_tree(id).await?;
+        let data = self
+            .read_object_bytes(jj_backend_types::ObjectKind::Tree, id)
+            .await?;
+        let tree = match crate::protos::simple_store::Tree::decode(&*data) {
+            Ok(proto) => tree_from_proto(proto),
+            Err(_) => self.read_git_tree(&data).await?,
+        };
         if path.is_root() {
             self.project_tree_to_virtual_root(tree).await
         } else {
@@ -368,14 +529,10 @@ impl Backend for VexBackend {
         let data = self
             .read_object_bytes(jj_backend_types::ObjectKind::Commit, id)
             .await?;
-        let proto = crate::protos::simple_store::Commit::decode(&*data).map_err(|err| {
-            BackendError::ReadObject {
-                object_type: "commit".to_string(),
-                hash: id.hex(),
-                source: err.into(),
-            }
-        })?;
-        Ok(commit_from_proto(proto))
+        match crate::protos::simple_store::Commit::decode(&*data) {
+            Ok(proto) => Ok(commit_from_proto(proto)),
+            Err(_) => self.parse_git_commit(&data, id).await,
+        }
     }
 
     async fn write_commit(

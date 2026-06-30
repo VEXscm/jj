@@ -288,6 +288,13 @@ fn vex_clone_workspace_name(workspace_root: &Path) -> WorkspaceNameBuf {
     format!("vex-{root_name}-{}-{timestamp:x}", std::process::id()).into()
 }
 
+fn skip_vex_clone_prefetch() -> bool {
+    matches!(
+        std::env::var("VEX_SKIP_CLONE_PREFETCH").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 impl Workspace {
     pub fn new(
         workspace_root: &Path,
@@ -542,7 +549,9 @@ impl Workspace {
             fs::write(submodule_store_path.join("type"), submodule_store.name())
                 .context(submodule_store_path.join("type"))?;
 
-            if config.virtual_root_path.is_none() {
+            if config.repository_scope_kind.as_deref() != Some("virtual_repository")
+                && !skip_vex_clone_prefetch()
+            {
                 let prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
                 let clone_manifest = prefetch_client
@@ -595,7 +604,15 @@ impl Workspace {
                     .get_commit_async(commit_id)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
-                None => clone_vex_start_commit(&repo, server_trunk).await?,
+                None => {
+                    if let Some(commit) =
+                        clone_vex_git_ref_start_commit(&repo, &store_path, server_trunk).await?
+                    {
+                        commit
+                    } else {
+                        clone_vex_start_commit(&repo, server_trunk).await?
+                    }
+                }
             };
             if let Some(progress) = progress {
                 progress(crate::vex::CloneProgress::CheckingOut);
@@ -610,6 +627,16 @@ impl Workspace {
                 &start_commit,
             )
             .await?;
+            let repo = if let Some(server_trunk) = server_trunk {
+                let mut tx = repo.start_transaction();
+                tx.repo_mut().set_local_bookmark_target(
+                    server_trunk.as_ref(),
+                    crate::op_store::RefTarget::normal(start_commit.id().clone()),
+                );
+                tx.commit("set server trunk bookmark").await?
+            } else {
+                repo
+            };
             let repo_loader = repo.loader().clone();
             let repo_dir = dunce::canonicalize(&repo_dir).context(&repo_dir)?;
             let workspace = Self::new(workspace_root, repo_dir, working_copy, repo_loader)?;
@@ -1003,6 +1030,33 @@ async fn clone_vex_start_commit(
         }
     }
     Ok(selected_commit.expect("non-empty heads should produce a checkout target"))
+}
+
+async fn clone_vex_git_ref_start_commit(
+    repo: &Arc<ReadonlyRepo>,
+    store_path: &Path,
+    server_trunk: Option<&str>,
+) -> Result<Option<Commit>, WorkspaceInitError> {
+    let Some(server_trunk) = server_trunk else {
+        return Ok(None);
+    };
+    let client = crate::vex::VexClient::from_store_path(store_path)
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+    let Some(content_id) = client
+        .resolve_ref(&format!("git/ref/refs/heads/{server_trunk}"))
+        .await
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?
+    else {
+        return Ok(None);
+    };
+    let content_id = jj_backend_types::ContentId::from_hex(&content_id)
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+    let commit_id = CommitId::new(content_id.as_bytes().to_vec());
+    repo.store()
+        .get_commit_async(&commit_id)
+        .await
+        .map(Some)
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))
 }
 
 async fn clone_vex_recent_workspace_commit_from_ops(
