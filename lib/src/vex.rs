@@ -170,6 +170,21 @@ pub use jj_backend_types::CloneBlobMode;
 pub enum CloneProgress {
     /// Contacting the backend and resolving repo metadata.
     Connecting,
+    /// The server is building the clone manifest (cold cache); emitted
+    /// repeatedly while the client polls so a slow first clone shows *why* it is
+    /// waiting instead of an opaque 0%.
+    ManifestBuilding {
+        /// Seconds spent waiting for the manifest so far.
+        waited_secs: u64,
+    },
+    /// A transient backend error occurred and the client is retrying. Surfaced
+    /// so a stuck/slow clone shows what is going wrong.
+    Retrying {
+        /// The operation being retried (e.g. `"clone manifest"`).
+        operation: String,
+        /// A short description of the error.
+        message: String,
+    },
     /// The clone manifest has been fetched; totals are now known.
     ManifestReady {
         /// Number of packs to prefetch.
@@ -766,6 +781,16 @@ impl VexClient {
                 | tonic::Code::Aborted
                 | tonic::Code::ResourceExhausted
         )
+    }
+
+    /// Whether a client error is a transient blip worth riding through (network
+    /// hiccup, backend restart, edge 502) rather than a hard failure.
+    fn is_transient_client_error(err: &VexClientError) -> bool {
+        match err {
+            VexClientError::Status(status) => Self::is_transient_status(status),
+            VexClientError::Transport(_) => true,
+            _ => false,
+        }
     }
 
     /// Like [`Self::block_on_grpc`] but retries the call on transient errors
@@ -1740,6 +1765,7 @@ impl VexClient {
     pub async fn get_clone_manifest(
         &self,
         blob_mode: CloneBlobMode,
+        progress: Option<&CloneProgressFn>,
     ) -> Result<CloneManifest, VexClientError> {
         let clone_view_kind = proto_clone_view_kind(self.config.repository_scope_kind.as_deref());
         let virtual_mounts: Vec<jj_backend_api::VirtualRepositoryMount> = self
@@ -1762,10 +1788,20 @@ impl VexClient {
             std::time::Duration::from_secs(env_secs("VEX_CLONE_MANIFEST_MAX_WAIT_SECS", 1_800));
         let started = std::time::Instant::now();
         loop {
+            if started.elapsed() >= max_wait {
+                return Err(tonic::Status::deadline_exceeded(format!(
+                    "clone manifest not ready after {}s",
+                    max_wait.as_secs()
+                ))
+                .into());
+            }
             let virtual_mounts = virtual_mounts.clone();
-            let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| {
-                // The retry closure is `Fn` and may run multiple times, so clone
-                // the (non-Copy) mounts vec per attempt instead of moving it.
+            // One (non-retrying) attempt per iteration; the loop itself rides
+            // both a still-`building` manifest *and* transient backend errors up
+            // to `max_wait`, reporting each through `progress` so a slow/cold
+            // first clone shows exactly what it is waiting on instead of a silent
+            // 0%.
+            let attempt = Self::block_on_grpc(&self.config.endpoint, |mut client| {
                 let virtual_mounts = virtual_mounts.clone();
                 async move {
                     client
@@ -1791,26 +1827,38 @@ impl VexClient {
                         .await
                         .map(|response| response.into_inner())
                 }
-            })?;
-
-            if response.building {
-                if started.elapsed() >= max_wait {
-                    return Err(tonic::Status::deadline_exceeded(format!(
-                        "clone manifest still building after {}s",
-                        max_wait.as_secs()
-                    ))
-                    .into());
+            });
+            match attempt {
+                Ok(response) if response.building => {
+                    if let Some(progress) = progress {
+                        progress(CloneProgress::ManifestBuilding {
+                            waited_secs: started.elapsed().as_secs(),
+                        });
+                    }
+                    // Blocking sleep matches this module's sync-over-async bridge
+                    // (the RPC above already blocks the calling thread).
+                    std::thread::sleep(poll);
+                    continue;
                 }
-                // Blocking sleep matches this module's sync-over-async bridge
-                // (the RPC above already blocks the calling thread); the whole
-                // clone is a blocking operation on this thread.
-                std::thread::sleep(poll);
-                continue;
+                Ok(response) => {
+                    return serde_json::from_slice(&response.manifest_json)
+                        .map_err(VexConfigError::Json)
+                        .map_err(Into::into);
+                }
+                // Transient blip (edge 502, backend restart, deadline): surface
+                // it and keep polling rather than aborting the clone.
+                Err(err) if Self::is_transient_client_error(&err) => {
+                    if let Some(progress) = progress {
+                        progress(CloneProgress::Retrying {
+                            operation: "clone manifest".to_string(),
+                            message: err.to_string(),
+                        });
+                    }
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                Err(err) => return Err(err),
             }
-
-            return serde_json::from_slice(&response.manifest_json)
-                .map_err(VexConfigError::Json)
-                .map_err(Into::into);
         }
     }
 

@@ -555,7 +555,7 @@ impl Workspace {
                 let prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
                 let clone_manifest = prefetch_client
-                    .get_clone_manifest(blob_mode)
+                    .get_clone_manifest(blob_mode, progress)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
                 if let Some(progress) = progress {
