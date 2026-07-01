@@ -825,6 +825,68 @@ impl VexClient {
         }))
     }
 
+    /// Async sibling of [`Self::block_on_grpc_retry`] that runs the retrying gRPC
+    /// call as a task on the shared multi-thread runtime and awaits its
+    /// `JoinHandle`, rather than blocking the calling thread.
+    ///
+    /// This distinction is the whole point on the working-copy checkout hot path.
+    /// `TreeState::check_out` drives thousands of per-object reads through
+    /// `.buffered(store.concurrency())` on a *single-threaded* `pollster`
+    /// executor. `block_on_grpc_retry` blocks that one thread until each
+    /// round-trip returns, so the buffered stream can never poll more than one
+    /// read at a time — the intended 32-way concurrency collapses to 1, and a
+    /// full clone becomes ~one network round-trip per file. Awaiting a spawned
+    /// task's handle is instead a cooperative yield point: it registers a waker
+    /// and returns `Pending`, so the executor keeps polling the other buffered
+    /// reads and up to `concurrency()` requests are genuinely in flight on the
+    /// runtime's worker threads at once.
+    async fn grpc_retry_async<T, F, Fut>(
+        endpoint: &str,
+        attempts: usize,
+        f: F,
+    ) -> Result<T, VexClientError>
+    where
+        F: Fn(JjBackendClient<Channel>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, tonic::Status>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let channel = Self::cached_channel(endpoint)?;
+        let attempts = attempts
+            .max(env_secs("VEX_GRPC_RETRY_ATTEMPTS", 10) as usize)
+            .max(1);
+        let base_ms = env_secs("VEX_GRPC_RETRY_BACKOFF_MS", 250).max(1);
+        let cap_ms = env_secs("VEX_GRPC_RETRY_BACKOFF_CAP_MS", 8_000).max(base_ms);
+        let handle = Self::shared_grpc_runtime().spawn(with_output_cancel(async move {
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
+                let client = JjBackendClient::new(channel.clone())
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+                match f(client).await {
+                    Ok(value) => return Ok(value),
+                    Err(status) if Self::is_transient_status(&status) && attempt < attempts => {
+                        let shift = (attempt - 1).min(6) as u32;
+                        let backoff_ms = base_ms.saturating_mul(1u64 << shift).min(cap_ms);
+                        let jitter_ms = Self::retry_jitter_ms(backoff_ms / 2 + 1);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            backoff_ms + jitter_ms,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(status) => return Err(status.into()),
+                }
+            }
+        }));
+        match handle.await {
+            Ok(result) => result,
+            Err(join_err) => Err(VexClientError::Io(std::io::Error::other(format!(
+                "grpc worker task failed: {join_err}"
+            )))),
+        }
+    }
+
     /// Cheap, dependency-free jitter in `[0, span)` milliseconds, seeded from the
     /// wall clock. Only used to de-correlate retry backoff across concurrent
     /// reads, so statistical quality is irrelevant.
@@ -1529,21 +1591,36 @@ impl VexClient {
             return Ok(bytes);
         }
         debug!(kind = kind_to_str(kind), %content_id, "vex cache miss");
-        let bytes = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-            client
-                .get_object(Self::auth_request(
-                    GetObjectRequest {
-                        repo_id: self.config.repo_id.clone(),
-                        object: Some(ObjectId {
-                            kind: kind_to_str(kind).to_string(),
-                            content_id: content_id.to_string(),
-                        }),
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner().data)
-        })?;
+        // Own every captured value so the fetch future is `Send + 'static` and can
+        // be spawned onto the shared runtime. This is what lets `check_out`'s
+        // `.buffered(concurrency())` actually run reads in parallel instead of
+        // serializing them behind a per-object `block_on` (see `grpc_retry_async`).
+        let repo_id = self.config.repo_id.clone();
+        let access_token = self.config.access_token.clone();
+        let kind_str = kind_to_str(kind).to_string();
+        let content_id_str = content_id.to_string();
+        let bytes = Self::grpc_retry_async(&self.config.endpoint, 5, move |mut client| {
+            let repo_id = repo_id.clone();
+            let access_token = access_token.clone();
+            let kind_str = kind_str.clone();
+            let content_id_str = content_id_str.clone();
+            async move {
+                client
+                    .get_object(Self::auth_request(
+                        GetObjectRequest {
+                            repo_id,
+                            object: Some(ObjectId {
+                                kind: kind_str,
+                                content_id: content_id_str,
+                            }),
+                        },
+                        access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner().data)
+            }
+        })
+        .await?;
         self.write_cached_object(kind, content_id, &bytes)?;
         Ok(bytes)
     }
