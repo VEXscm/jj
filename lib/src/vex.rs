@@ -783,9 +783,22 @@ impl VexClient {
         Fut: Future<Output = Result<T, tonic::Status>>,
     {
         let channel = Self::cached_channel(endpoint)?;
-        let attempts = attempts.max(1);
+        // Retry budget. A clone's working-copy checkout makes thousands of
+        // per-object `GetObject` reads; a transient edge failure (a 502
+        // mid-stream) or a jj-backend restart (down for seconds to tens of
+        // seconds) must be *ridden through*, not aborted. The previous policy —
+        // 5 attempts with linear 200ms*attempt backoff — gave only a ~2s window,
+        // so a single backend blip mid-checkout failed the whole clone
+        // ("Failed to check out the initial commit"). Use exponential backoff
+        // (capped) with jitter over a ~40s window, and let callers only raise
+        // (never lower) the attempt count. All tunable via env for ops.
+        let attempts = attempts
+            .max(env_secs("VEX_GRPC_RETRY_ATTEMPTS", 10) as usize)
+            .max(1);
+        let base_ms = env_secs("VEX_GRPC_RETRY_BACKOFF_MS", 250).max(1);
+        let cap_ms = env_secs("VEX_GRPC_RETRY_BACKOFF_CAP_MS", 8_000).max(base_ms);
         Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
-            let mut attempt = 0;
+            let mut attempt = 0usize;
             loop {
                 attempt += 1;
                 let client = JjBackendClient::new(channel.clone())
@@ -794,14 +807,36 @@ impl VexClient {
                 match f(client).await {
                     Ok(value) => return Ok(value),
                     Err(status) if Self::is_transient_status(&status) && attempt < attempts => {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
-                            .await;
+                        // Exponential backoff capped at `cap_ms`, plus jitter, so
+                        // the flood of concurrent checkout reads doesn't hammer
+                        // the backend in lockstep the instant it recovers.
+                        let shift = (attempt - 1).min(6) as u32;
+                        let backoff_ms = base_ms.saturating_mul(1u64 << shift).min(cap_ms);
+                        let jitter_ms = Self::retry_jitter_ms(backoff_ms / 2 + 1);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            backoff_ms + jitter_ms,
+                        ))
+                        .await;
                         continue;
                     }
                     Err(status) => return Err(status.into()),
                 }
             }
         }))
+    }
+
+    /// Cheap, dependency-free jitter in `[0, span)` milliseconds, seeded from the
+    /// wall clock. Only used to de-correlate retry backoff across concurrent
+    /// reads, so statistical quality is irrelevant.
+    fn retry_jitter_ms(span: u64) -> u64 {
+        if span <= 1 {
+            return 0;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        nanos % span
     }
 
     fn block_on_http_get(
@@ -1636,37 +1671,70 @@ impl VexClient {
             .iter()
             .map(proto_virtual_repository_mount)
             .collect();
-        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| {
-            // The retry closure is `Fn` and may run multiple times, so clone
-            // the (non-Copy) mounts vec per attempt instead of moving it.
+        // Building a clone manifest for a large repo can take minutes (it packs
+        // tens of thousands of objects). We send `accept_pending = true` so the
+        // server returns `building = true` immediately on a cache miss (and warms
+        // in the background) instead of holding one RPC open past the
+        // client/edge-proxy timeout. We then poll until the manifest is ready.
+        // Each poll is itself transient-retryable via `block_on_grpc_retry`, so a
+        // backend restart mid-wait is ridden through rather than fatal.
+        let poll = std::time::Duration::from_millis(
+            env_secs("VEX_CLONE_MANIFEST_POLL_MS", 3_000).max(500),
+        );
+        let max_wait =
+            std::time::Duration::from_secs(env_secs("VEX_CLONE_MANIFEST_MAX_WAIT_SECS", 1_800));
+        let started = std::time::Instant::now();
+        loop {
             let virtual_mounts = virtual_mounts.clone();
-            async move {
-                client
-                    .get_clone_manifest(Self::auth_request(
-                        GetCloneManifestRequest {
-                            tenant_id: self.config.tenant_id.clone(),
-                            repo_id: self.config.repo_id.clone(),
-                            clone_blob_mode: match blob_mode {
-                                CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
-                                CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
+            let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| {
+                // The retry closure is `Fn` and may run multiple times, so clone
+                // the (non-Copy) mounts vec per attempt instead of moving it.
+                let virtual_mounts = virtual_mounts.clone();
+                async move {
+                    client
+                        .get_clone_manifest(Self::auth_request(
+                            GetCloneManifestRequest {
+                                tenant_id: self.config.tenant_id.clone(),
+                                repo_id: self.config.repo_id.clone(),
+                                clone_blob_mode: match blob_mode {
+                                    CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
+                                    CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
+                                },
+                                clone_view_kind: clone_view_kind as i32,
+                                virtual_root_path: self
+                                    .config
+                                    .virtual_root_path
+                                    .clone()
+                                    .unwrap_or_default(),
+                                virtual_mounts,
+                                accept_pending: true,
                             },
-                            clone_view_kind: clone_view_kind as i32,
-                            virtual_root_path: self
-                                .config
-                                .virtual_root_path
-                                .clone()
-                                .unwrap_or_default(),
-                            virtual_mounts,
-                        },
-                        self.config.access_token.as_deref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner())
+                            self.config.access_token.as_deref(),
+                        )?)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            })?;
+
+            if response.building {
+                if started.elapsed() >= max_wait {
+                    return Err(tonic::Status::deadline_exceeded(format!(
+                        "clone manifest still building after {}s",
+                        max_wait.as_secs()
+                    ))
+                    .into());
+                }
+                // Blocking sleep matches this module's sync-over-async bridge
+                // (the RPC above already blocks the calling thread); the whole
+                // clone is a blocking operation on this thread.
+                std::thread::sleep(poll);
+                continue;
             }
-        })?;
-        serde_json::from_slice(&response.manifest_json)
-            .map_err(VexConfigError::Json)
-            .map_err(Into::into)
+
+            return serde_json::from_slice(&response.manifest_json)
+                .map_err(VexConfigError::Json)
+                .map_err(Into::into);
+        }
     }
 
     async fn get_object_fetch_hints(

@@ -677,6 +677,11 @@ fn sparse_patterns_from_proto(
 /// Note that this does not prevent TOCTOU bugs caused by concurrent checkouts.
 /// Another process may remove the directory created by this function and put a
 /// symlink there.
+/// How many times [`create_parent_dirs`] retries a transient failure (a
+/// concurrent checkout worker racing on a shared ancestor directory) before
+/// surfacing it as a real error.
+const CREATE_PARENT_DIR_RETRY_ATTEMPTS: u32 = 8;
+
 fn create_parent_dirs(
     working_copy_path: &Path,
     repo_path: &RepoPath,
@@ -689,20 +694,41 @@ fn create_parent_dirs(
         // A directory named ".git" or ".jj" can be temporarily created. It
         // might trick workspace path discovery, but is harmless so long as the
         // directory is empty.
-        let (new_dir_created, is_dir) = match fs::create_dir(&dir_path) {
-            Ok(()) => (true, true), // New directory
-            Err(err) => match dir_path.symlink_metadata() {
-                Ok(m) => (false, m.is_dir()), // Existing file or directory
-                Err(_) => {
-                    return Err(CheckoutError::Other {
-                        message: format!(
-                            "Failed to create parent directories for {}",
-                            repo_path.to_fs_path_unchecked(working_copy_path).display(),
-                        ),
-                        err: err.into(),
-                    });
+        //
+        // Checkout materializes files with a pool of worker threads, so many
+        // files sharing a parent directory race here creating the same
+        // ancestors. `fs::create_dir` failing with the parent absent
+        // (`ErrorKind::NotFound`) followed by `symlink_metadata` also failing is
+        // a transient artifact of a concurrent worker creating/replacing a
+        // sibling entry, not a real failure — retry a few times with a short
+        // backoff before giving up so a single racy `ENOENT` doesn't abort the
+        // whole checkout (observed on case-insensitive/APFS macOS clones).
+        let (new_dir_created, is_dir) = 'create: {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match fs::create_dir(&dir_path) {
+                    Ok(()) => break 'create (true, true), // New directory
+                    Err(err) => match dir_path.symlink_metadata() {
+                        Ok(m) => break 'create (false, m.is_dir()), // Existing file or directory
+                        Err(_) if attempt < CREATE_PARENT_DIR_RETRY_ATTEMPTS => {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                (2u64.pow(attempt.min(6))).min(50),
+                            ));
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(CheckoutError::Other {
+                                message: format!(
+                                    "Failed to create parent directories for {}",
+                                    repo_path.to_fs_path_unchecked(working_copy_path).display(),
+                                ),
+                                err: err.into(),
+                            });
+                        }
+                    },
                 }
-            },
+            }
         };
         // Invalid component (e.g. "..") should have been rejected.
         // The current dir_path should be an entry of dir_path.parent().
