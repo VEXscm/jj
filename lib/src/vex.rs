@@ -22,6 +22,7 @@ use std::io::Write;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -48,7 +49,7 @@ use jj_backend_api::ResolveRefsRequest;
 use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
-    CloneManifest, ContentId, ObjectKind, SnapshotPackSet, decode_object_pack,
+    CloneManifest, ContentId, ObjectKind, ObjectPackEntry, SnapshotPackSet, decode_object_pack,
     decode_object_pack_reader, decode_object_pack_with_visitor,
 };
 use serde::Deserialize;
@@ -198,12 +199,29 @@ pub struct VexClientStats {
     pub pack_chunks_fetched: AtomicU64,
     /// Encoded pack bytes transferred.
     pub pack_bytes_fetched: AtomicU64,
+    /// Successful direct HTTP object-store fetches (pack chunks and whole
+    /// packs), bypassing the gRPC relay. Named for the common case —
+    /// SigV4-presigned hint URLs — but a deployment serving hints via the
+    /// unauthenticated `JJ_OBJECT_BASE_URL` route counts here too (the client
+    /// cannot tell the flavors apart); with such a deployment a
+    /// `JJ_PRESIGN_GET_TTL_SECS=0` rollback will NOT drive this to zero.
+    /// Only fetches whose result is actually consumed are counted (see
+    /// [`VexClient::http_get_async`]).
+    pub presigned_fetches: AtomicU64,
+    /// Bytes fetched via direct HTTP (see [`Self::presigned_fetches`] for
+    /// exactly what "presigned" covers).
+    pub presigned_bytes: AtomicU64,
     /// Snapshot packs fetched (roadmap/032 snapshot-pack consumption).
     pub snapshot_packs_fetched: AtomicU64,
     /// Encoded snapshot pack bytes transferred.
     pub snapshot_pack_bytes: AtomicU64,
     /// Objects unpacked from packs into the local cache.
     pub objects_unpacked: AtomicU64,
+    /// Objects unpacked pack-resident — indexed into a `.packs` payload file
+    /// instead of exploded into a loose cache file (roadmap/032 follow-up).
+    pub objects_pack_resident: AtomicU64,
+    /// Loose cache file creations avoided by the pack-resident unpack.
+    pub loose_writes_avoided: AtomicU64,
     /// Objects hydrated pre-checkout via [`VexClient::get_objects_inline_batched`].
     pub hydrated_objects: AtomicU64,
     /// Bytes hydrated pre-checkout.
@@ -232,9 +250,13 @@ macro_rules! for_each_vex_client_stat {
             packs_fetched,
             pack_chunks_fetched,
             pack_bytes_fetched,
+            presigned_fetches,
+            presigned_bytes,
             snapshot_packs_fetched,
             snapshot_pack_bytes,
             objects_unpacked,
+            objects_pack_resident,
+            loose_writes_avoided,
             hydrated_objects,
             hydrated_bytes,
             files_written,
@@ -258,9 +280,13 @@ pub struct VexClientStatsSnapshot {
     pub packs_fetched: u64,
     pub pack_chunks_fetched: u64,
     pub pack_bytes_fetched: u64,
+    pub presigned_fetches: u64,
+    pub presigned_bytes: u64,
     pub snapshot_packs_fetched: u64,
     pub snapshot_pack_bytes: u64,
     pub objects_unpacked: u64,
+    pub objects_pack_resident: u64,
+    pub loose_writes_avoided: u64,
     pub hydrated_objects: u64,
     pub hydrated_bytes: u64,
     pub files_written: u64,
@@ -525,6 +551,22 @@ pub struct VexClient {
     /// Mirror of `config.local_writes`. When true, `put_object` short-circuits to
     /// the local cache instead of issuing a gRPC `PutObject` (READ_ONLY CI runner).
     local_writes: bool,
+    /// The cache dir was created by this clone process (and is removed with the
+    /// `.jj` scaffold on failure), so unpack loose writes may skip the
+    /// temp+rename atomicity dance. See [`Self::mark_fresh_clone_cache`].
+    fresh_cache: bool,
+    /// Test override for [`pack_resident_cache_enabled`] (`None` = env). Tests
+    /// pin it directly instead of mutating the process environment (`jj-lib`
+    /// forbids `unsafe`, which `set_var` now requires).
+    pack_resident_override: Option<bool>,
+    /// Tripped by the first presigned HTTP 403 (see
+    /// [`Self::fetch_pack_chunk_with_retry`]). Object-fetch hints are minted
+    /// once per prefetch run, so one expired/invalid signature means every
+    /// remaining hint fails the same way; once set, direct HTTP fetches are
+    /// skipped and transfers go straight to the gRPC fallback. Shared
+    /// (`Arc`) across clones of this client, per-client so tests stay
+    /// isolated.
+    presigned_get_disabled: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -611,6 +653,34 @@ fn pack_fetch_concurrency() -> usize {
         .unwrap_or(PACK_FETCH_CONCURRENCY)
 }
 
+/// Default number of chunk fetches in flight within one pack transfer. The
+/// fetches are reorder-buffered (`.buffered(W)` yields results in input
+/// order), so the single writer still appends to the `.part` file strictly in
+/// chunk order. Peak buffered memory is bounded at pack workers × W × the
+/// 512KiB chunk size. Overridable via `VEX_CLONE_CHUNK_CONCURRENCY` (set `1`
+/// to restore the serial chunk loop).
+const CHUNK_FETCH_CONCURRENCY: usize = 8;
+
+/// Effective chunk-fetch concurrency (env `VEX_CLONE_CHUNK_CONCURRENCY`,
+/// default [`CHUNK_FETCH_CONCURRENCY`]). Public so `vex bench clone` can
+/// record it alongside the transfer counters.
+pub fn clone_chunk_concurrency() -> usize {
+    std::env::var("VEX_CLONE_CHUNK_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(CHUNK_FETCH_CONCURRENCY)
+}
+
+/// Persist the pack transfer state every this many appended chunks (plus once
+/// at the end and on error) instead of per chunk — the per-chunk JSON rewrite
+/// was one extra file write per 512KiB on the clone critical path. A kill
+/// between saves leaves the `.part` ahead of the recorded state; resume
+/// truncates it back to the recorded contiguous prefix (see
+/// [`VexClient::prefetch_pack_via_chunks`]), so at most this many chunks are
+/// refetched.
+const TRANSFER_STATE_SAVE_INTERVAL: usize = 8;
+
 /// Whether the client consumes precomputed snapshot packs from the clone
 /// manifest (roadmap/032). On by default; `VEX_CLONE_SNAPSHOT_PACKS=0` (or
 /// `false`/`no`) disables consumption (rollback / bench control).
@@ -619,6 +689,35 @@ fn snapshot_packs_client_enabled() -> bool {
         std::env::var("VEX_CLONE_SNAPSHOT_PACKS").ok().as_deref(),
         Some("0") | Some("false") | Some("no")
     )
+}
+
+/// Whether unpacked metadata objects (commit/tree/op/view) are kept
+/// pack-resident — one decompressed payload file plus a `(offset, len)`
+/// sidecar index per pack under `<cache_root>/.packs/` — instead of exploded
+/// into one loose cache file each (~126k of the ~129k files a prod clone used
+/// to create, ~50% of the pack phase). Blobs and symlinks always unpack
+/// loose: reflink materialization and checkout streaming need real per-object
+/// files. On by default; `VEX_CACHE_PACK_RESIDENT=0` (or `false`/`no`)
+/// restores the all-loose unpack exactly (kill switch — pack-resident reads
+/// and writes are both disabled).
+fn pack_resident_cache_enabled() -> bool {
+    !matches!(
+        std::env::var("VEX_CACHE_PACK_RESIDENT").ok().as_deref(),
+        Some("0") | Some("false") | Some("no")
+    )
+}
+
+/// Bound on the decode→writer channel of the loose-object unpack writer pool:
+/// how many decoded entries may sit in flight before the decode thread blocks,
+/// which bounds peak memory at roughly this many object bodies per pack.
+const UNPACK_WRITER_QUEUE_OBJECTS: usize = 128;
+
+/// Loose-object writer threads per pack unpack. The measured cache-write
+/// throughput stops scaling past ~4 threads (FS-bound), so cap there.
+fn unpack_loose_writer_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 4)
 }
 
 /// Objects written this process that have not yet been uploaded, keyed by repo
@@ -647,6 +746,280 @@ struct PendingUploads {
     bytes: usize,
 }
 
+/// Process-wide pack-resident indexes, keyed by cache root. Process-global for
+/// the same reason as [`PENDING_UPLOADS`]: the three Vex stores of one repo —
+/// object backend, op store, op heads store — each hold their own
+/// [`VexClient`], and all of them must see one coherent view of the index
+/// (including self-heal drops and prune invalidation).
+static PACK_INDEXES: OnceLock<Mutex<HashMap<PathBuf, Arc<PackResidentIndex>>>> = OnceLock::new();
+
+/// In-memory overlay of the pack-resident metadata cache (roadmap/032
+/// follow-up). Unpacking a clone/snapshot pack appends the metadata entries'
+/// bytes to `<cache_root>/.packs/<pack_hex>.payload` and records
+/// `content_id → (pack, offset, len)` both here and in an atomically-written
+/// `<pack_hex>.idx` sidecar (one idx file per pack, so concurrent clones
+/// sharing a cache dir never coordinate appends). The overlay is consulted by
+/// [`VexClient::read_cached_object`] / [`VexClient::has_cached_object`]
+/// *before* the loose files; sidecars are folded in lazily on first use.
+///
+/// Entries only ever describe server-served, SHA-256-verified pack contents,
+/// so an index hit carries the same "cached ⟹ present on server" guarantee as
+/// a loose cache file. Staleness (a payload pruned or deleted behind our
+/// back) self-heals on read: see [`VexClient::read_pack_resident_object`].
+#[derive(Debug)]
+struct PackResidentIndex {
+    /// `<cache_root>/.packs` — payload and `.idx` sidecar files live here.
+    packs_dir: PathBuf,
+    state: Mutex<PackIndexState>,
+}
+
+#[derive(Debug, Default)]
+struct PackIndexState {
+    /// Whether the on-disk `*.idx` sidecars have been folded in.
+    loaded: bool,
+    entries: HashMap<(ObjectKind, ContentId), PackEntryLocation>,
+}
+
+/// Where one pack-resident object's bytes live: `(payload file, offset, len)`.
+#[derive(Debug, Clone)]
+struct PackEntryLocation {
+    /// Pack content id hex — the payload/idx file stem, shared (`Arc`) across
+    /// all of the pack's entries.
+    pack_hex: Arc<str>,
+    offset: u64,
+    len: u64,
+}
+
+/// One `.idx` sidecar line: an object's location within its pack's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackIndexRecord {
+    kind: ObjectKind,
+    content_id: ContentId,
+    offset: u64,
+    len: u64,
+}
+
+/// First line of a pack `.idx` sidecar (format version marker). Files with a
+/// different header are ignored wholesale, so the format can evolve without
+/// misreading old caches.
+const PACK_IDX_HEADER: &str = "vex-pack-idx-v1";
+
+/// Serialize the `.idx` sidecar: the header line, then one
+/// `<kind> <content_id> <offset> <len>` line per entry.
+fn format_pack_index_file(records: &[PackIndexRecord]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(records.len() * 90 + PACK_IDX_HEADER.len() + 1);
+    out.push_str(PACK_IDX_HEADER);
+    out.push('\n');
+    for record in records {
+        writeln!(
+            out,
+            "{} {} {} {}",
+            kind_to_str(record.kind),
+            record.content_id,
+            record.offset,
+            record.len
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out
+}
+
+/// Allocation-free decode of a 64-char hex content id.
+/// `ContentId::from_hex` heap-allocates a `Vec` per call (`hex::decode`),
+/// which is measurable across the ~126k sidecar records a prod-scale
+/// [`PackResidentIndex::ensure_loaded`] parses on a process's first metadata
+/// read. Same accepted inputs as `from_hex` (either hex case).
+fn content_id_from_hex_no_alloc(s: &str) -> Option<ContentId> {
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() != ContentId::HEX_LEN {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(ContentId::from_bytes(out))
+}
+
+/// Parse a `.idx` sidecar written by [`format_pack_index_file`]. `None` for
+/// anything malformed (wrong header, junk line): the whole file is then
+/// ignored and its objects simply fall back to loose/RPC reads.
+///
+/// This runs for *every* sidecar on a process's first metadata read
+/// (`ensure_loaded`) — ~11MB of text at prod scale, on the profiled
+/// `vex status` startup path — so it stays allocation lean: the only
+/// per-record work is borrowed `split`s, a stack hex decode, and integer
+/// parses, and the output `Vec` is pre-sized from the file length (records
+/// are ~86 bytes/line).
+fn parse_pack_index_file(text: &str) -> Option<Vec<PackIndexRecord>> {
+    let mut lines = text.lines();
+    if lines.next()? != PACK_IDX_HEADER {
+        return None;
+    }
+    let mut records = Vec::with_capacity(text.len() / 80 + 1);
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(' ');
+        let kind = kind_from_str(fields.next()?)?;
+        let content_id = content_id_from_hex_no_alloc(fields.next()?)?;
+        let offset = fields.next()?.parse().ok()?;
+        let len = fields.next()?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        records.push(PackIndexRecord {
+            kind,
+            content_id,
+            offset,
+            len,
+        });
+    }
+    Some(records)
+}
+
+impl PackResidentIndex {
+    fn new(packs_dir: PathBuf) -> Self {
+        Self {
+            packs_dir,
+            state: Mutex::new(PackIndexState::default()),
+        }
+    }
+
+    fn payload_path(&self, pack_hex: &str) -> PathBuf {
+        self.packs_dir.join(format!("{pack_hex}.payload"))
+    }
+
+    fn idx_path(&self, pack_hex: &str) -> PathBuf {
+        self.packs_dir.join(format!("{pack_hex}.idx"))
+    }
+
+    fn lookup(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PackEntryLocation> {
+        let mut state = self.state.lock().unwrap();
+        self.ensure_loaded(&mut state);
+        state.entries.get(&(kind, *content_id)).cloned()
+    }
+
+    fn contains(&self, kind: ObjectKind, content_id: &ContentId) -> bool {
+        self.lookup(kind, content_id).is_some()
+    }
+
+    /// Publish a freshly unpacked pack's entries to the overlay (its payload
+    /// and `.idx` sidecar are already persisted).
+    fn insert_pack(&self, pack_hex: &str, records: &[PackIndexRecord]) {
+        let mut state = self.state.lock().unwrap();
+        self.ensure_loaded(&mut state);
+        let pack_hex: Arc<str> = Arc::from(pack_hex);
+        for record in records {
+            state.entries.insert(
+                (record.kind, record.content_id),
+                PackEntryLocation {
+                    pack_hex: Arc::clone(&pack_hex),
+                    offset: record.offset,
+                    len: record.len,
+                },
+            );
+        }
+    }
+
+    /// Self-heal after a payload read failure: the payload file is gone (or
+    /// unreadable), so every entry pointing into it is dead. Drop them from
+    /// the overlay and best-effort-remove the on-disk pair so no later
+    /// process resurrects the stale entries from the sidecar.
+    fn drop_pack(&self, pack_hex: &str) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state
+                .entries
+                .retain(|_, location| location.pack_hex.as_ref() != pack_hex);
+        }
+        drop(fs::remove_file(self.idx_path(pack_hex)));
+        drop(fs::remove_file(self.payload_path(pack_hex)));
+    }
+
+    /// Drop every entry (prune removed the whole `.packs` dir). `loaded`
+    /// stays true: the sidecars are gone with the payloads, and later unpacks
+    /// re-publish through [`Self::insert_pack`].
+    fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entries.clear();
+        state.loaded = true;
+    }
+
+    /// Fold the on-disk `*.idx` sidecars into the overlay, once. A sidecar
+    /// whose payload file is missing (partially pruned/deleted cache) is
+    /// dropped on the spot instead of loaded — the load-time flavor of the
+    /// read-time self-heal.
+    fn ensure_loaded(&self, state: &mut PackIndexState) {
+        if state.loaded {
+            return;
+        }
+        state.loaded = true;
+        let Ok(dir_entries) = fs::read_dir(&self.packs_dir) else {
+            return;
+        };
+        for dir_entry in dir_entries.flatten() {
+            let path = dir_entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+                continue;
+            }
+            let Some(pack_hex) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !self.payload_path(pack_hex).exists() {
+                drop(fs::remove_file(&path));
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(records) = parse_pack_index_file(&text) else {
+                continue;
+            };
+            let pack_hex: Arc<str> = Arc::from(pack_hex);
+            // Bulk-reserve before the insert loop: at prod scale (~126k
+            // records) the incremental HashMap growth is roughly half the
+            // load cost.
+            state.entries.reserve(records.len());
+            for record in records {
+                state.entries.insert(
+                    (record.kind, record.content_id),
+                    PackEntryLocation {
+                        pack_hex: Arc::clone(&pack_hex),
+                        offset: record.offset,
+                        len: record.len,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Kinds served pack-resident from `.packs` payloads (when
+/// [`pack_resident_cache_enabled`]). Blob and Symlink must stay loose —
+/// reflink materialization (`cached_blob_path`), checkout streaming
+/// (`open_cached_object`) and `read_symlink` all need real per-object files —
+/// and the rarer kinds (tag/copy/manifest) conservatively stay loose with
+/// them. Commits, trees, ops and views are read only through
+/// `read_cached_object`/`get_object`, so they can be served straight from a
+/// payload file.
+fn is_pack_resident_kind(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Commit | ObjectKind::Tree | ObjectKind::Op | ObjectKind::View
+    )
+}
+
 impl VexClient {
     pub fn from_config(config: VexRepoConfig) -> Result<Self, VexConfigError> {
         Self::validate_endpoint(&config.endpoint)?;
@@ -656,6 +1029,9 @@ impl VexClient {
             cache_root: None,
             cache_max_bytes: cache_max_bytes(),
             local_writes,
+            fresh_cache: false,
+            pack_resident_override: None,
+            presigned_get_disabled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -673,6 +1049,9 @@ impl VexClient {
             cache_root: Some(cache_root),
             cache_max_bytes: cache_max_bytes(),
             local_writes,
+            fresh_cache: false,
+            pack_resident_override: None,
+            presigned_get_disabled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -685,6 +1064,45 @@ impl VexClient {
     /// [`crate::vex_op_heads_store::VexOpHeadsStore`].
     pub fn local_writes(&self) -> bool {
         self.local_writes
+    }
+
+    /// Whether this client uses the pack-resident metadata cache
+    /// ([`pack_resident_cache_enabled`], overridable per client for tests).
+    fn pack_resident_enabled(&self) -> bool {
+        self.pack_resident_override
+            .unwrap_or_else(pack_resident_cache_enabled)
+    }
+
+    /// This cache root's shared [`PackResidentIndex`], creating it on first
+    /// use. `None` without a cache root or when the pack-resident cache is
+    /// disabled (`VEX_CACHE_PACK_RESIDENT=0`) — every consulting call site
+    /// then behaves exactly as before the pack-resident split.
+    fn pack_index(&self) -> Option<Arc<PackResidentIndex>> {
+        if !self.pack_resident_enabled() {
+            return None;
+        }
+        let cache_root = self.cache_root.as_ref()?;
+        let map = PACK_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap();
+        if let Some(index) = guard.get(cache_root) {
+            return Some(Arc::clone(index));
+        }
+        let index = Arc::new(PackResidentIndex::new(cache_root.join(".packs")));
+        guard.insert(cache_root.clone(), Arc::clone(&index));
+        Some(index)
+    }
+
+    /// Mark this client's cache dir as freshly created by the current clone
+    /// scaffold, enabling the direct-create (no temp+rename) fast path for
+    /// the unpack's loose writes. Off by default; only the repo-local
+    /// `vex-cache` qualifies: it lives inside the `.jj` this clone just
+    /// created (`create_jj_dir` fails if one exists) and the whole `.jj` is
+    /// removed on clone failure, so a crash cannot leave a truncated cache
+    /// file for `read_cached_object` (which never re-verifies hashes) to
+    /// serve forever. A shared cache dir (`JJ_VEX_SHARED_CACHE_DIR`) may
+    /// pre-exist and outlives a failed clone, so it keeps atomic writes.
+    pub fn mark_fresh_clone_cache(&mut self) {
+        self.fresh_cache = shared_cache_root(&self.config).is_none();
     }
 
     fn cache_path(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PathBuf> {
@@ -769,12 +1187,25 @@ impl VexClient {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(path)?;
-        Ok(Some(
-            serde_json::from_slice(&bytes)
-                .map_err(VexConfigError::Json)
-                .map_err(VexClientError::from)?,
-        ))
+        let bytes = fs::read(&path)?;
+        match serde_json::from_slice(&bytes) {
+            Ok(state) => Ok(Some(state)),
+            Err(err) => {
+                // Corrupt/truncated state (saves are plain `fs::write`, so a
+                // kill or ENOSPC mid-save can leave partial JSON behind):
+                // inconsistent state means a full reset per the resume
+                // contract. Drop the poisoned file so the chunk path
+                // self-heals instead of erroring into the full-pack fallback
+                // on every later clone sharing this cache.
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "corrupt pack transfer state; resetting the transfer"
+                );
+                drop(fs::remove_file(&path));
+                Ok(None)
+            }
+        }
     }
 
     fn save_pack_transfer_state(
@@ -795,12 +1226,28 @@ impl VexClient {
         Ok(())
     }
 
-    fn clear_pack_transfer_state(&self, pack_content_id: &ContentId) -> Result<(), VexClientError> {
+    /// Remove a finished (or abandoned) pack transfer's state + `.part` files.
+    /// Also best-effort-removes any legacy loose `pack/<chunk_id>` cache files
+    /// for `chunk_ids`: older clients' gRPC chunk fallback double-wrote every
+    /// chunk into the loose cache (~41MB of dead files per prod clone). New
+    /// fallback reads bypass the cache entirely (see
+    /// [`Self::fetch_pack_chunk_with_retry`]); this cleans up what old clients
+    /// left behind.
+    fn clear_pack_transfer_state(
+        &self,
+        pack_content_id: &ContentId,
+        chunk_ids: &[ContentId],
+    ) -> Result<(), VexClientError> {
         if let Some(state_path) = self.transfer_state_path(pack_content_id) {
             drop(fs::remove_file(state_path));
         }
         if let Some(partial_path) = self.transfer_partial_path(pack_content_id) {
             drop(fs::remove_file(partial_path));
+        }
+        for chunk_id in chunk_ids {
+            if let Some(chunk_path) = self.cache_path(ObjectKind::Pack, chunk_id) {
+                drop(fs::remove_file(chunk_path));
+            }
         }
         Ok(())
     }
@@ -810,10 +1257,79 @@ impl VexClient {
         kind: ObjectKind,
         content_id: &ContentId,
     ) -> Option<Vec<u8>> {
+        // Pack-resident overlay first: after a clone, metadata kinds live in
+        // `.packs` payloads and never as loose files, so the in-memory lookup
+        // is the common hit and skips a guaranteed failed `open()` of the
+        // loose path. Anything not in the overlay — blobs, individually
+        // fetched or locally written objects — falls through to the loose
+        // file, which remains fully supported.
+        if let Some(bytes) = self.read_pack_resident_object(kind, content_id) {
+            return Some(bytes);
+        }
         let path = self.cache_path(kind, content_id)?;
         let bytes = fs::read(&path).ok()?;
         debug!(kind = kind_to_str(kind), %content_id, bytes = bytes.len(), cache_path = %path.display(), "vex cache hit");
         Some(bytes)
+    }
+
+    /// Read one object out of its pack-resident payload file, if the index
+    /// holds it. Self-heals a stale index: when the payload is *structurally*
+    /// gone — missing (pruned or deleted behind our back) or truncated
+    /// (entries point past EOF) — the whole pack's entries are dropped along
+    /// with its on-disk sidecar, and the read reports a miss so the caller
+    /// falls back to the loose file or the backend. Any other I/O error
+    /// (EMFILE under checkout's fd pressure, EACCES from a sandbox/AV, EIO)
+    /// is transient: report a miss for this one read but keep the payload,
+    /// sidecar, and index entries intact so the next read retries — matching
+    /// the loose path, which never deletes on a read error.
+    fn read_pack_resident_object(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+    ) -> Option<Vec<u8>> {
+        let index = self.pack_index()?;
+        let location = index.lookup(kind, content_id)?;
+        let path = index.payload_path(&location.pack_hex);
+        let read = || -> std::io::Result<Vec<u8>> {
+            use std::io::Read as _;
+            let mut file = File::open(&path)?;
+            file.seek(SeekFrom::Start(location.offset))?;
+            let mut bytes = vec![0_u8; location.len as usize];
+            file.read_exact(&mut bytes)?;
+            Ok(bytes)
+        };
+        match read() {
+            Ok(bytes) => {
+                debug!(kind = kind_to_str(kind), %content_id, bytes = bytes.len(), pack = %location.pack_hex, "vex cache hit (pack)");
+                Some(bytes)
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                debug!(
+                    kind = kind_to_str(kind),
+                    %content_id,
+                    pack = %location.pack_hex,
+                    error = %err,
+                    "pack payload missing/truncated; dropping its index entries (self-heal)"
+                );
+                index.drop_pack(&location.pack_hex);
+                None
+            }
+            Err(err) => {
+                debug!(
+                    kind = kind_to_str(kind),
+                    %content_id,
+                    pack = %location.pack_hex,
+                    error = %err,
+                    "pack payload unreadable (transient); treating as a cache miss"
+                );
+                None
+            }
+        }
     }
 
     /// Whether an object is present in the local cache, without reading it.
@@ -823,6 +1339,18 @@ impl VexClient {
     /// the object is already on the server. Callers use this to skip redundant
     /// uploads cheaply (no disk read of the blob body).
     fn has_cached_object(&self, kind: ObjectKind, content_id: &ContentId) -> bool {
+        // Pack-resident entries count too: they were unpacked from
+        // server-served, hash-verified packs, so "cached ⟹ present on server"
+        // holds for them — without this, every push would re-upload the
+        // pack-delivered metadata. The payload file is deliberately not
+        // stat'ed here: even if it was pruned, the object is still on the
+        // server, which is all this check vouches for.
+        if self
+            .pack_index()
+            .is_some_and(|index| index.contains(kind, content_id))
+        {
+            return true;
+        }
         self.cache_path(kind, content_id)
             .is_some_and(|path| path.exists())
     }
@@ -893,6 +1421,35 @@ impl VexClient {
         Ok(())
     }
 
+    /// Persist one unpacked loose object. `direct` skips the temp+rename
+    /// atomicity dance (measured 2.5x faster at clone scale) — safe ONLY for
+    /// a cache dir created by this clone process (see
+    /// [`Self::mark_fresh_clone_cache`]): a crash mid-write leaves a
+    /// truncated file, which `read_cached_object` (never re-verifies hashes)
+    /// would otherwise serve forever, but a failed clone removes the whole
+    /// freshly-scaffolded `.jj` and its cache with it.
+    fn write_unpacked_loose_object(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+        data: &[u8],
+        direct: bool,
+    ) -> Result<(), VexClientError> {
+        if !direct {
+            return self.write_cached_object_no_prune(kind, content_id, data);
+        }
+        let Some(path) = self.cache_path(kind, content_id) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(&path)?;
+        file.write_all(data)?;
+        debug!(kind = kind_to_str(kind), %content_id, bytes = data.len(), cache_path = %path.display(), "vex cache write (direct)");
+        Ok(())
+    }
+
     fn prune_cache_if_needed(&self) -> Result<(), VexClientError> {
         let (Some(cache_root), Some(limit_bytes)) = (&self.cache_root, self.cache_max_bytes) else {
             return Ok(());
@@ -942,10 +1499,26 @@ impl VexClient {
         // the chain) and the hydration walk skip, and new deltas marked
         // complete on top of it would keep the degradation alive across trunk
         // advances. Markers are cheap to regenerate — drop them all.
-        if removed_files > 0
-            && let Some(marker_root) = self.snapshot_marker_root()
-        {
-            drop(fs::remove_dir_all(marker_root));
+        if removed_files > 0 {
+            if let Some(marker_root) = self.snapshot_marker_root() {
+                drop(fs::remove_dir_all(marker_root));
+            }
+            // The `.packs` payload/index files are excluded from the LRU scan
+            // above (dot-dir), so a capped cache bounds their growth here
+            // instead: any prune that evicts object files also drops the
+            // pack-resident store wholesale, mirroring the marker rule. The
+            // removal runs even with `VEX_CACHE_PACK_RESIDENT=0` — nothing
+            // reads or writes `.packs` while the kill switch is on, so a
+            // cache dir that previously ran enabled would otherwise keep its
+            // whole `.packs` footprint as unreclaimable dead disk. The
+            // in-memory overlay is cleared with it (`pack_index()` is `None`
+            // when disabled, so the clear no-ops there); another process
+            // holding stale entries self-heals on its next read (the payload
+            // open fails, so the pack's entries are dropped).
+            drop(fs::remove_dir_all(cache_root.join(".packs")));
+            if let Some(index) = self.pack_index() {
+                index.clear();
+            }
         }
         debug!(
             cache_root = %cache_root.display(),
@@ -1262,48 +1835,202 @@ impl VexClient {
         nanos % span
     }
 
-    fn block_on_http_get(
-        url: &str,
-        headers: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<u8>, VexClientError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(VexClientError::Runtime)?;
-        runtime.block_on(with_output_cancel(async move {
-            let client = reqwest::Client::new();
-            let mut request = client.get(url);
-            for (name, value) in headers {
+    /// Shared pooled HTTP client for presigned-URL fetches. One per process
+    /// (like [`Self::cached_channel`]) so the ~139 chunk fetches of a clone
+    /// reuse pooled TLS connections to the object store instead of paying a
+    /// fresh TCP+TLS handshake per request.
+    ///
+    /// Timeouts: `connect_timeout` bounds a tarpit connect, and `read_timeout`
+    /// bounds the time between body reads — so a server that returns headers
+    /// then stalls the body errors out instead of hanging a non-interactive
+    /// clone forever (the only other cancellation, [`with_output_cancel`],
+    /// fires solely when a pager quits). A *total* request timeout is
+    /// deliberately not set: whole packs stream through this client
+    /// ([`Self::block_on_http_get_to_file`]) and a large-but-progressing
+    /// download must never be killed. A timed-out chunk surfaces as an error
+    /// and degrades to the existing gRPC fallback
+    /// ([`Self::fetch_pack_chunk_with_retry`]). Env-tunable, mirroring the
+    /// gRPC endpoint's `VEX_GRPC_*_TIMEOUT_SECS` knobs.
+    fn shared_http_client() -> &'static reqwest::Client {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(env_secs(
+                    "VEX_HTTP_CONNECT_TIMEOUT_SECS",
+                    10,
+                )))
+                .read_timeout(Duration::from_secs(env_secs(
+                    "VEX_HTTP_READ_TIMEOUT_SECS",
+                    60,
+                )))
+                .build()
+                .expect("static HTTP client configuration is valid")
+        })
+    }
+
+    /// Spawn a presigned HTTP GET as a task on the shared runtime, with
+    /// `with_output_cancel` *inside* the spawned future (the
+    /// [`Self::grpc_retry_async`] pattern), and buffer the response body.
+    /// Awaiting the returned `JoinHandle` is a cooperative yield, so
+    /// `.buffered(W)` chunk streams genuinely overlap W requests even when
+    /// driven from a plain thread's `block_on`.
+    ///
+    /// `expected_len` (the descriptor's `size_bytes`, when the caller knows
+    /// it) caps the buffered body: a hostile or broken endpoint that streams
+    /// more than the expected size errors out as soon as the cap is crossed
+    /// instead of buffering an arbitrarily large body — W of these run
+    /// concurrently, so the memory bound matters. An over-cap fetch hits the
+    /// same retry/gRPC-fallback path as any other fetch failure.
+    fn spawn_http_get(
+        url: String,
+        headers: std::collections::HashMap<String, String>,
+        expected_len: Option<u64>,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, VexClientError>> {
+        Self::shared_grpc_runtime().spawn(with_output_cancel(async move {
+            let mut request = Self::shared_http_client().get(&url);
+            for (name, value) in &headers {
                 request = request.header(name, value);
             }
-            let response = request.send().await?.error_for_status()?;
-            let bytes = response.bytes().await?;
-            Ok(bytes.to_vec())
+            let mut response = request.send().await?.error_for_status()?;
+            // Pre-size to the expected length (capped: never trust a header
+            // or descriptor for a huge up-front allocation).
+            let mut bytes: Vec<u8> = Vec::with_capacity(
+                usize::try_from(expected_len.unwrap_or(0))
+                    .unwrap_or(usize::MAX)
+                    .min(16 << 20),
+            );
+            while let Some(chunk) = response.chunk().await? {
+                let received = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+                if expected_len.is_some_and(|limit| received > limit) {
+                    return Err(VexClientError::PackDecode(format!(
+                        "http response exceeds expected size ({} bytes)",
+                        expected_len.unwrap_or(0)
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
         }))
     }
 
+    /// Async presigned GET: spawns via [`Self::spawn_http_get`] and awaits the
+    /// task handle (a cooperative yield point for buffered chunk streams).
+    ///
+    /// The `presigned_fetches`/`presigned_bytes` counters are bumped *here*,
+    /// on the consumer side, not inside the spawned task: dropping this future
+    /// mid-await (an error abandons a `.buffered(W)` window; the detached task
+    /// still runs to completion) must not count bytes that are never consumed,
+    /// or bench JSON would report `presigned_bytes > pack_bytes_fetched`.
+    async fn http_get_async(
+        url: String,
+        headers: std::collections::HashMap<String, String>,
+        expected_len: Option<u64>,
+    ) -> Result<Vec<u8>, VexClientError> {
+        match Self::spawn_http_get(url, headers, expected_len).await {
+            Ok(result) => {
+                if let Ok(bytes) = &result {
+                    let stats = vex_client_stats();
+                    stats.presigned_fetches.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .presigned_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                }
+                result
+            }
+            Err(join_err) => Err(VexClientError::Io(std::io::Error::other(format!(
+                "http worker task failed: {join_err}"
+            )))),
+        }
+    }
+
+    fn block_on_http_get(
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        expected_len: Option<u64>,
+    ) -> Result<Vec<u8>, VexClientError> {
+        // `Runtime::block_on` (not `futures::executor::block_on`): the callers
+        // are plain pack-worker threads already inside a
+        // `futures::executor::block_on`, which panics on re-entry.
+        Self::shared_grpc_runtime().block_on(Self::http_get_async(
+            url.to_string(),
+            headers.clone(),
+            expected_len,
+        ))
+    }
+
+    /// Stream an HTTP GET body into `out`. `max_bytes` (the pack descriptor's
+    /// `size_bytes`, when known) bounds how much a hostile/broken endpoint can
+    /// write to disk; crossing it fails the fetch, which degrades to the
+    /// existing whole-pack gRPC fallback.
     fn block_on_http_get_to_file(
         url: &str,
         headers: &std::collections::HashMap<String, String>,
         out: &mut dyn Write,
+        max_bytes: Option<u64>,
     ) -> Result<(), VexClientError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(VexClientError::Runtime)?;
-        runtime.block_on(with_output_cancel(async move {
-            let client = reqwest::Client::new();
-            let mut request = client.get(url);
-            for (name, value) in headers {
+        let url = url.to_string();
+        let headers = headers.clone();
+        // The response streams from a task on the shared runtime (which owns
+        // the pooled client's connections and the cancellation timer) over a
+        // bounded channel to this thread, which writes it out — `out` is a
+        // plain `&mut dyn Write` that cannot move into a `'static` task.
+        let (mut tx, mut rx) = futures::channel::mpsc::channel::<Vec<u8>>(8);
+        let handle = Self::shared_grpc_runtime().spawn(with_output_cancel(async move {
+            use futures::SinkExt as _;
+            let mut request = Self::shared_http_client().get(&url);
+            for (name, value) in &headers {
                 request = request.header(name, value);
             }
             let mut response = request.send().await?.error_for_status()?;
+            let mut total_bytes = 0_u64;
             while let Some(chunk) = response.chunk().await? {
-                out.write_all(&chunk)?;
+                total_bytes += chunk.len() as u64;
+                if max_bytes.is_some_and(|limit| total_bytes > limit) {
+                    return Err(VexClientError::PackDecode(format!(
+                        "http response exceeds expected size ({} bytes)",
+                        max_bytes.unwrap_or(0)
+                    )));
+                }
+                if tx.send(chunk.to_vec()).await.is_err() {
+                    // Receiver dropped: the writer failed and its error wins
+                    // (checked before this task's result below).
+                    return Err(VexClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "pack stream receiver dropped",
+                    )));
+                }
             }
-            out.flush()?;
+            let stats = vex_client_stats();
+            stats.presigned_fetches.fetch_add(1, Ordering::Relaxed);
+            stats
+                .presigned_bytes
+                .fetch_add(total_bytes, Ordering::Relaxed);
             Ok(())
-        }))
+        }));
+        let (write_result, task_result) = Self::shared_grpc_runtime().block_on(async {
+            use futures::StreamExt as _;
+            let mut write_result: Result<(), std::io::Error> = Ok(());
+            while let Some(chunk) = rx.next().await {
+                if let Err(err) = out.write_all(&chunk) {
+                    write_result = Err(err);
+                    break;
+                }
+            }
+            // Closing the receiver unblocks a sender awaiting channel capacity,
+            // so the task observes the drop and finishes.
+            drop(rx);
+            let task_result = match handle.await {
+                Ok(result) => result,
+                Err(join_err) => Err(VexClientError::Io(std::io::Error::other(format!(
+                    "http worker task failed: {join_err}"
+                )))),
+            };
+            (write_result, task_result)
+        });
+        write_result?;
+        task_result?;
+        out.flush()?;
+        Ok(())
     }
 
     fn direct_fetch_pack_bytes(
@@ -1311,6 +2038,9 @@ impl VexClient {
         pack: &jj_backend_types::PackDescriptor,
         hints: &[jj_backend_api::PresignedGet],
     ) -> Result<Option<Vec<u8>>, VexClientError> {
+        if self.presigned_get_disabled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let Some(hint) = hints
             .iter()
             .find(|hint| hint.object_key.ends_with(&pack.content_id.to_string()))
@@ -1320,13 +2050,18 @@ impl VexClient {
         if hint.url.is_empty() {
             return Ok(None);
         }
-        Self::block_on_http_get(&hint.url, &hint.headers).map(Some)
+        Self::block_on_http_get(&hint.url, &hint.headers, Some(pack.size_bytes)).map(Some)
     }
 
-    fn direct_fetch_pack_blob_bytes(
+    /// Fetch one pack chunk via its presigned hint URL, if any. Async (the
+    /// request runs as a spawned task on the shared runtime) so the chunk
+    /// stream's `.buffered(W)` genuinely overlaps W fetches. `expected_len`
+    /// is the chunk descriptor's `size_bytes` (caps the buffered body).
+    async fn direct_fetch_pack_blob_bytes(
         &self,
         content_id: &ContentId,
         hints: &[jj_backend_api::PresignedGet],
+        expected_len: Option<u64>,
     ) -> Result<Option<Vec<u8>>, VexClientError> {
         let Some(hint) = hints
             .iter()
@@ -1337,7 +2072,9 @@ impl VexClient {
         if hint.url.is_empty() {
             return Ok(None);
         }
-        Self::block_on_http_get(&hint.url, &hint.headers).map(Some)
+        Self::http_get_async(hint.url.clone(), hint.headers.clone(), expected_len)
+            .await
+            .map(Some)
     }
 
     fn direct_fetch_pack_to_file(
@@ -1346,6 +2083,9 @@ impl VexClient {
         hints: &[jj_backend_api::PresignedGet],
         out: &mut dyn Write,
     ) -> Result<bool, VexClientError> {
+        if self.presigned_get_disabled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         let Some(hint) = hints
             .iter()
             .find(|hint| hint.object_key.ends_with(&pack.content_id.to_string()))
@@ -1355,60 +2095,320 @@ impl VexClient {
         if hint.url.is_empty() {
             return Ok(false);
         }
-        Self::block_on_http_get_to_file(&hint.url, &hint.headers, out)?;
+        Self::block_on_http_get_to_file(&hint.url, &hint.headers, out, Some(pack.size_bytes))?;
         Ok(true)
     }
 
-    /// Stream a pack file's entries into the local cache. Uses the no-prune
-    /// cache write (bulk path — the prefetch prunes once at the end).
+    /// Stream a pack file's entries into the local cache via the hybrid
+    /// pack-resident/loose unpack (see [`Self::unpack_pack_entries`]). Uses
+    /// the no-prune cache write for the loose portion (bulk path — the
+    /// prefetch prunes once at the end).
     fn prefetch_pack_entries_from_file(
         &self,
+        pack_content_id: &ContentId,
         path: &Path,
         prefetched_objects: &AtomicU64,
     ) -> Result<(), VexClientError> {
         let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut write_error: Option<VexClientError> = None;
-        let decode_result = decode_object_pack_with_visitor(reader, |entry| {
-            match self.write_cached_object_no_prune(entry.kind, &entry.content_id, &entry.data) {
-                Ok(()) => {
-                    prefetched_objects.fetch_add(1, Ordering::Relaxed);
-                    vex_client_stats()
-                        .objects_unpacked
-                        .fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                }
-                Err(err) => {
+        let mut reader = Some(BufReader::new(file));
+        self.unpack_pack_entries(pack_content_id, prefetched_objects, move |sink| {
+            let reader = reader.take().expect("unpack drives the decode once");
+            let mut write_error: Option<VexClientError> = None;
+            let decode_result = decode_object_pack_with_visitor(reader, |entry| {
+                sink(entry).map_err(|err| {
                     write_error = Some(err);
-                    Err(jj_backend_types::PackCodecError::Compression(
-                        "cache write failed".to_string(),
-                    ))
-                }
+                    jj_backend_types::PackCodecError::Compression("cache write failed".to_string())
+                })
+            });
+            if let Some(err) = write_error {
+                return Err(err);
             }
-        });
-        if let Some(err) = write_error {
-            return Err(err);
-        }
-        decode_result.map_err(|err| VexClientError::PackDecode(err.to_string()))
+            decode_result.map_err(|err| VexClientError::PackDecode(err.to_string()))
+        })
     }
 
-    async fn fetch_pack_blob_with_retry(
+    /// Unpack a pack's entries into the local cache with the hybrid split
+    /// (roadmap/032 follow-up): metadata kinds ([`is_pack_resident_kind`]) are
+    /// appended once to a per-pack payload file under `<cache_root>/.packs/`
+    /// and published to the [`PackResidentIndex`] overlay as
+    /// `(offset, len)` records, while everything else (blobs, symlinks) is
+    /// written loose as before. The payload holds exactly the indexed entries'
+    /// bytes, so offsets are computed here during the streaming decode; the
+    /// per-entry SHA-256 verification already ran inside the decode, and
+    /// entries are published only after payload + `.idx` sidecar are persisted
+    /// (both atomically, content-addressed by pack id — concurrent clones
+    /// sharing a cache dir persist idempotently).
+    ///
+    /// The loose portion is handed over a bounded channel to a small blocking
+    /// writer pool ([`unpack_loose_writer_count`]), so the decode thread is
+    /// not serialized behind per-object temp+rename file creation; payload and
+    /// sidecar writes stay on the decode thread.
+    ///
+    /// With `VEX_CACHE_PACK_RESIDENT=0` (or without a cache root) every entry
+    /// unpacks loose, inline, on the decode thread — exactly the pre-split
+    /// behavior.
+    ///
+    /// `drive` feeds the entries (from a streaming decode or an in-memory
+    /// pack) into the sink it is given, in pack order.
+    fn unpack_pack_entries<F>(
+        &self,
+        pack_content_id: &ContentId,
+        prefetched_objects: &AtomicU64,
+        drive: F,
+    ) -> Result<(), VexClientError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(ObjectPackEntry) -> Result<(), VexClientError>,
+        ) -> Result<(), VexClientError>,
+    {
+        let stats = vex_client_stats();
+        let index = self.pack_index();
+        let (Some(cache_root), Some(index)) = (self.cache_root.as_ref(), index) else {
+            // Kill switch / no cache: the all-loose inline unpack of old.
+            return drive(&mut |entry| {
+                self.write_cached_object_no_prune(entry.kind, &entry.content_id, &entry.data)?;
+                prefetched_objects.fetch_add(1, Ordering::Relaxed);
+                stats.objects_unpacked.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+        };
+        let packs_dir = cache_root.join(".packs");
+        let pack_hex = pack_content_id.to_string();
+        let direct_create = self.fresh_cache;
+        // Payload + index records accumulate on the decode thread; loose
+        // entries cross the bounded channel to the writer pool. The payload
+        // temp is buffered: metadata entries average a few hundred bytes, so
+        // writing them straight through the `NamedTempFile` would cost one
+        // `write(2)` syscall per object (~126k per prod clone) on the
+        // clone-critical decode thread.
+        let mut payload: Option<std::io::BufWriter<NamedTempFile>> = None;
+        let mut payload_offset = 0_u64;
+        let mut records: Vec<PackIndexRecord> = Vec::new();
+        let write_failed = AtomicBool::new(false);
+        let first_writer_error: Mutex<Option<VexClientError>> = Mutex::new(None);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(ObjectKind, ContentId, Vec<u8>)>(
+            UNPACK_WRITER_QUEUE_OBJECTS,
+        );
+        let receiver = Mutex::new(receiver);
+        let drive_result = std::thread::scope(|scope| {
+            for _ in 0..unpack_loose_writer_count() {
+                scope.spawn(|| {
+                    loop {
+                        // The receiver lock is held only while *waiting*; the
+                        // write below runs unlocked, so writers overlap.
+                        let message = receiver.lock().unwrap().recv();
+                        let Ok((kind, content_id, data)) = message else {
+                            // Channel closed: the decode is done and drained.
+                            return;
+                        };
+                        if write_failed.load(Ordering::SeqCst) {
+                            // A sibling failed; keep draining so the bounded
+                            // channel never blocks the decode thread.
+                            continue;
+                        }
+                        match self.write_unpacked_loose_object(
+                            kind,
+                            &content_id,
+                            &data,
+                            direct_create,
+                        ) {
+                            Ok(()) => {
+                                prefetched_objects.fetch_add(1, Ordering::Relaxed);
+                                stats.objects_unpacked.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(err) => {
+                                write_failed.store(true, Ordering::SeqCst);
+                                let mut slot = first_writer_error.lock().unwrap();
+                                if slot.is_none() {
+                                    *slot = Some(err);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            let result = drive(&mut |entry| {
+                if write_failed.load(Ordering::SeqCst) {
+                    return Err(VexClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "unpack writer failed",
+                    )));
+                }
+                if is_pack_resident_kind(entry.kind) {
+                    if payload.is_none() {
+                        fs::create_dir_all(&packs_dir)?;
+                        payload = Some(std::io::BufWriter::with_capacity(
+                            64 * 1024,
+                            NamedTempFile::new_in(&packs_dir)?,
+                        ));
+                    }
+                    let temp = payload.as_mut().expect("payload temp just initialized");
+                    temp.write_all(&entry.data)?;
+                    records.push(PackIndexRecord {
+                        kind: entry.kind,
+                        content_id: entry.content_id,
+                        offset: payload_offset,
+                        len: entry.data.len() as u64,
+                    });
+                    payload_offset += entry.data.len() as u64;
+                    prefetched_objects.fetch_add(1, Ordering::Relaxed);
+                    stats.objects_unpacked.fetch_add(1, Ordering::Relaxed);
+                    stats.objects_pack_resident.fetch_add(1, Ordering::Relaxed);
+                    stats.loose_writes_avoided.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                } else {
+                    sender
+                        .send((entry.kind, entry.content_id, entry.data))
+                        .map_err(|_| {
+                            VexClientError::Io(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "unpack writer pool terminated",
+                            ))
+                        })
+                }
+            });
+            // Closing the channel drains the writers; the scope joins them.
+            drop(sender);
+            result
+        });
+        // A writer error is the root cause of any decode abort; it wins.
+        if let Some(err) = first_writer_error.into_inner().unwrap() {
+            return Err(err);
+        }
+        drive_result?;
+        if let Some(writer) = payload {
+            // `into_inner` flushes the buffer and hands back the temp file.
+            let temp = writer
+                .into_inner()
+                .map_err(std::io::IntoInnerError::into_error)?;
+            Self::persist_pack_temp(
+                &packs_dir,
+                temp,
+                &packs_dir.join(format!("{pack_hex}.payload")),
+            )?;
+            // A cross-process prune may have removed the whole `.packs` dir
+            // between the payload persist and here; recreate it so the idx
+            // temp can be created (its persist is race-tolerant below).
+            fs::create_dir_all(&packs_dir)?;
+            let mut idx_temp = NamedTempFile::new_in(&packs_dir)?;
+            idx_temp.write_all(format_pack_index_file(&records).as_bytes())?;
+            idx_temp.flush()?;
+            Self::persist_pack_temp(
+                &packs_dir,
+                idx_temp,
+                &packs_dir.join(format!("{pack_hex}.idx")),
+            )?;
+            index.insert_pack(&pack_hex, &records);
+            debug!(
+                pack = %pack_hex,
+                entries = records.len(),
+                payload_bytes = payload_offset,
+                "vex pack-resident unpack"
+            );
+        }
+        Ok(())
+    }
+
+    /// Persist a `.packs` temp file to its final path, tolerating a
+    /// cross-process prune having `remove_dir_all`'d the `.packs` dir (and
+    /// with it the temp's source path) mid-unpack: `persist` is a `rename(2)`
+    /// whose source is then gone, so it fails deterministically — but the
+    /// open fd handed back by the `PersistError` still holds every byte.
+    /// Recreate the dir, re-materialize a fresh temp from that fd, and retry
+    /// once (a second failure propagates). Without this, a concurrent capped
+    /// clone sharing the cache could turn a metadata-pack unpack — fatal to
+    /// the clone — into an ENOENT.
+    fn persist_pack_temp(
+        packs_dir: &Path,
+        temp: NamedTempFile,
+        path: &Path,
+    ) -> Result<(), VexClientError> {
+        let mut temp = match temp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                debug!(
+                    path = %path.display(),
+                    error = %err.error,
+                    "pack file persist failed; recreating .packs and retrying once"
+                );
+                err.file
+            }
+        };
+        fs::create_dir_all(packs_dir)?;
+        temp.as_file_mut().seek(SeekFrom::Start(0))?;
+        let mut fresh = NamedTempFile::new_in(packs_dir)?;
+        std::io::copy(temp.as_file_mut(), fresh.as_file_mut())?;
+        fresh.persist(path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
+    /// Whether a fetch error is an HTTP 403 from a hint URL. A 403 on a
+    /// signed URL is deterministic — the signature expired or is invalid —
+    /// so retrying the same URL (or any sibling hint minted in the same
+    /// up-front batch) is doomed.
+    fn is_presigned_forbidden(err: &VexClientError) -> bool {
+        matches!(
+            err,
+            VexClientError::Http(http) if http.status() == Some(reqwest::StatusCode::FORBIDDEN)
+        )
+    }
+
+    /// Fetch one pack chunk's bytes: try the presigned hint URL (twice), then
+    /// fall back to a gRPC `GetObject`. The fallback deliberately bypasses the
+    /// local loose cache: the chunk bytes land in the transfer's `.part` file,
+    /// so a loose `pack/<chunk_id>` copy would be pure dead weight (~41MB per
+    /// prod clone before this read went cache-less).
+    ///
+    /// Presigned bytes are hash-verified before they are returned (a chunk's
+    /// content id is the SHA-256 of exactly its bytes — the gRPC fallback
+    /// verifies the same way): a size-correct but wrong-content response must
+    /// never enter the `.part` file, where it would only surface much later
+    /// as a decode failure of the assembled pack. On the first 403 the
+    /// per-client presigned kill switch trips (see `presigned_get_disabled`):
+    /// hints are minted once per prefetch, so an expired URL means every
+    /// remaining hint is expired too, and the rest of the pack goes straight
+    /// to gRPC instead of paying two doomed HTTPS attempts per chunk.
+    async fn fetch_pack_chunk_with_retry(
         &self,
         content_id: &ContentId,
         hints: &[jj_backend_api::PresignedGet],
+        expected_len: Option<u64>,
     ) -> Result<Vec<u8>, VexClientError> {
         let mut last_hint_err: Option<VexClientError> = None;
-        for _ in 0..2 {
-            match self.direct_fetch_pack_blob_bytes(content_id, hints) {
-                Ok(Some(bytes)) => return Ok(bytes),
-                Ok(None) => break,
-                Err(err) => last_hint_err = Some(err),
+        if !self.presigned_get_disabled.load(Ordering::Relaxed) {
+            for _ in 0..2 {
+                match self
+                    .direct_fetch_pack_blob_bytes(content_id, hints, expected_len)
+                    .await
+                {
+                    Ok(Some(bytes)) => {
+                        if ContentId::hash_bytes(&bytes) == *content_id {
+                            return Ok(bytes);
+                        }
+                        last_hint_err = Some(VexClientError::PackDecode(format!(
+                            "presigned chunk {content_id} failed hash verification"
+                        )));
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let forbidden = Self::is_presigned_forbidden(&err);
+                        last_hint_err = Some(err);
+                        if forbidden {
+                            self.presigned_get_disabled.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
             }
         }
         if let Some(err) = last_hint_err {
-            debug!(%content_id, error = %err, "direct chunk fetch failed, falling back to grpc");
+            // Redacted: a presigned fetch error embeds the full signed URL
+            // (`X-Amz-Signature=...` query), which must never reach a log.
+            debug!(%content_id, error = %redact_url_queries(&err.to_string()), "direct chunk fetch failed, falling back to grpc");
         }
-        self.get_object(ObjectKind::Pack, content_id).await
+        let _t = RpcTimer::start(|| "get_object/pack".to_string());
+        self.fetch_object_grpc_verified(ObjectKind::Pack, content_id)
+            .await
     }
 
     async fn prefetch_pack_via_chunks(
@@ -1417,6 +2417,27 @@ impl VexClient {
         hints: &[jj_backend_api::PresignedGet],
         snapshot: bool,
         prefetched_objects: &AtomicU64,
+    ) -> Result<bool, VexClientError> {
+        self.prefetch_pack_via_chunks_with_concurrency(
+            pack,
+            hints,
+            snapshot,
+            prefetched_objects,
+            clone_chunk_concurrency(),
+        )
+        .await
+    }
+
+    /// [`Self::prefetch_pack_via_chunks`] with an explicit chunk-fetch
+    /// concurrency, so tests can pin W without mutating the process
+    /// environment (`jj-lib` forbids `unsafe`, which `set_var` now requires).
+    async fn prefetch_pack_via_chunks_with_concurrency(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        hints: &[jj_backend_api::PresignedGet],
+        snapshot: bool,
+        prefetched_objects: &AtomicU64,
+        concurrency: usize,
     ) -> Result<bool, VexClientError> {
         let Some(chunks) = normalized_valid_pack_chunks(pack) else {
             return Ok(false);
@@ -1450,22 +2471,119 @@ impl VexClient {
             .take(state.next_chunk_index)
             .map(|chunk| chunk.size_bytes)
             .sum();
-        if partial_file.metadata()?.len() != expected_prefix_bytes {
+        let partial_len = partial_file.metadata()?.len();
+        if partial_len > expected_prefix_bytes {
+            // State saves are batched (every [`TRANSFER_STATE_SAVE_INTERVAL`]
+            // chunks), so a kill between an append and the next save leaves
+            // the `.part` ahead of the recorded state — possibly mid-chunk.
+            // Only the recorded contiguous prefix is trustworthy; truncate
+            // back to it and refetch the rest.
+            debug!(
+                pack = %pack.content_id,
+                partial_len,
+                expected_prefix_bytes,
+                next_chunk_index = state.next_chunk_index,
+                "pack `.part` ahead of recorded transfer state; truncating to the trusted prefix"
+            );
+            partial_file.set_len(expected_prefix_bytes)?;
+            partial_file.seek(SeekFrom::Start(expected_prefix_bytes))?;
+        } else if partial_len < expected_prefix_bytes {
+            // Shorter than the recorded prefix: the state/`.part` pair is
+            // inconsistent (a state file ahead of its data); restart from
+            // scratch.
             partial_file.set_len(0)?;
             partial_file.seek(SeekFrom::Start(0))?;
             state.next_chunk_index = 0;
         }
-        for (idx, chunk) in chunks.iter().enumerate().skip(state.next_chunk_index) {
-            let chunk_bytes = self
-                .fetch_pack_blob_with_retry(&chunk.content_id, hints)
-                .await?;
+        let fetch_result = self
+            .fetch_chunks_into_partial(
+                pack,
+                &chunks,
+                hints,
+                snapshot,
+                concurrency,
+                &mut state,
+                &mut partial_file,
+            )
+            .await;
+        // Persist progress once at the end — and on error, so a resumed
+        // transfer continues from the last appended chunk rather than the last
+        // batched save. The fetch's own error wins over a save failure.
+        let save_result = self.save_pack_transfer_state(&pack.content_id, &state);
+        fetch_result?;
+        save_result?;
+        partial_file.flush()?;
+        drop(partial_file);
+        let chunk_ids: Vec<ContentId> = chunks.iter().map(|chunk| chunk.content_id).collect();
+        if let Err(err) = self.prefetch_pack_entries_from_file(
+            &pack.content_id,
+            &partial_path,
+            prefetched_objects,
+        ) {
+            // A fully-fetched `.part` that fails decode is poison, not
+            // resumable progress: the completed state passes every resume
+            // consistency check (equal length), so without clearing it every
+            // future attempt would refetch nothing, re-decode the same bytes,
+            // and fail forever. Only a *decode* error clears — a cache-write
+            // failure (e.g. disk full, surfaced as `Io`) keeps the good
+            // `.part` for a zero-refetch retry.
+            if matches!(err, VexClientError::PackDecode(_)) {
+                drop(self.clear_pack_transfer_state(&pack.content_id, &chunk_ids));
+            }
+            return Err(err);
+        }
+        self.clear_pack_transfer_state(&pack.content_id, &chunk_ids)?;
+        Ok(true)
+    }
+
+    /// Fetch `chunks[state.next_chunk_index..]` and append them to the pack's
+    /// `.part` file, advancing `state` as each chunk lands.
+    ///
+    /// Index-ordered fetch futures are driven `.buffered(W)`: up to W fetches
+    /// run concurrently (each request is a spawned task on the shared runtime,
+    /// so awaiting it is a cooperative yield and the overlap survives the pack
+    /// worker's plain-thread `block_on`), while `buffered` yields results in
+    /// input order — it *is* the reorder buffer. The single writer below
+    /// therefore appends strictly in chunk order and the contiguous-prefix
+    /// resume invariant of [`PackTransferState`] is untouched.
+    #[expect(clippy::too_many_arguments)]
+    async fn fetch_chunks_into_partial(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        chunks: &[jj_backend_types::PackChunkDescriptor],
+        hints: &[jj_backend_api::PresignedGet],
+        snapshot: bool,
+        concurrency: usize,
+        state: &mut PackTransferState,
+        partial_file: &mut File,
+    ) -> Result<(), VexClientError> {
+        use futures::stream::StreamExt as _;
+        let mut fetched =
+            futures::stream::iter(chunks.iter().enumerate().skip(state.next_chunk_index).map(
+                |(index, chunk)| async move {
+                    let bytes = self
+                        .fetch_pack_chunk_with_retry(
+                            &chunk.content_id,
+                            hints,
+                            Some(chunk.size_bytes),
+                        )
+                        .await?;
+                    Ok::<_, VexClientError>((index, bytes))
+                },
+            ))
+            .buffered(concurrency.max(1));
+        let mut chunks_since_save = 0_usize;
+        while let Some(result) = fetched.next().await {
+            let (index, chunk_bytes) = result?;
+            let chunk = &chunks[index];
             if u64::try_from(chunk_bytes.len()).unwrap_or(u64::MAX) != chunk.size_bytes {
-                // Keep state file for debugging, but restart next attempt from scratch.
+                // Keep the state file for debugging, but restart the next
+                // attempt from scratch (the caller persists this state on its
+                // way out).
                 state.next_chunk_index = 0;
-                self.save_pack_transfer_state(&pack.content_id, &state)?;
                 return Err(VexClientError::PackDecode(format!(
                     "chunk size mismatch for pack {} chunk {}",
-                    pack.content_id, idx
+                    pack.content_id, index
                 )));
             }
             let stats = vex_client_stats();
@@ -1477,14 +2595,14 @@ impl VexClient {
             };
             bytes_counter.fetch_add(chunk_bytes.len() as u64, Ordering::Relaxed);
             partial_file.write_all(&chunk_bytes)?;
-            state.next_chunk_index = idx + 1;
-            self.save_pack_transfer_state(&pack.content_id, &state)?;
+            state.next_chunk_index = index + 1;
+            chunks_since_save += 1;
+            if chunks_since_save >= TRANSFER_STATE_SAVE_INTERVAL {
+                self.save_pack_transfer_state(&pack.content_id, state)?;
+                chunks_since_save = 0;
+            }
         }
-        partial_file.flush()?;
-        drop(partial_file);
-        self.prefetch_pack_entries_from_file(&partial_path, prefetched_objects)?;
-        self.clear_pack_transfer_state(&pack.content_id)?;
-        Ok(true)
+        Ok(())
     }
 
     pub async fn init_repo(
@@ -1971,6 +3089,23 @@ impl VexClient {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(bytes);
         }
+        let bytes = self.fetch_object_grpc_verified(kind, content_id).await?;
+        // A cache hit is assumed present-on-server (see `has_cached_object`)
+        // and is never re-verified; the fetch above hash-verified the bytes,
+        // so they may enter the cache.
+        self.write_cached_object(kind, content_id, &bytes)?;
+        Ok(bytes)
+    }
+
+    /// gRPC `GetObject` plus content-hash verification, *without* touching the
+    /// local cache. [`Self::get_object`] layers the cache on top; pack-chunk
+    /// fallback reads use this directly, since chunk bytes belong in the
+    /// transfer's `.part` file, not the loose cache.
+    async fn fetch_object_grpc_verified(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+    ) -> Result<Vec<u8>, VexClientError> {
         debug!(kind = kind_to_str(kind), %content_id, "vex cache miss");
         vex_client_stats().record_get_object_rpc(kind);
         // Own every captured value so the fetch future is `Send + 'static` and can
@@ -2003,11 +3138,11 @@ impl VexClient {
             }
         })
         .await?;
-        // Verify content addressing before the bytes enter the cache: a cache
-        // hit is assumed present-on-server (see `has_cached_object`) and is
-        // never re-verified, so nothing unverified may be written. This also
-        // keeps `hydrate_one_batch` honest — an inline object that failed its
-        // hash check is refetched through here and must not slip into the
+        // Verify content addressing before the bytes are used anywhere: a
+        // cache hit is assumed present-on-server (see `has_cached_object`) and
+        // is never re-verified, so nothing unverified may be written. This
+        // also keeps `hydrate_one_batch` honest — an inline object that failed
+        // its hash check is refetched through here and must not slip into the
         // cache unchecked on the second try.
         if ContentId::hash_bytes(&bytes) != *content_id {
             return Err(VexClientError::Status(tonic::Status::data_loss(format!(
@@ -2015,7 +3150,6 @@ impl VexClient {
                 kind_to_str(kind),
             ))));
         }
-        self.write_cached_object(kind, content_id, &bytes)?;
         Ok(bytes)
     }
 
@@ -2599,7 +3733,8 @@ impl VexClient {
                         tracing::warn!(
                             pack_content_id = %pack.content_id,
                             snapshot_commit_id = %snapshot_sets[*set_idx].commit_id,
-                            error = %err,
+                            // Redacted: the error may embed a signed URL.
+                            error = %redact_url_queries(&err.to_string()),
                             "snapshot pack fetch failed; continuing without it"
                         );
                         fetched_ok.insert(snapshot_sets[*set_idx].commit_id.to_string(), false);
@@ -2689,8 +3824,8 @@ impl VexClient {
     /// their network and decode costs. Workers are plain blocking threads (the
     /// same execution context the sequential caller had), NOT tasks on the
     /// shared runtime: the pack path mixes blocking bridges
-    /// (`block_on_http_get*` builds and blocks on its own runtime) that must
-    /// never run on the shared runtime's workers.
+    /// (`block_on_http_get*` blocks on tasks spawned onto the shared runtime)
+    /// that must never run on the shared runtime's own workers.
     ///
     /// Emits [`CloneProgress::PackFetched`] per completed pack, with `done`
     /// accumulated in the caller-shared `packs_done` so the metadata and
@@ -2835,7 +3970,8 @@ impl VexClient {
             Err(err) => {
                 debug!(
                     pack_content_id = %pack.content_id,
-                    error = %err,
+                    // Redacted: the error may embed a signed URL.
+                    error = %redact_url_queries(&err.to_string()),
                     "chunk path failed, using full-pack fallback"
                 );
             }
@@ -2845,7 +3981,11 @@ impl VexClient {
             .direct_fetch_pack_to_file(pack, pack_hints, temp_pack.as_file_mut())
             .unwrap_or(false);
         if streamed {
-            self.prefetch_pack_entries_from_file(temp_pack.path(), prefetched_objects)?;
+            self.prefetch_pack_entries_from_file(
+                &pack.content_id,
+                temp_pack.path(),
+                prefetched_objects,
+            )?;
             packs_counter.fetch_add(1, Ordering::Relaxed);
             bytes_counter.fetch_add(pack.size_bytes, Ordering::Relaxed);
             return Ok(());
@@ -2859,11 +3999,13 @@ impl VexClient {
         let object_pack = decode_object_pack(&pack_bytes)
             .or_else(|_| decode_object_pack_reader(BufReader::new(pack_bytes.as_slice())))
             .map_err(|err| VexClientError::PackDecode(err.to_string()))?;
-        for entry in object_pack.objects {
-            self.write_cached_object_no_prune(entry.kind, &entry.content_id, &entry.data)?;
-            prefetched_objects.fetch_add(1, Ordering::Relaxed);
-            stats.objects_unpacked.fetch_add(1, Ordering::Relaxed);
-        }
+        let mut entries = Some(object_pack.objects);
+        self.unpack_pack_entries(&pack.content_id, prefetched_objects, move |sink| {
+            for entry in entries.take().expect("unpack drives the entries once") {
+                sink(entry)?;
+            }
+            Ok(())
+        })?;
         packs_counter.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -3004,6 +4146,28 @@ fn split_inline_fetch_batches(
     batches
 }
 
+/// Replace the query string of any URL embedded in `text` with `<redacted>`.
+/// Presigned object-store URLs carry their entire authorization in the query
+/// (`X-Amz-Signature=...`), and reqwest errors embed the full request URL, so
+/// every log line that can carry such an error must pass through here.
+fn redact_url_queries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('?') {
+        out.push_str(&rest[..pos]);
+        out.push_str("?<redacted>");
+        let after = &rest[pos + 1..];
+        // The query ends at the first delimiter that cannot appear in one
+        // (reqwest wraps URLs in parentheses; whitespace/quotes end a token).
+        let end = after
+            .find([')', ' ', '\t', '\n', '"', '\''])
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn kind_to_str(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Blob => "blob",
@@ -3041,10 +4205,20 @@ fn kind_from_str(kind: &str) -> Option<ObjectKind> {
 mod tests {
     use super::*;
     use jj_backend_api::PresignedGet;
-    use jj_backend_types::{ClonePackScope, PackChunkDescriptor, PackDescriptor};
+    use jj_backend_types::{
+        ClonePackScope, ObjectPack, PackChunkDescriptor, PackDescriptor, encode_object_pack,
+    };
     use std::io::Read;
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
+
+    /// Serializes tests that touch the process-global [`VexClientStats`]
+    /// counters, so a concurrent [`vex_client_stats_reset`] cannot corrupt
+    /// another test's delta assertions (tests run in parallel threads).
+    fn stats_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn sample_client() -> VexClient {
         VexClient::from_config(VexRepoConfig {
@@ -3117,8 +4291,17 @@ mod tests {
         client.save_pack_transfer_state(&pack_id, &state).unwrap();
         let loaded = client.load_pack_transfer_state(&pack_id).unwrap().unwrap();
         assert_eq!(loaded, state);
-        client.clear_pack_transfer_state(&pack_id).unwrap();
+        // Clearing also removes legacy loose `pack/<chunk_id>` files that old
+        // clients' gRPC chunk fallback double-wrote into the cache.
+        let chunk_id = ContentId::hash_bytes(b"legacy-chunk");
+        client
+            .write_cached_object_no_prune(ObjectKind::Pack, &chunk_id, b"legacy-chunk")
+            .unwrap();
+        client
+            .clear_pack_transfer_state(&pack_id, &[chunk_id])
+            .unwrap();
         assert!(client.load_pack_transfer_state(&pack_id).unwrap().is_none());
+        assert!(!client.has_cached_object(ObjectKind::Pack, &chunk_id));
     }
 
     #[test]
@@ -3295,8 +4478,10 @@ mod tests {
 
     #[test]
     fn client_stats_snapshot_and_reset() {
-        // One test (not several) so parallel test threads never race on the
+        // One test (not several), serialized against the other counter-bumping
+        // tests via `stats_lock`, so parallel test threads never race on the
         // process-global counters.
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
         vex_client_stats_reset();
         let stats = vex_client_stats();
         stats.record_get_object_rpc(ObjectKind::Blob);
@@ -3500,6 +4685,8 @@ mod tests {
 
     #[test]
     fn direct_fetch_pack_bytes_uses_http_hint() {
+        // Bumps the global presigned-fetch counters.
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let body = b"pack-bytes".to_vec();
@@ -3522,7 +4709,9 @@ mod tests {
         let content_id = ContentId::hash_bytes(b"pack");
         let pack = PackDescriptor {
             content_id,
-            size_bytes: 4,
+            // The descriptor size now caps the buffered response body, so it
+            // must match what the server serves.
+            size_bytes: 10,
             scope: ClonePackScope::Full,
             chunks: vec![],
             objects: vec![],
@@ -3540,6 +4729,1227 @@ mod tests {
 
         assert_eq!(bytes, b"pack-bytes");
         server.join().unwrap();
+    }
+
+    /// Minimal HTTP server for presigned chunk fetches: serves
+    /// `GET /chunks/<hex>` from an id → bytes map, one connection per request
+    /// (`Connection: close`, so the shared reqwest pool opens a fresh
+    /// connection each time), with a small pseudo-random delay per request so
+    /// concurrent fetches complete out of order and exercise the reorder
+    /// buffer. Records every requested path.
+    struct ChunkServer {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ChunkServer {
+        fn start(chunks: HashMap<String, Vec<u8>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let chunks = Arc::new(chunks);
+            let handle = {
+                let requests = Arc::clone(&requests);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(stream) = stream else { break };
+                        let requests = Arc::clone(&requests);
+                        let chunks = Arc::clone(&chunks);
+                        thread::spawn(move || Self::serve_one(stream, &chunks, &requests));
+                    }
+                })
+            };
+            Self {
+                addr,
+                requests,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn serve_one(
+            mut stream: TcpStream,
+            chunks: &HashMap<String, Vec<u8>>,
+            requests: &Mutex<Vec<String>>,
+        ) {
+            // Read to the end of the request headers (requests are tiny).
+            let mut buf = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => buf.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let request = String::from_utf8_lossy(&buf);
+            let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+            requests.lock().unwrap().push(path.clone());
+            // De-correlate completion order across concurrent fetches.
+            let jitter_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::from(d.subsec_nanos()) % 25)
+                .unwrap_or(0);
+            thread::sleep(Duration::from_millis(jitter_ms));
+            match path.rsplit('/').next().and_then(|hex| chunks.get(hex)) {
+                Some(body) => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    drop(stream.write_all(header.as_bytes()));
+                    drop(stream.write_all(body));
+                }
+                None => {
+                    drop(stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ));
+                }
+            }
+        }
+
+        fn requested_paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn url_for(&self, content_id: &ContentId) -> String {
+            format!("http://{}/chunks/{content_id}", self.addr)
+        }
+    }
+
+    impl Drop for ChunkServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Unblock the accept loop so the thread observes the stop flag.
+            drop(TcpStream::connect(self.addr));
+            if let Some(handle) = self.handle.take() {
+                drop(handle.join());
+            }
+        }
+    }
+
+    /// Minimal HTTP server answering every request with `403 Forbidden` (an
+    /// expired presigned URL) and counting complete requests.
+    struct ForbiddenServer {
+        addr: SocketAddr,
+        hits: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ForbiddenServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let hits = Arc::clone(&hits);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut stream) = stream else { break };
+                        let mut buf = Vec::new();
+                        let mut byte = [0_u8; 1];
+                        while !buf.ends_with(b"\r\n\r\n") {
+                            match stream.read(&mut byte) {
+                                Ok(1) => buf.push(byte[0]),
+                                _ => break,
+                            }
+                        }
+                        if !buf.ends_with(b"\r\n\r\n") {
+                            // The Drop unblock connection, not a request.
+                            continue;
+                        }
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        drop(stream.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        ));
+                    }
+                })
+            };
+            Self {
+                addr,
+                hits,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        fn url_for(&self, content_id: &ContentId) -> String {
+            format!("http://{}/chunks/{content_id}", self.addr)
+        }
+    }
+
+    impl Drop for ForbiddenServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            drop(TcpStream::connect(self.addr));
+            if let Some(handle) = self.handle.take() {
+                drop(handle.join());
+            }
+        }
+    }
+
+    /// A valid encoded pack of pseudo-random blob objects (incompressible, so
+    /// the encoded pack is large enough to split into many chunks), served
+    /// chunk-by-chunk over a local [`ChunkServer`] via presigned hints.
+    struct ChunkedPackFixture {
+        pack: PackDescriptor,
+        objects: Vec<ObjectPackEntry>,
+        encoded: Vec<u8>,
+        hints: Vec<PresignedGet>,
+        server: ChunkServer,
+    }
+
+    fn chunked_pack_fixture(object_count: usize, chunk_size: usize) -> ChunkedPackFixture {
+        // Cheap deterministic LCG data zstd cannot squash, so the encoded
+        // payload really spans many chunks.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let objects: Vec<ObjectPackEntry> = (0..object_count)
+            .map(|_| {
+                let data: Vec<u8> = (0..257)
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (seed >> 33) as u8
+                    })
+                    .collect();
+                ObjectPackEntry {
+                    kind: ObjectKind::Blob,
+                    content_id: ContentId::hash_bytes(&data),
+                    data,
+                }
+            })
+            .collect();
+        let encoded = encode_object_pack(&ObjectPack {
+            objects: objects.clone(),
+        });
+        let chunk_count = encoded.len().div_ceil(chunk_size) as u32;
+        assert!(chunk_count > 1, "fixture must produce a multi-chunk pack");
+        let pieces: Vec<(PackChunkDescriptor, Vec<u8>)> = encoded
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(index, piece)| {
+                (
+                    PackChunkDescriptor {
+                        content_id: ContentId::hash_bytes(piece),
+                        chunk_index: index as u32,
+                        chunk_count,
+                        offset_bytes: (index * chunk_size) as u64,
+                        size_bytes: piece.len() as u64,
+                    },
+                    piece.to_vec(),
+                )
+            })
+            .collect();
+        let server = ChunkServer::start(
+            pieces
+                .iter()
+                .map(|(descriptor, bytes)| (descriptor.content_id.to_string(), bytes.clone()))
+                .collect(),
+        );
+        let hints = pieces
+            .iter()
+            .map(|(descriptor, _)| PresignedGet {
+                object_key: format!("packs/chunks/sha256/{}", descriptor.content_id),
+                url: server.url_for(&descriptor.content_id),
+                headers: Default::default(),
+            })
+            .collect();
+        let pack = PackDescriptor {
+            content_id: ContentId::hash_bytes(&encoded),
+            size_bytes: encoded.len() as u64,
+            scope: ClonePackScope::Full,
+            chunks: pieces
+                .into_iter()
+                .map(|(descriptor, _)| descriptor)
+                .collect(),
+            objects: vec![],
+        };
+        ChunkedPackFixture {
+            pack,
+            objects,
+            encoded,
+            hints,
+            server,
+        }
+    }
+
+    /// Run a full chunked prefetch into a fresh cache dir at the given fetch
+    /// concurrency and return the unpacked object bytes, in fixture object
+    /// order.
+    fn run_chunked_prefetch(fixture: &ChunkedPackFixture, concurrency: usize) -> Vec<Vec<u8>> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let counter = AtomicU64::new(0);
+        let ok = futures::executor::block_on(client.prefetch_pack_via_chunks_with_concurrency(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+            concurrency,
+        ))
+        .unwrap();
+        assert!(ok, "chunked path must handle a well-formed chunked pack");
+        // Chunk fetches must not leave loose `pack/<chunk_id>` cache files.
+        assert!(!temp_dir.path().join("pack").exists());
+        // Transfer state is cleared after a successful unpack.
+        assert!(
+            client
+                .load_pack_transfer_state(&fixture.pack.content_id)
+                .unwrap()
+                .is_none()
+        );
+        fixture
+            .objects
+            .iter()
+            .map(|entry| {
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .expect("object unpacked into cache")
+            })
+            .collect()
+    }
+
+    /// The `.buffered(W)` reorder buffer must reassemble the pack
+    /// byte-identically to the serial (W=1) loop even when chunk responses
+    /// complete out of order (the test server adds random delays), and every
+    /// chunk must be counted as a presigned fetch.
+    #[test]
+    fn chunked_prefetch_reorder_buffer_matches_serial_and_counts_presigned() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture(24, 256);
+        let run_with_concurrency = |concurrency: usize| {
+            let before = vex_client_stats_snapshot();
+            let objects = run_chunked_prefetch(&fixture, concurrency);
+            let after = vex_client_stats_snapshot();
+            let chunk_count = fixture.pack.chunks.len() as u64;
+            assert_eq!(
+                after.presigned_fetches - before.presigned_fetches,
+                chunk_count
+            );
+            assert_eq!(
+                after.presigned_bytes - before.presigned_bytes,
+                fixture.encoded.len() as u64
+            );
+            assert_eq!(
+                after.pack_chunks_fetched - before.pack_chunks_fetched,
+                chunk_count
+            );
+            assert_eq!(
+                after.pack_bytes_fetched - before.pack_bytes_fetched,
+                fixture.encoded.len() as u64
+            );
+            objects
+        };
+        let concurrent = run_with_concurrency(4);
+        let serial = run_with_concurrency(1);
+        assert_eq!(concurrent, serial);
+        // Unpack SHA-256-verifies every entry, so matching the source objects
+        // proves the reassembled pack bytes were identical to the original.
+        for (entry, bytes) in fixture.objects.iter().zip(&concurrent) {
+            assert_eq!(&entry.data, bytes);
+        }
+    }
+
+    /// A `.part` file LONGER than the recorded state (a kill between an append
+    /// and the next batched state save, possibly mid-chunk) must be truncated
+    /// back to the recorded contiguous prefix — chunks before the prefix are
+    /// not refetched, everything after is.
+    #[test]
+    fn chunked_prefetch_resume_truncates_part_longer_than_state() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture(24, 256);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let recorded = 2_usize;
+        client
+            .save_pack_transfer_state(
+                &fixture.pack.content_id,
+                &PackTransferState {
+                    pack_content_id: fixture.pack.content_id.to_string(),
+                    chunk_count: fixture.pack.chunks.len(),
+                    next_chunk_index: recorded,
+                },
+            )
+            .unwrap();
+        // 4.5 chunks on disk vs 2 recorded: 2.5 chunks of untrusted tail.
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        fs::write(&partial_path, &fixture.encoded[..4 * 256 + 128]).unwrap();
+
+        let counter = AtomicU64::new(0);
+        let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap();
+        assert!(ok);
+        let requested = fixture.server.requested_paths();
+        for chunk in &fixture.pack.chunks[..recorded] {
+            let id = chunk.content_id.to_string();
+            assert!(
+                !requested.iter().any(|path| path.ends_with(&id)),
+                "chunk {id} within the recorded prefix must not be refetched"
+            );
+        }
+        for chunk in &fixture.pack.chunks[recorded..] {
+            let id = chunk.content_id.to_string();
+            assert!(
+                requested.iter().any(|path| path.ends_with(&id)),
+                "chunk {id} beyond the recorded prefix must be fetched"
+            );
+        }
+        // The unpack hash-verified every entry: the truncate+resume
+        // reassembled the exact original pack bytes.
+        for entry in &fixture.objects {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    /// A `.part` file SHORTER than the recorded state is inconsistent (a state
+    /// file ahead of its data): the transfer must fully reset and refetch
+    /// every chunk.
+    #[test]
+    fn chunked_prefetch_resume_resets_when_part_shorter_than_state() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture(24, 256);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        client
+            .save_pack_transfer_state(
+                &fixture.pack.content_id,
+                &PackTransferState {
+                    pack_content_id: fixture.pack.content_id.to_string(),
+                    chunk_count: fixture.pack.chunks.len(),
+                    next_chunk_index: 3,
+                },
+            )
+            .unwrap();
+        // Only one chunk on disk vs 3 recorded.
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        fs::write(&partial_path, &fixture.encoded[..256]).unwrap();
+
+        let counter = AtomicU64::new(0);
+        let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap();
+        assert!(ok);
+        let requested = fixture.server.requested_paths();
+        for chunk in &fixture.pack.chunks {
+            let id = chunk.content_id.to_string();
+            assert!(
+                requested.iter().any(|path| path.ends_with(&id)),
+                "chunk {id} must be refetched after a full reset"
+            );
+        }
+        for entry in &fixture.objects {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    /// A size-correct but wrong-content presigned chunk response must be
+    /// rejected by the per-chunk hash verification (never appended to the
+    /// `.part`), and the next attempt must resume from the trusted prefix.
+    #[test]
+    fn chunked_prefetch_hash_verifies_presigned_chunks_and_resumes() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture(24, 256);
+        let chunks = &fixture.pack.chunks;
+        // A second server serving the same chunk ids, but chunk 1's bytes are
+        // corrupted in place: same length (passes the old size-only check),
+        // wrong content.
+        let corrupt_server = ChunkServer::start(
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let start = chunk.offset_bytes as usize;
+                    let mut bytes =
+                        fixture.encoded[start..start + chunk.size_bytes as usize].to_vec();
+                    if index == 1 {
+                        bytes[0] ^= 0xff;
+                    }
+                    (chunk.content_id.to_string(), bytes)
+                })
+                .collect(),
+        );
+        let corrupt_hints: Vec<PresignedGet> = chunks
+            .iter()
+            .map(|chunk| PresignedGet {
+                object_key: format!("packs/chunks/sha256/{}", chunk.content_id),
+                url: corrupt_server.url_for(&chunk.content_id),
+                headers: Default::default(),
+            })
+            .collect();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let counter = AtomicU64::new(0);
+        // Chunk 1 fails hash verification twice, then the gRPC fallback fails
+        // (no backend in unit tests): the transfer errors...
+        futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &corrupt_hints,
+            false,
+            &counter,
+        ))
+        .unwrap_err();
+        let chunk1_id = chunks[1].content_id.to_string();
+        assert_eq!(
+            corrupt_server
+                .requested_paths()
+                .iter()
+                .filter(|path| path.ends_with(&chunk1_id))
+                .count(),
+            2,
+            "the bad chunk must be retried once before the gRPC fallback"
+        );
+        // ...and the corrupt bytes never reached the `.part`: it holds
+        // exactly the verified chunk 0, recorded as resumable progress.
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        assert_eq!(
+            fs::read(&partial_path).unwrap(),
+            &fixture.encoded[..chunks[0].size_bytes as usize]
+        );
+        assert_eq!(
+            client
+                .load_pack_transfer_state(&fixture.pack.content_id)
+                .unwrap()
+                .unwrap()
+                .next_chunk_index,
+            1
+        );
+        // A retry against a healthy server resumes past the verified prefix
+        // and completes.
+        let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap();
+        assert!(ok);
+        let chunk0_id = chunks[0].content_id.to_string();
+        assert!(
+            !fixture
+                .server
+                .requested_paths()
+                .iter()
+                .any(|path| path.ends_with(&chunk0_id)),
+            "the verified prefix must not be refetched"
+        );
+        for entry in &fixture.objects {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    /// Corrupt/truncated transfer-state JSON (a kill mid non-atomic save)
+    /// must reset the transfer — not hard-error the chunk path forever — and
+    /// remove the poisoned file.
+    #[test]
+    fn chunked_prefetch_resets_on_corrupt_transfer_state() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture(24, 256);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let state_path = client
+            .transfer_state_path(&fixture.pack.content_id)
+            .unwrap();
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, b"{\"pack_content_id\": trunc").unwrap();
+        // The corrupt file loads as no-state and is dropped on the spot.
+        assert!(
+            client
+                .load_pack_transfer_state(&fixture.pack.content_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!state_path.exists());
+        // And a prefetch over a re-corrupted state self-heals end to end.
+        fs::write(&state_path, b"not json at all").unwrap();
+        let counter = AtomicU64::new(0);
+        let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap();
+        assert!(ok);
+        for entry in &fixture.objects {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    /// A COMPLETED transfer whose `.part` fails decode (same-length on-disk
+    /// corruption passes every resume consistency check) must clear its
+    /// state + `.part` so the next attempt refetches from scratch instead of
+    /// re-decoding the same poisoned bytes forever.
+    #[test]
+    fn chunked_prefetch_clears_poisoned_completed_transfer() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture(24, 256);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        client
+            .save_pack_transfer_state(
+                &fixture.pack.content_id,
+                &PackTransferState {
+                    pack_content_id: fixture.pack.content_id.to_string(),
+                    chunk_count: fixture.pack.chunks.len(),
+                    next_chunk_index: fixture.pack.chunks.len(),
+                },
+            )
+            .unwrap();
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        let mut poisoned = fixture.encoded.clone();
+        let mid = poisoned.len() / 2;
+        poisoned[mid] ^= 0xff;
+        fs::write(&partial_path, &poisoned).unwrap();
+
+        let counter = AtomicU64::new(0);
+        let err = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, VexClientError::PackDecode(_)), "{err}");
+        // Nothing was fetched (the state said complete)...
+        assert!(fixture.server.requested_paths().is_empty());
+        // ...but the poison is gone, so the next attempt starts clean...
+        assert!(
+            client
+                .load_pack_transfer_state(&fixture.pack.content_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!partial_path.exists());
+        // ...and succeeds by refetching every chunk.
+        let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap();
+        assert!(ok);
+        for entry in &fixture.objects {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    /// Direct HTTP fetches must cap the response body at the caller's
+    /// expected size (the descriptor's `size_bytes`) instead of buffering or
+    /// writing unbounded bytes from a broken/hostile endpoint.
+    #[test]
+    fn http_get_caps_response_at_expected_size() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let content_id = ContentId::hash_bytes(b"oversize");
+        let body = vec![7_u8; 10];
+        let server = ChunkServer::start(
+            [(content_id.to_string(), body.clone())]
+                .into_iter()
+                .collect(),
+        );
+        let url = server.url_for(&content_id);
+        let headers = HashMap::new();
+        assert_eq!(
+            VexClient::block_on_http_get(&url, &headers, Some(10)).unwrap(),
+            body
+        );
+        assert_eq!(
+            VexClient::block_on_http_get(&url, &headers, None).unwrap(),
+            body
+        );
+        let err = VexClient::block_on_http_get(&url, &headers, Some(4)).unwrap_err();
+        assert!(err.to_string().contains("exceeds expected size"), "{err}");
+        // The streaming (whole-pack) variant enforces its cap too.
+        let mut out = Vec::new();
+        let err =
+            VexClient::block_on_http_get_to_file(&url, &headers, &mut out, Some(4)).unwrap_err();
+        assert!(err.to_string().contains("exceeds expected size"), "{err}");
+        let mut out = Vec::new();
+        VexClient::block_on_http_get_to_file(&url, &headers, &mut out, Some(10)).unwrap();
+        assert_eq!(out, body);
+    }
+
+    /// The first presigned 403 (expired/invalid signature — deterministic)
+    /// must trip the per-client kill switch: no second attempt on the same
+    /// chunk, and every later direct HTTP fetch is skipped outright.
+    #[test]
+    fn presigned_403_disables_direct_fetch_for_the_run() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let server = ForbiddenServer::start();
+        let content_id = ContentId::hash_bytes(b"forbidden-chunk");
+        let hints = vec![PresignedGet {
+            object_key: format!("packs/chunks/sha256/{content_id}"),
+            url: server.url_for(&content_id),
+            headers: Default::default(),
+        }];
+        let client = sample_client();
+        // The 403 breaks out after ONE attempt; the gRPC fallback then fails
+        // (no backend in unit tests), surfacing an error.
+        futures::executor::block_on(client.fetch_pack_chunk_with_retry(&content_id, &hints, None))
+            .unwrap_err();
+        assert_eq!(server.hits(), 1);
+        assert!(client.presigned_get_disabled.load(Ordering::Relaxed));
+        // Subsequent chunk fetches skip the presigned path entirely.
+        drop(futures::executor::block_on(
+            client.fetch_pack_chunk_with_retry(&content_id, &hints, None),
+        ));
+        assert_eq!(server.hits(), 1);
+        // The whole-pack direct fetches are disabled too.
+        let pack = PackDescriptor {
+            content_id,
+            size_bytes: 4,
+            scope: ClonePackScope::Full,
+            chunks: vec![],
+            objects: vec![],
+        };
+        assert!(
+            client
+                .direct_fetch_pack_bytes(&pack, &hints)
+                .unwrap()
+                .is_none()
+        );
+        let mut out = Vec::new();
+        assert!(
+            !client
+                .direct_fetch_pack_to_file(&pack, &hints, &mut out)
+                .unwrap()
+        );
+        assert_eq!(server.hits(), 1);
+    }
+
+    /// A `.packs` persist racing a cross-process prune (`remove_dir_all` of
+    /// the whole dir, unlinking the temp's source path) must recover from the
+    /// still-open fd instead of failing the unpack — fatal for metadata
+    /// packs.
+    #[cfg(unix)]
+    #[test]
+    fn persist_pack_temp_survives_concurrent_packs_dir_removal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let packs_dir = temp_dir.path().join(".packs");
+        fs::create_dir_all(&packs_dir).unwrap();
+        let mut temp = NamedTempFile::new_in(&packs_dir).unwrap();
+        temp.write_all(b"payload-bytes").unwrap();
+        temp.flush().unwrap();
+        fs::remove_dir_all(&packs_dir).unwrap();
+        let dest = packs_dir.join("pack.payload");
+        VexClient::persist_pack_temp(&packs_dir, temp, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"payload-bytes");
+    }
+
+    /// Mixed-kind pack entries: the four metadata kinds (pack-resident) plus
+    /// a blob and a symlink (always loose).
+    fn hybrid_pack_entries() -> Vec<ObjectPackEntry> {
+        let entry = |kind: ObjectKind, data: &[u8]| ObjectPackEntry {
+            kind,
+            content_id: ContentId::hash_bytes(data),
+            data: data.to_vec(),
+        };
+        vec![
+            entry(ObjectKind::Commit, b"commit-bytes"),
+            entry(ObjectKind::Tree, b"tree-bytes"),
+            entry(ObjectKind::Op, b"op-bytes"),
+            entry(ObjectKind::View, b"view-bytes"),
+            entry(ObjectKind::Blob, b"blob-bytes"),
+            entry(ObjectKind::Symlink, b"symlink-target"),
+        ]
+    }
+
+    fn pack_resident_client(cache_root: &Path, enabled: bool) -> VexClient {
+        let mut client = sample_client();
+        client.cache_root = Some(cache_root.to_path_buf());
+        client.pack_resident_override = Some(enabled);
+        client
+    }
+
+    /// Encode `entries` into a pack file and unpack it through the real
+    /// streaming path; returns the pack content id.
+    fn unpack_hybrid_pack(client: &VexClient, entries: &[ObjectPackEntry]) -> ContentId {
+        let encoded = encode_object_pack(&ObjectPack {
+            objects: entries.to_vec(),
+        });
+        let pack_id = ContentId::hash_bytes(&encoded);
+        let pack_file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(pack_file.path(), &encoded).unwrap();
+        let counter = AtomicU64::new(0);
+        client
+            .prefetch_pack_entries_from_file(&pack_id, pack_file.path(), &counter)
+            .unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), entries.len() as u64);
+        pack_id
+    }
+
+    fn loose_path(cache_root: &Path, entry: &ObjectPackEntry) -> PathBuf {
+        cache_root
+            .join(kind_to_str(entry.kind))
+            .join(entry.content_id.to_string())
+    }
+
+    /// The hybrid unpack must serve metadata reads straight from the pack
+    /// payload — with NO loose file — while blobs/symlinks unpack loose, and
+    /// a fresh index (a new process) must reload the sidecar identically.
+    #[test]
+    fn pack_resident_unpack_serves_reads_without_loose_files() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = pack_resident_client(temp_dir.path(), true);
+        let entries = hybrid_pack_entries();
+        let before = vex_client_stats_snapshot();
+        let pack_id = unpack_hybrid_pack(&client, &entries);
+        let after = vex_client_stats_snapshot();
+        assert_eq!(after.objects_unpacked - before.objects_unpacked, 6);
+        assert_eq!(
+            after.objects_pack_resident - before.objects_pack_resident,
+            4
+        );
+        assert_eq!(after.loose_writes_avoided - before.loose_writes_avoided, 4);
+
+        let packs_dir = temp_dir.path().join(".packs");
+        assert!(packs_dir.join(format!("{pack_id}.payload")).exists());
+        assert!(packs_dir.join(format!("{pack_id}.idx")).exists());
+        for entry in &entries {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data,
+                "every unpacked object must read back byte-identically"
+            );
+            assert!(client.has_cached_object(entry.kind, &entry.content_id));
+            let loose = loose_path(temp_dir.path(), entry);
+            if is_pack_resident_kind(entry.kind) {
+                assert!(
+                    !loose.exists(),
+                    "metadata must not explode into a loose file"
+                );
+            } else {
+                assert!(
+                    loose.exists(),
+                    "blobs/symlinks stay loose for reflink/streaming"
+                );
+            }
+        }
+        // A fresh index (as a new process would build it) reloads the sidecar.
+        let reloaded = PackResidentIndex::new(packs_dir);
+        let commit = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Commit)
+            .unwrap();
+        let location = reloaded.lookup(commit.kind, &commit.content_id).unwrap();
+        assert_eq!(location.pack_hex.as_ref(), pack_id.to_string());
+        assert_eq!(location.len, commit.data.len() as u64);
+    }
+
+    /// `VEX_CACHE_PACK_RESIDENT=0` (here: the per-client override) must
+    /// restore the pre-split behavior exactly: every entry lands as a loose
+    /// file, no `.packs` dir appears, and reads are byte-identical.
+    #[test]
+    fn pack_resident_kill_switch_restores_all_loose_unpack() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let disabled = pack_resident_client(temp_dir.path(), false);
+        let entries = hybrid_pack_entries();
+        let before = vex_client_stats_snapshot();
+        unpack_hybrid_pack(&disabled, &entries);
+        let after = vex_client_stats_snapshot();
+        assert_eq!(after.objects_unpacked - before.objects_unpacked, 6);
+        assert_eq!(after.objects_pack_resident, before.objects_pack_resident);
+        assert_eq!(after.loose_writes_avoided, before.loose_writes_avoided);
+        assert!(!temp_dir.path().join(".packs").exists());
+        for entry in &entries {
+            assert!(loose_path(temp_dir.path(), entry).exists());
+            assert_eq!(
+                disabled
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    /// A payload deleted behind our back (prune from another process, manual
+    /// cleanup) must read as a miss — the caller falls back to loose/RPC —
+    /// and self-heal by dropping the whole pack's index entries + sidecar.
+    #[test]
+    fn pack_resident_read_self_heals_when_payload_deleted() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = pack_resident_client(temp_dir.path(), true);
+        let entries = hybrid_pack_entries();
+        let pack_id = unpack_hybrid_pack(&client, &entries);
+        let packs_dir = temp_dir.path().join(".packs");
+        fs::remove_file(packs_dir.join(format!("{pack_id}.payload"))).unwrap();
+        let commit = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Commit)
+            .unwrap();
+        assert!(
+            client
+                .read_cached_object(commit.kind, &commit.content_id)
+                .is_none()
+        );
+        // The whole pack self-healed out of the index, so presence checks
+        // (the put_object upload skip) miss for its other entries too...
+        let tree = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Tree)
+            .unwrap();
+        assert!(!client.has_cached_object(tree.kind, &tree.content_id));
+        // ...and the stale sidecar is gone, so no later process reloads it.
+        assert!(!packs_dir.join(format!("{pack_id}.idx")).exists());
+        // Loose objects are untouched.
+        let blob = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Blob)
+            .unwrap();
+        assert!(client.has_cached_object(blob.kind, &blob.content_id));
+    }
+
+    /// A *transient* payload read error (EACCES here; EMFILE/EIO in the
+    /// wild) must be a plain miss for that one read — NOT trigger the
+    /// self-heal, which permanently deletes the intact payload + sidecar.
+    /// Only a missing or truncated payload (NotFound/UnexpectedEof) is
+    /// structural and may drop the pack.
+    #[cfg(unix)]
+    #[test]
+    fn pack_resident_transient_read_error_misses_without_dropping_pack() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = pack_resident_client(temp_dir.path(), true);
+        let entries = hybrid_pack_entries();
+        let pack_id = unpack_hybrid_pack(&client, &entries);
+        let packs_dir = temp_dir.path().join(".packs");
+        let payload_path = packs_dir.join(format!("{pack_id}.payload"));
+        let idx_path = packs_dir.join(format!("{pack_id}.idx"));
+        let commit = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Commit)
+            .unwrap();
+
+        // Transient failure: unreadable payload => miss, but nothing deleted.
+        fs::set_permissions(&payload_path, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&payload_path).is_err() {
+            // (Skipped when running as root, where mode 000 is still readable.)
+            assert!(
+                client
+                    .read_cached_object(commit.kind, &commit.content_id)
+                    .is_none()
+            );
+            assert!(
+                payload_path.exists(),
+                "transient error must not delete the payload"
+            );
+            assert!(
+                idx_path.exists(),
+                "transient error must not delete the sidecar"
+            );
+        }
+        fs::set_permissions(&payload_path, fs::Permissions::from_mode(0o644)).unwrap();
+        // The next read simply retries and succeeds.
+        assert_eq!(
+            client
+                .read_cached_object(commit.kind, &commit.content_id)
+                .unwrap(),
+            commit.data
+        );
+
+        // Structural failure: truncated payload (UnexpectedEof) self-heals.
+        File::options()
+            .write(true)
+            .open(&payload_path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        assert!(
+            client
+                .read_cached_object(commit.kind, &commit.content_id)
+                .is_none()
+        );
+        assert!(!idx_path.exists(), "truncated payload must drop the pack");
+    }
+
+    /// The "cached ⟹ uploaded" short circuit in `put_object` must include
+    /// pack-resident objects, or every push would re-upload the metadata a
+    /// clone's packs delivered.
+    #[test]
+    fn put_object_skips_upload_for_pack_resident_objects() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), true);
+        // Isolate this test's slice of the process-global pending-upload
+        // buffer (keyed by endpoint + repo id).
+        client.config.repo_id = "repo-pack-resident-put-skip".to_string();
+        let entries = hybrid_pack_entries();
+        unpack_hybrid_pack(&client, &entries);
+        let commit = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Commit)
+            .unwrap();
+        futures::executor::block_on(client.put_object(
+            commit.kind,
+            &commit.content_id,
+            commit.data.clone(),
+        ))
+        .unwrap();
+        assert!(
+            !client.has_pending_object(commit.kind, &commit.content_id),
+            "an index hit must skip the upload entirely, not buffer it"
+        );
+        // A genuinely uncached object takes the normal (buffered) upload path.
+        let missing_data = b"never-packed".to_vec();
+        let missing_id = ContentId::hash_bytes(&missing_data);
+        futures::executor::block_on(client.put_object(
+            ObjectKind::Commit,
+            &missing_id,
+            missing_data,
+        ))
+        .unwrap();
+        assert!(client.has_pending_object(ObjectKind::Commit, &missing_id));
+    }
+
+    /// A prune that evicts loose object files must drop the pack-resident
+    /// store wholesale (its payloads are excluded from the LRU scan) and
+    /// clear the in-memory overlay with it.
+    #[test]
+    fn prune_drops_packs_dir_and_clears_pack_index() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), true);
+        client.cache_max_bytes = Some(8);
+        let entries = hybrid_pack_entries();
+        unpack_hybrid_pack(&client, &entries);
+        assert!(temp_dir.path().join(".packs").exists());
+        // The loose blob+symlink bytes alone exceed the cap: the prune evicts
+        // them and must take `.packs` down too.
+        client.prune_cache_if_needed().unwrap();
+        assert!(!temp_dir.path().join(".packs").exists());
+        let commit = entries
+            .iter()
+            .find(|entry| entry.kind == ObjectKind::Commit)
+            .unwrap();
+        assert!(!client.has_cached_object(commit.kind, &commit.content_id));
+        assert!(
+            client
+                .read_cached_object(commit.kind, &commit.content_id)
+                .is_none()
+        );
+    }
+
+    /// With the pack-resident kill switch on (`VEX_CACHE_PACK_RESIDENT=0`)
+    /// nothing reads or writes `.packs`, so a prune must still reclaim a
+    /// `.packs` dir left behind by an earlier enabled run — otherwise the
+    /// rollback orphans it as dead disk for as long as the switch is on.
+    #[test]
+    fn prune_drops_packs_dir_even_with_pack_resident_disabled() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let enabled = pack_resident_client(temp_dir.path(), true);
+        unpack_hybrid_pack(&enabled, &hybrid_pack_entries());
+        assert!(temp_dir.path().join(".packs").exists());
+        let mut disabled = pack_resident_client(temp_dir.path(), false);
+        disabled.cache_max_bytes = Some(8);
+        // The loose blob+symlink bytes exceed the cap, so the prune evicts
+        // files — and must take the orphaned `.packs` down with them.
+        disabled.prune_cache_if_needed().unwrap();
+        assert!(!temp_dir.path().join(".packs").exists());
+    }
+
+    /// The direct-create fast path is off by default, only enabled through
+    /// `mark_fresh_clone_cache` (the clone scaffold), never for a shared
+    /// cache dir — and it must produce byte-identical loose files.
+    #[test]
+    fn fresh_clone_cache_direct_create_is_gated_and_writes_identical_files() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), true);
+        assert!(!client.fresh_cache, "direct create must default off");
+        client.mark_fresh_clone_cache();
+        // Fresh only when the cache is repo-local (no shared cache dir
+        // configured in the environment).
+        assert_eq!(
+            client.fresh_cache,
+            std::env::var_os("JJ_VEX_SHARED_CACHE_DIR").is_none()
+        );
+        client.fresh_cache = true;
+        let entries = hybrid_pack_entries();
+        unpack_hybrid_pack(&client, &entries);
+        for entry in &entries {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+        for entry in entries
+            .iter()
+            .filter(|entry| !is_pack_resident_kind(entry.kind))
+        {
+            assert_eq!(
+                fs::read(loose_path(temp_dir.path(), entry)).unwrap(),
+                entry.data,
+                "direct-create loose files must be byte-identical"
+            );
+        }
+    }
+
+    /// The allocation-free hex decode used by the sidecar parser must accept
+    /// exactly what `ContentId::from_hex` accepts.
+    #[test]
+    fn content_id_hex_decode_matches_from_hex() {
+        let id = ContentId::hash_bytes(b"hex-roundtrip");
+        let hex = id.to_string();
+        assert_eq!(content_id_from_hex_no_alloc(&hex), Some(id));
+        assert_eq!(
+            content_id_from_hex_no_alloc(&hex.to_uppercase()),
+            Some(ContentId::from_hex(&hex.to_uppercase()).unwrap())
+        );
+        for junk in ["", "abc", &format!("{}z", &hex[..63]), &format!("{hex}00")] {
+            assert_eq!(
+                content_id_from_hex_no_alloc(junk).is_none(),
+                ContentId::from_hex(junk).is_err(),
+                "decoders disagree on {junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_index_file_round_trips_and_rejects_junk() {
+        let records = vec![
+            PackIndexRecord {
+                kind: ObjectKind::Commit,
+                content_id: ContentId::hash_bytes(b"a"),
+                offset: 0,
+                len: 12,
+            },
+            PackIndexRecord {
+                kind: ObjectKind::Tree,
+                content_id: ContentId::hash_bytes(b"b"),
+                offset: 12,
+                len: 34,
+            },
+        ];
+        let text = format_pack_index_file(&records);
+        assert_eq!(parse_pack_index_file(&text).unwrap(), records);
+        assert!(parse_pack_index_file("").is_none());
+        assert!(parse_pack_index_file("not-the-header\n").is_none());
+        assert!(
+            parse_pack_index_file(&format!("{PACK_IDX_HEADER}\ncommit nothex 0 1\n")).is_none()
+        );
+        assert!(
+            parse_pack_index_file(&format!(
+                "{PACK_IDX_HEADER}\ncommit {} 0 1 extra\n",
+                ContentId::hash_bytes(b"a")
+            ))
+            .is_none()
+        );
+    }
+
+    /// A sidecar whose payload is missing (partially deleted cache) must not
+    /// be loaded — and is dropped on the spot (load-time self-heal).
+    #[test]
+    fn pack_index_loader_drops_sidecar_without_payload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let packs_dir = temp_dir.path().join(".packs");
+        fs::create_dir_all(&packs_dir).unwrap();
+        let content_id = ContentId::hash_bytes(b"orphan");
+        let records = vec![PackIndexRecord {
+            kind: ObjectKind::Commit,
+            content_id,
+            offset: 0,
+            len: 6,
+        }];
+        let idx_path = packs_dir.join("deadbeef.idx");
+        fs::write(&idx_path, format_pack_index_file(&records)).unwrap();
+        let index = PackResidentIndex::new(packs_dir);
+        assert!(index.lookup(ObjectKind::Commit, &content_id).is_none());
+        assert!(!idx_path.exists());
+    }
+
+    #[test]
+    fn redact_url_queries_strips_signed_query_strings() {
+        // reqwest error Display wraps the URL in parentheses; the query (which
+        // carries the whole SigV4 authorization) must go, the rest must stay.
+        assert_eq!(
+            redact_url_queries(
+                "error sending request for url (https://t3.storage.dev/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc123): timed out"
+            ),
+            "error sending request for url (https://t3.storage.dev/bucket/key?<redacted>): timed out"
+        );
+        assert_eq!(redact_url_queries("no urls here"), "no urls here");
+        assert_eq!(
+            redact_url_queries("got https://a/b?x=1 then https://c/d?y=2"),
+            "got https://a/b?<redacted> then https://c/d?<redacted>"
+        );
+        assert_eq!(
+            redact_url_queries("trailing https://a/b?x=1"),
+            "trailing https://a/b?<redacted>"
+        );
     }
 }
 

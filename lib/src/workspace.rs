@@ -578,8 +578,15 @@ impl Workspace {
             if config.repository_scope_kind.as_deref() != Some("virtual_repository")
                 && !skip_vex_clone_prefetch()
             {
-                let prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
+                let mut prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+                // The `.jj` scaffold above is brand new (`create_jj_dir` fails
+                // if one exists) and is removed wholesale if the clone fails,
+                // so a repo-local cache dir was created by this process: the
+                // unpack's loose writes may take the direct-create fast path.
+                // Shared cache dirs keep atomic temp+rename writes — the
+                // client checks which kind it has.
+                prefetch_client.mark_fresh_clone_cache();
                 let clone_manifest = prefetch_client
                     .get_clone_manifest(blob_mode, have_snapshot_commit_ids, progress)
                     .await
