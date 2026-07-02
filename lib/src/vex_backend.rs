@@ -16,6 +16,7 @@
 
 use std::fmt::Debug;
 use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::SystemTime;
 
@@ -23,6 +24,7 @@ use async_trait::async_trait;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
+use futures::io::AllowStdIo;
 use futures::io::Cursor;
 use futures::stream;
 use futures::stream::BoxStream;
@@ -251,11 +253,14 @@ impl VexBackend {
                     format!("missing {ref_name}"),
                 )),
             })?;
-        Ok(jj_backend_types::ContentId::from_hex(&content_id).map_err(|err| BackendError::ReadObject {
-            object_type: "git-mapping".to_string(),
-            hash: oid_hex.to_string(),
-            source: Box::new(err),
-        })?.as_bytes().to_vec())
+        Ok(jj_backend_types::ContentId::from_hex(&content_id)
+            .map_err(|err| BackendError::ReadObject {
+                object_type: "git-mapping".to_string(),
+                hash: oid_hex.to_string(),
+                source: Box::new(err),
+            })?
+            .as_bytes()
+            .to_vec())
     }
 
     async fn read_git_tree(&self, data: &[u8]) -> BackendResult<Tree> {
@@ -315,7 +320,9 @@ impl VexBackend {
                     let id = self.git_mapping("blob", &oid_hex).await?;
                     TreeValue::Symlink(SymlinkId::new(id))
                 }
-                "160000" => TreeValue::GitSubmodule(CommitId::from_bytes(&data[index - 20..oid_end])),
+                "160000" => {
+                    TreeValue::GitSubmodule(CommitId::from_bytes(&data[index - 20..oid_end]))
+                }
                 "100755" => {
                     let id = self.git_mapping("blob", &oid_hex).await?;
                     TreeValue::File {
@@ -410,6 +417,18 @@ impl Backend for VexBackend {
         path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
+        // Cache hit: stream from the on-disk cache file instead of buffering
+        // the whole blob — checkout holds up to `concurrency()` readers at
+        // once, so whole-blob buffers multiply peak RSS.
+        let content_id = to_content_id(&id.to_bytes(), &id.object_type())?;
+        if let Some(file) = self
+            .client
+            .open_cached_object(jj_backend_types::ObjectKind::Blob, &content_id)
+        {
+            return Ok(Box::pin(AllowStdIo::new(file)));
+        }
+        // Miss: fetch the whole blob (which also writes it to the cache) and
+        // serve it from memory.
         let data = self
             .read_object_bytes(jj_backend_types::ObjectKind::Blob, id)
             .await
@@ -423,6 +442,12 @@ impl Backend for VexBackend {
                 other => other,
             })?;
         Ok(Box::pin(Cursor::new(data)))
+    }
+
+    fn cached_blob_path(&self, id: &FileId) -> Option<PathBuf> {
+        let content_id = to_content_id(&id.to_bytes(), &id.object_type()).ok()?;
+        self.client
+            .cached_object_path(jj_backend_types::ObjectKind::Blob, &content_id)
     }
 
     async fn write_file(
@@ -445,16 +470,37 @@ impl Backend for VexBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
-        let data = match self
-            .read_object_bytes(jj_backend_types::ObjectKind::Symlink, id)
-            .await
-        {
-            Ok(data) => data,
-            Err(_) => {
-                let file_id = FileId::new(id.to_bytes());
-                self.read_object_bytes(jj_backend_types::ObjectKind::Blob, &file_id)
-                    .await?
-            }
+        // Legacy repos (and snapshot packs built from them) may hold the
+        // target bytes under either kind — old clients wrote symlink targets
+        // as blobs. Cover both kinds in the local cache up front, matching
+        // the RPC fallback order below; otherwise a target unpacked from a
+        // snapshot pack under the other kind costs a NotFound round-trip
+        // during checkout.
+        let content_id = to_content_id(&id.to_bytes(), &id.object_type())?;
+        let cached = [
+            jj_backend_types::ObjectKind::Symlink,
+            jj_backend_types::ObjectKind::Blob,
+        ]
+        .into_iter()
+        .find_map(|kind| self.client.read_cached_object(kind, &content_id));
+        if cached.is_some() {
+            crate::vex::vex_client_stats()
+                .get_object_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let data = match cached {
+            Some(data) => data,
+            None => match self
+                .read_object_bytes(jj_backend_types::ObjectKind::Symlink, id)
+                .await
+            {
+                Ok(data) => data,
+                Err(_) => {
+                    let file_id = FileId::new(id.to_bytes());
+                    self.read_object_bytes(jj_backend_types::ObjectKind::Blob, &file_id)
+                        .await?
+                }
+            },
         };
         String::from_utf8(data).map_err(|err| BackendError::InvalidUtf8 {
             object_type: "symlink".to_string(),
@@ -577,14 +623,17 @@ impl Backend for VexBackend {
 #[cfg(test)]
 mod tests {
     use super::VexBackend;
+    use super::sha256_bytes;
     use crate::backend::Backend as _;
+    use crate::backend::FileId;
+    use crate::object_id::ObjectId as _;
     use crate::repo_path::RepoPath;
     use crate::vex::VexRepoConfig;
+    use futures::AsyncReadExt as _;
     use pollster::FutureExt as _;
 
-    #[test]
-    fn empty_tree_is_served_locally() {
-        let backend = VexBackend::init(VexRepoConfig {
+    fn sample_config() -> VexRepoConfig {
+        VexRepoConfig {
             endpoint: "http://127.0.0.1:1".to_string(),
             tenant_id: "tenant".to_string(),
             tenant_slug: "tenant".to_string(),
@@ -597,8 +646,12 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_tree_is_served_locally() {
+        let backend = VexBackend::init(sample_config()).unwrap();
 
         let tree = backend
             .read_tree(RepoPath::root(), backend.empty_tree_id())
@@ -606,5 +659,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree, crate::backend::Tree::default());
+    }
+
+    /// Backend loaded from a store path with the blob already in the local
+    /// cache: `read_file` must stream from the cache file (the endpoint above
+    /// is unreachable, so any RPC attempt would fail) and `cached_blob_path`
+    /// must expose the cache file for reflink materialization.
+    #[test]
+    fn read_file_streams_from_cache_and_reports_cached_blob_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let store_dir = repo_dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        sample_config().write_to_repo_path(&repo_dir).unwrap();
+        let backend = VexBackend::load(&store_dir).unwrap();
+
+        let data = b"cached blob contents";
+        let id = FileId::new(sha256_bytes(data).to_vec());
+        let uncached_id = FileId::new(sha256_bytes(b"never cached").to_vec());
+        let cache_file = repo_dir
+            .join("vex-cache")
+            .join("blob")
+            .join(super::hex_bytes(&id.to_bytes()));
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        std::fs::write(&cache_file, data).unwrap();
+
+        assert_eq!(backend.cached_blob_path(&id), Some(cache_file));
+        assert_eq!(backend.cached_blob_path(&uncached_id), None);
+
+        let mut reader = backend.read_file(RepoPath::root(), &id).block_on().unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).block_on().unwrap();
+        assert_eq!(buf, data);
     }
 }

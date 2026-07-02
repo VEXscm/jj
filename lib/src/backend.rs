@@ -17,6 +17,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::slice;
 use std::time::SystemTime;
@@ -575,6 +576,16 @@ pub trait Backend: Any + Send + Sync + Debug {
         path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>>;
+
+    /// Path of a local, content-addressed cache file whose contents are
+    /// exactly the contents of the file `id`, if the backend maintains one.
+    /// The returned file must never be mutated once created. This lets
+    /// checkout materialize working-copy files as copy-on-write clones
+    /// (reflink) of the cache file instead of a byte copy; backends without a
+    /// local blob cache use the default.
+    fn cached_blob_path(&self, _id: &FileId) -> Option<PathBuf> {
+        None
+    }
 
     /// Writes the contents of the writer to the backend. Returns the ID of the
     /// written file.

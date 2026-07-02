@@ -21,6 +21,9 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -36,6 +39,7 @@ use crate::file_util::PathError;
 use crate::local_working_copy::LocalWorkingCopy;
 use crate::local_working_copy::LocalWorkingCopyFactory;
 use crate::merged_tree::MergedTree;
+use crate::object_id::ObjectId as _;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store::OperationId;
 use crate::ref_name::WorkspaceName;
@@ -295,6 +299,16 @@ fn skip_vex_clone_prefetch() -> bool {
     )
 }
 
+/// Whether a lazy clone bulk-hydrates the start commit's file/symlink contents
+/// before checkout. On by default; `VEX_CLONE_HYDRATION=0` restores the pure
+/// per-file lazy fetch path (rollback / bench control).
+fn vex_clone_hydration_enabled() -> bool {
+    !matches!(
+        std::env::var("VEX_CLONE_HYDRATION").ok().as_deref(),
+        Some("0") | Some("false") | Some("no")
+    )
+}
+
 impl Workspace {
     pub fn new(
         workspace_root: &Path,
@@ -502,6 +516,18 @@ impl Workspace {
         // path this selects the start commit; ignored when `target_commit` is
         // `Some`. `None` falls back to the local main/master/trunk heuristic.
         server_trunk: Option<&str>,
+        // Whether to bulk-hydrate the start commit's file/symlink contents into
+        // the local cache before checkout (lazy clones only). Callers pass
+        // `false` for virtual working copies, which materialize nothing — the
+        // factory itself can't tell us (no identity on `WorkingCopyFactory`).
+        // Also gates snapshot-pack consumption (roadmap/032): a clone that
+        // won't materialize files must not download working-tree snapshots.
+        hydrate_blobs: bool,
+        // Extra snapshot commit ids (64-char hex) the caller already holds
+        // fully unpacked, sent as `have_snapshot_commit_ids` on the clone
+        // manifest request on top of the shared cache's `.snapshots` markers
+        // (`vex bench clone --have`).
+        have_snapshot_commit_ids: &[String],
         working_copy_factory: &dyn WorkingCopyFactory,
         progress: Option<&crate::vex::CloneProgressFn>,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
@@ -555,7 +581,7 @@ impl Workspace {
                 let prefetch_client = crate::vex::VexClient::from_store_path(&store_path)
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
                 let clone_manifest = prefetch_client
-                    .get_clone_manifest(blob_mode, progress)
+                    .get_clone_manifest(blob_mode, have_snapshot_commit_ids, progress)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
                 if let Some(progress) = progress {
@@ -582,8 +608,13 @@ impl Workspace {
                         deferred_objects: clone_manifest.deferred_object_count,
                     });
                 }
+                // Snapshot packs carry the trunk working tree's blob closure;
+                // they are only worth downloading when this clone will
+                // materialize files from the cache (lazy + non-virtual — the
+                // same conditions as the hydration step below).
+                let fetch_snapshot_packs = hydrate_blobs && blob_mode == CloneBlobMode::Lazy;
                 prefetch_client
-                    .prefetch_clone_manifest(&clone_manifest, progress)
+                    .prefetch_clone_manifest(&clone_manifest, fetch_snapshot_packs, progress)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             }
@@ -614,19 +645,74 @@ impl Workspace {
                     }
                 }
             };
+            // Pre-checkout hydration: a lazy manifest defers every blob and
+            // symlink, so materialization would otherwise pay one RPC per
+            // file. Batch-fetch the start commit's contents into the cache
+            // first (the tree metadata is already warm from the prefetch).
+            // Best-effort — checkout still hydrates on demand if this fails —
+            // and skipped wherever the prefetch is skipped (virtual-repository
+            // scope, VEX_SKIP_CLONE_PREFETCH), where the walk itself would
+            // become per-object RPCs.
+            let mut hydration_file_count: Option<u64> = None;
+            if hydrate_blobs
+                && blob_mode == CloneBlobMode::Lazy
+                && config.repository_scope_kind.as_deref() != Some("virtual_repository")
+                && !skip_vex_clone_prefetch()
+                && vex_clone_hydration_enabled()
+            {
+                hydration_file_count =
+                    hydrate_start_commit_blobs(&repo, &store_path, &start_commit, progress).await;
+            }
             if let Some(progress) = progress {
                 progress(crate::vex::CloneProgress::CheckingOut);
             }
             let workspace_name = vex_clone_workspace_name(workspace_root);
-            let (working_copy, repo) = init_working_copy_at(
+            let init_working_copy = init_working_copy_at(
                 &repo,
                 workspace_root,
                 &jj_dir,
                 working_copy_factory,
                 workspace_name,
                 &start_commit,
-            )
-            .await?;
+            );
+            let (working_copy, repo) = match progress {
+                // Materializing progress: the checkout has no progress channel
+                // of its own, so while it runs poll the process-global
+                // `files_written` counter every ~200ms and report the delta.
+                // `files_total` comes from the hydration walk when it ran
+                // (0 = unknown; sinks omit the total then). The ticker's timer
+                // is parked on the shared gRPC runtime (this executor has no
+                // timer driver) and the ticker stops within one tick of the
+                // checkout future finishing, so `join!` cannot hang on it.
+                Some(progress) => {
+                    let files_total = hydration_file_count.unwrap_or(0);
+                    let files_written_base = crate::vex::vex_client_stats_snapshot().files_written;
+                    let checkout_done = AtomicBool::new(false);
+                    let checkout = async {
+                        let result = init_working_copy.await;
+                        checkout_done.store(true, AtomicOrdering::Relaxed);
+                        result
+                    };
+                    let ticker = async {
+                        while !checkout_done.load(AtomicOrdering::Relaxed) {
+                            crate::vex::shared_runtime_sleep(Duration::from_millis(200)).await;
+                            if checkout_done.load(AtomicOrdering::Relaxed) {
+                                break;
+                            }
+                            let files_done = crate::vex::vex_client_stats_snapshot()
+                                .files_written
+                                .saturating_sub(files_written_base);
+                            progress(crate::vex::CloneProgress::Materializing {
+                                files_done,
+                                files_total,
+                            });
+                        }
+                    };
+                    let (checkout_result, ()) = futures::join!(checkout, ticker);
+                    checkout_result?
+                }
+                None => init_working_copy.await?,
+            };
             let repo = if let Some(server_trunk) = server_trunk {
                 let mut tx = repo.start_transaction();
                 tx.repo_mut().set_local_bookmark_target(
@@ -1057,6 +1143,154 @@ async fn clone_vex_git_ref_start_commit(
         .await
         .map(Some)
         .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))
+}
+
+/// Bulk-fetch the file/symlink contents of `start_commit` into the local
+/// vex-cache before checkout, replacing thousands of per-file `GetObject` RPCs
+/// during materialization with a few batched `GetObjectsInline` reads.
+/// Best-effort: on any failure it logs and returns, and checkout falls back to
+/// hydrating the remaining files on demand exactly as before.
+/// Returns the number of file/symlink tree entries in the start commit when
+/// the hydration walk ran (used as the materializing-progress total), or
+/// `None` when the walk was skipped (snapshot packs already cover the commit)
+/// or failed.
+async fn hydrate_start_commit_blobs(
+    repo: &Arc<ReadonlyRepo>,
+    store_path: &Path,
+    start_commit: &Commit,
+    progress: Option<&crate::vex::CloneProgressFn>,
+) -> Option<u64> {
+    let started = std::time::Instant::now();
+    let client = match crate::vex::VexClient::from_store_path(store_path) {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "clone hydration: failed to build client; falling back to lazy per-file fetch"
+            );
+            return None;
+        }
+    };
+    // Snapshot fast path (roadmap/032 Stage 4): a fully-unpacked snapshot set
+    // covering the start commit means every blob/symlink in its tree is
+    // already in the local cache — skip the hydration tree walk entirely.
+    // Recorded in the `snapshot_walk_skips` counter so `vex bench clone` can
+    // tell which path ran.
+    if client.has_unpacked_snapshot(&start_commit.id().hex()) {
+        crate::vex::vex_client_stats()
+            .snapshot_walk_skips
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::debug!(
+            commit_id = %start_commit.id().hex(),
+            "clone hydration: snapshot packs cover the start commit; skipping hydration walk"
+        );
+        return None;
+    }
+    let (ids, file_count) = match clone_vex_hydration_ids(repo, start_commit).await {
+        Ok(walk) => walk,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "clone hydration: tree walk failed; falling back to lazy per-file fetch"
+            );
+            return None;
+        }
+    };
+    if ids.is_empty() {
+        return Some(file_count);
+    }
+    let total = ids.len();
+    match client.get_objects_inline_batched(ids, progress).await {
+        Ok(hydrated) => {
+            tracing::debug!(
+                total,
+                hydrated,
+                elapsed_ms = started.elapsed().as_millis(),
+                "clone hydration complete"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "clone hydration failed; falling back to lazy per-file fetch"
+            );
+        }
+    }
+    Some(file_count)
+}
+
+/// Result of the hydration tree walk: the object ids to hydrate and the
+/// number of file/symlink tree entries encountered.
+type HydrationWalk = (
+    Vec<(
+        jj_backend_types::ObjectKind,
+        jj_backend_types::ContentId,
+        Option<u64>,
+    )>,
+    u64,
+);
+
+/// Walk `commit`'s root trees (all conflict terms, so merged/conflicted
+/// commits are covered) and collect the content ids of every file blob and
+/// symlink target for pre-checkout hydration, plus the number of file/symlink
+/// tree entries encountered (per path, before content dedup — the count of
+/// working-copy entries a full checkout will materialize). Tree metadata is
+/// warm in the local cache after the clone prefetch, so the walk itself stays
+/// local. Implicit objects (all-zeros, empty content) are skipped, matching
+/// the server's snapshot closure definition.
+async fn clone_vex_hydration_ids(
+    repo: &Arc<ReadonlyRepo>,
+    commit: &Commit,
+) -> Result<HydrationWalk, crate::backend::BackendError> {
+    use jj_backend_types::ContentId;
+    use jj_backend_types::ObjectKind;
+
+    fn vex_content_id(bytes: &[u8]) -> Option<ContentId> {
+        <[u8; 32]>::try_from(bytes).ok().map(ContentId::from_bytes)
+    }
+
+    let store = repo.store();
+    let empty_id = ContentId::hash_bytes(b"");
+    let zeros_id = ContentId::from_bytes([0; 32]);
+    let mut visited_trees: HashSet<crate::backend::TreeId> = HashSet::new();
+    let mut queue: Vec<(crate::repo_path::RepoPathBuf, crate::backend::TreeId)> = Vec::new();
+    for tree_id in commit.tree_ids().iter() {
+        if visited_trees.insert(tree_id.clone()) {
+            queue.push((crate::repo_path::RepoPathBuf::root(), tree_id.clone()));
+        }
+    }
+    let mut seen: HashSet<(ObjectKind, ContentId)> = HashSet::new();
+    let mut ids = Vec::new();
+    let mut file_count = 0_u64;
+    let mut push_content = |kind: ObjectKind, id_bytes: &[u8], ids: &mut Vec<_>| {
+        if let Some(content_id) = vex_content_id(id_bytes) {
+            if content_id != empty_id && content_id != zeros_id && seen.insert((kind, content_id)) {
+                ids.push((kind, content_id, None));
+            }
+        }
+    };
+    while let Some((dir, tree_id)) = queue.pop() {
+        let tree = store.get_tree(dir, &tree_id).await?;
+        for entry in tree.entries_non_recursive() {
+            match entry.value() {
+                crate::backend::TreeValue::File { id, .. } => {
+                    file_count += 1;
+                    push_content(ObjectKind::Blob, id.as_bytes(), &mut ids);
+                }
+                crate::backend::TreeValue::Symlink(id) => {
+                    file_count += 1;
+                    push_content(ObjectKind::Symlink, id.as_bytes(), &mut ids);
+                }
+                crate::backend::TreeValue::Tree(sub_tree_id) => {
+                    if visited_trees.insert(sub_tree_id.clone()) {
+                        queue.push((tree.dir().join(entry.name()), sub_tree_id.clone()));
+                    }
+                }
+                crate::backend::TreeValue::GitSubmodule(_) => {}
+            }
+        }
+    }
+    Ok((ids, file_count))
 }
 
 async fn clone_vex_recent_workspace_commit_from_ops(

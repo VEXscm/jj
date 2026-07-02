@@ -34,12 +34,19 @@ pub struct VexLiveTestHarness {
 
 impl VexLiveTestHarness {
     pub fn start() -> Self {
+        // The live harness backend runs with no repo-access authorizer
+        // (allow-all), but the CLI's repo-auth resolution requires a token
+        // (`resolve_repo_auth` falls back to the Vex API catalog without
+        // one), and `TestEnvironment` spawns `jj` with a cleared env. Inject
+        // a dummy token so tests stay hermetic.
+        let mut test_env = TestEnvironment::default();
+        test_env.add_env_var("VEX_ACCESS_TOKEN", "vex-live-test-token");
         Self {
             _guard: LIVE_VEX_TEST_GUARD
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             backend: LiveBackendHarness::start().expect("live backend harness"),
-            test_env: TestEnvironment::default(),
+            test_env,
         }
     }
 

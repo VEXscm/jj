@@ -34,11 +34,19 @@ use std::ops::Range;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::channel;
+use std::sync::mpsc::sync_channel;
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -1040,6 +1048,11 @@ pub struct TreeState {
     exec_policy: ExecChangePolicy,
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
+    /// True when `target_eol_strategy` writes file content to disk unmodified
+    /// (`convert_eol_for_update` is the identity), so an on-disk file is
+    /// byte-identical to its blob — the precondition for materializing files
+    /// as copy-on-write clones of the backend's content-addressed cache.
+    eol_update_is_identity: bool,
 }
 
 #[derive(Debug, Error)]
@@ -1117,6 +1130,10 @@ impl TreeState {
             exec_policy,
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
+            eol_update_is_identity: matches!(
+                eol_conversion_mode,
+                EolConversionMode::None | EolConversionMode::Input
+            ),
         }
     }
 
@@ -2058,6 +2075,517 @@ fn snapshot_error_for_mtime_out_of_range(err: MtimeOutOfRange, path: &Path) -> S
     }
 }
 
+/// Number of worker threads used to materialize `File` entries during
+/// checkout. `VEX_CHECKOUT_WRITERS` overrides it (`0` disables the pool and
+/// keeps the historical serial write loop); the default is `min(8, available
+/// parallelism)`. The pool is only used when the backend serves reads
+/// concurrently (`Store::concurrency() > 1`), so local backends like Git keep
+/// the serial path.
+fn checkout_writer_count() -> usize {
+    let default = || {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)
+    };
+    match std::env::var("VEX_CHECKOUT_WRITERS") {
+        Ok(value) => value.trim().parse().ok().unwrap_or_else(default),
+        Err(_) => default(),
+    }
+}
+
+/// Kill switch for copy-on-write materialization from the backend's local
+/// blob cache (`VEX_CHECKOUT_REFLINK=0` disables it).
+fn checkout_reflink_enabled() -> bool {
+    std::env::var("VEX_CHECKOUT_REFLINK").map_or(true, |value| value.trim() != "0")
+}
+
+/// Record one materialized working-copy file in the process-global client
+/// counters (consumed by `vex bench clone`).
+fn record_file_written(size: u64, reflinked: bool) {
+    let stats = crate::vex::vex_client_stats();
+    stats.files_written.fetch_add(1, AtomicOrdering::Relaxed);
+    stats.bytes_written.fetch_add(size, AtomicOrdering::Relaxed);
+    if reflinked {
+        stats.files_reflinked.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Clone `src` to `dst` with copy-on-write (APFS `clonefile(2)` / Linux
+/// `FICLONE`). Returns false when the platform, filesystem, or volume layout
+/// can't clone; `dst` is then left absent so the caller's streamed-copy
+/// fallback (which opens with `create_new`) succeeds.
+#[cfg(target_os = "macos")]
+fn clone_file_cow(src: &Path, dst: &Path) -> bool {
+    use std::sync::atomic::AtomicU64;
+
+    let Ok(src_file) = File::open(src) else {
+        return false;
+    };
+    // clonefile(2) follows a (possibly dangling) symlink at `dst` and creates
+    // the clone at its *target* — a filesystem write-what-where hole the
+    // streamed path's `create_new` open (O_CREAT|O_EXCL, no-follow) doesn't
+    // have, and `CloneFlags::NOFOLLOW` only applies to `src`. So clone into a
+    // unique temp name we control (guaranteed absent, nothing to follow),
+    // then move it into place with RENAME_EXCL, which fails if *anything* —
+    // including a dangling symlink — exists at `dst`, restoring the O_EXCL
+    // no-follow guarantee.
+    static REFLINK_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dst.with_file_name(format!(
+        ".vex-reflink-{}-{}.tmp",
+        std::process::id(),
+        REFLINK_TEMP_SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    if rustix::fs::fclonefileat(
+        &src_file,
+        rustix::fs::CWD,
+        &tmp,
+        rustix::fs::CloneFlags::empty(),
+    )
+    .is_err()
+    {
+        // clonefile(2) creates nothing on failure; the streamed fallback runs.
+        return false;
+    }
+    match rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &tmp,
+        rustix::fs::CWD,
+        dst,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => true,
+        // Something exists at dst (e.g. a case-colliding sibling task on a
+        // case-insensitive filesystem, or a concurrently planted symlink).
+        // Remove only the temp clone — never dst — so the streamed fallback's
+        // `create_new` open fails like the serial path.
+        Err(_) => {
+            fs::remove_file(&tmp).ok();
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clone_file_cow(src: &Path, dst: &Path) -> bool {
+    let Ok(src_file) = File::open(src) else {
+        return false;
+    };
+    let Ok(dst_file) = File::options().write(true).create_new(true).open(dst) else {
+        return false;
+    };
+    if rustix::fs::ioctl_ficlone(&dst_file, &src_file).is_err() {
+        drop(dst_file);
+        fs::remove_file(dst).ok();
+        return false;
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn clone_file_cow(_src: &Path, _dst: &Path) -> bool {
+    false
+}
+
+/// Materialize `disk_path` as a copy-on-write clone of `src`, a local
+/// content-addressed cache file holding exactly the target blob's bytes
+/// (cache files are never mutated once written). Only valid when EOL
+/// conversion is the identity. Returns `None` on any failure with `disk_path`
+/// left absent, so the caller falls back to the streamed copy.
+fn try_reflink_file(src: &Path, disk_path: &Path, exec_bit: ExecBit) -> Option<FileState> {
+    // clonefile/FICLONE only work within one volume, and the cache may live
+    // elsewhere (e.g. JJ_VEX_SHARED_CACHE_DIR).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let src_metadata = src.metadata().ok()?;
+        if !src_metadata.is_file() {
+            return None;
+        }
+        let dst_dir_metadata = disk_path.parent()?.metadata().ok()?;
+        if src_metadata.dev() != dst_dir_metadata.dev() {
+            return None;
+        }
+    }
+    if !clone_file_cow(src, disk_path) {
+        return None;
+    }
+    // Same post-write steps as the streamed path: normalize the mode for the
+    // exec bit, then derive the recorded FileState from the destination file
+    // so the next snapshot's mtime/size comparisons see what's on disk.
+    let file_state = set_executable(exec_bit, disk_path)
+        .ok()
+        .and_then(|()| File::open(disk_path).ok())
+        .and_then(|file| {
+            // clonefile(2) clones the cache blob's (arbitrarily old) mtime;
+            // restore write-time semantics before recording the FileState so
+            // mtime-comparing build tools (make/ninja/cargo) see the checkout
+            // write as new. (Linux's FICLONE path writes into a fresh
+            // `create_new` file, so this is a semantic no-op there.)
+            file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+                .ok()?;
+            file.metadata().ok()
+        })
+        .and_then(|metadata| FileState::for_file(exec_bit, metadata.len(), &metadata).ok());
+    let Some(file_state) = file_state else {
+        fs::remove_file(disk_path).ok();
+        return None;
+    };
+    record_file_written(file_state.size, true);
+    Some(file_state)
+}
+
+/// Write `contents` to `disk_path` — as a copy-on-write clone of
+/// `reflink_source` when possible, streamed otherwise — apply the exec bit,
+/// and derive the new [`FileState`] from the destination file.
+async fn write_file_to_disk(
+    target_eol_strategy: &TargetEolStrategy,
+    reflink_source: Option<&Path>,
+    disk_path: &Path,
+    contents: impl AsyncRead + Send + Unpin,
+    exec_bit: ExecBit,
+    apply_eol_conversion: bool,
+) -> Result<FileState, CheckoutError> {
+    if let Some(src) = reflink_source
+        && let Some(file_state) = try_reflink_file(src, disk_path, exec_bit)
+    {
+        return Ok(file_state);
+    }
+    let mut file = File::options()
+        .write(true)
+        .create_new(true) // Don't overwrite un-ignored file. Don't follow symlink.
+        .open(disk_path)
+        .map_err(|err| CheckoutError::Other {
+            message: format!("Failed to open file {} for writing", disk_path.display()),
+            err: FileCreateError(err).into(),
+        })?;
+    let contents = if apply_eol_conversion {
+        target_eol_strategy
+            .convert_eol_for_update(contents)
+            .await
+            .map_err(|err| CheckoutError::Other {
+                message: "Failed to convert the EOL for the content".to_string(),
+                err: err.into(),
+            })?
+    } else {
+        Box::new(contents)
+    };
+    let size = copy_async_to_sync(contents, &mut file)
+        .await
+        .map_err(|err| CheckoutError::Other {
+            message: format!(
+                "Failed to write the content to the file {}",
+                disk_path.display()
+            ),
+            err: err.into(),
+        })?;
+    set_executable(exec_bit, disk_path)
+        .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+    // Read the file state from the file descriptor. That way, know that the file
+    // exists and is of the expected type, and the stat information is most likely
+    // accurate, except for other processes modifying the file concurrently (The
+    // mtime is set at write time and won't change when we close the file.)
+    let metadata = file
+        .metadata()
+        .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+    let file_state = FileState::for_file(exec_bit, size as u64, &metadata)
+        .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))?;
+    record_file_written(size as u64, false);
+    Ok(file_state)
+}
+
+/// One `MaterializedTreeValue::File` write dispatched to the checkout writer
+/// pool: everything a worker needs without borrowing `TreeState`.
+struct CheckoutWriteTask {
+    path: RepoPathBuf,
+    id: FileId,
+    reader: Pin<Box<dyn AsyncRead + Send>>,
+    exec_bit: ExecBit,
+    before_present: bool,
+}
+
+/// Result of one pooled write; `skipped` mirrors the serial arms that record
+/// a placeholder file state and count the path as skipped.
+struct CheckoutWriteOutcome {
+    path: RepoPathBuf,
+    file_state: FileState,
+    skipped: bool,
+}
+
+/// Immutable state shared by all checkout writer threads.
+struct CheckoutWriterContext {
+    working_copy_path: PathBuf,
+    target_eol_strategy: TargetEolStrategy,
+    store: Arc<Store>,
+    /// Reflink materialization allowed (kill switch on and EOL conversion is
+    /// the identity).
+    reflink: bool,
+}
+
+/// Whether a pre-write checkout step failed because a concurrent deletion
+/// entry removed a freshly created (still empty) parent directory. The whole
+/// write is retried from directory creation in that case, converging to the
+/// same end state as the serial loop. Only used for steps that never consume
+/// the content reader.
+fn is_transient_not_found(err: &CheckoutError) -> bool {
+    match err {
+        CheckoutError::Other { err, .. } => err
+            .downcast_ref::<io::Error>()
+            .is_some_and(|err| err.kind() == io::ErrorKind::NotFound),
+        _ => false,
+    }
+}
+
+/// Marker for a failure of the `create_new` open in [`write_file_to_disk`].
+/// The open happens before any of the content reader is consumed, so it is
+/// the only write failure that is safe to retry with the same reader.
+#[derive(Debug, Error)]
+#[error(transparent)]
+struct FileCreateError(io::Error);
+
+fn file_create_error_kind(err: &CheckoutError) -> Option<io::ErrorKind> {
+    match err {
+        CheckoutError::Other { err, .. } => err
+            .downcast_ref::<FileCreateError>()
+            .map(|FileCreateError(err)| err.kind()),
+        _ => None,
+    }
+}
+
+/// Whether a checkout write failed because the `create_new` open hit a
+/// parent directory pruned by a concurrent deletion entry. No content was
+/// read yet (see [`FileCreateError`]), so the whole write is retried from
+/// directory creation.
+fn is_transient_create_not_found(err: &CheckoutError) -> bool {
+    file_create_error_kind(err) == Some(io::ErrorKind::NotFound)
+}
+
+/// Whether a checkout write failed because the target file appeared between
+/// the `can_create_new_file` probe and the `create_new` open — e.g. a
+/// case-colliding sibling task on a case-insensitive filesystem. The serial
+/// loop's probe turns such paths into a deterministic skip; the pooled
+/// writer maps this failure to the same skip outcome.
+fn is_create_already_exists(err: &CheckoutError) -> bool {
+    file_create_error_kind(err) == Some(io::ErrorKind::AlreadyExists)
+}
+
+/// Whether a consumer-side checkout write (symlink, conflict, or fake
+/// symlink) failed because the target path appeared between this thread's
+/// `can_create_new_file` probe and the write — a case-colliding *pooled* file
+/// write landing on a case-insensitive filesystem. The pooled writer maps the
+/// mirror-image race to a skip (see [`is_create_already_exists`]); these
+/// serial arms wrap plain [`io::Error`]s rather than [`FileCreateError`], so
+/// both are checked.
+fn is_checkout_already_exists(err: &CheckoutError) -> bool {
+    let kind = match err {
+        CheckoutError::Other { err, .. } => err
+            .downcast_ref::<FileCreateError>()
+            .map(|FileCreateError(err)| err.kind())
+            .or_else(|| err.downcast_ref::<io::Error>().map(io::Error::kind)),
+        _ => None,
+    };
+    kind == Some(io::ErrorKind::AlreadyExists)
+}
+
+impl CheckoutWriterContext {
+    fn execute(&self, task: CheckoutWriteTask) -> Result<CheckoutWriteOutcome, CheckoutError> {
+        let CheckoutWriteTask {
+            path,
+            id,
+            mut reader,
+            exec_bit,
+            before_present,
+        } = task;
+        let reflink_source = self
+            .reflink
+            .then(|| self.store.backend().cached_blob_path(&id))
+            .flatten();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            // Retry the whole write from directory creation when a concurrent
+            // deletion entry prunes a freshly created (still empty) parent
+            // directory out from under one of the pre-write steps. None of
+            // these steps consume the content reader, so retrying is safe.
+            macro_rules! retry_transient {
+                ($result:expr) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(err)
+                            if attempt < CREATE_PARENT_DIR_RETRY_ATTEMPTS
+                                && is_transient_not_found(&err) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                (2u64.pow(attempt.min(6))).min(50),
+                            ));
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                };
+            }
+            // No cross-entry `prev_created_path` caching here: entries
+            // complete out of order, so every task creates (and
+            // safety-checks) its own parent chain. `create_parent_dirs`
+            // absorbs the transient races between workers sharing ancestors.
+            let Some(disk_path) =
+                retry_transient!(create_parent_dirs(&self.working_copy_path, &path))
+            else {
+                return Ok(CheckoutWriteOutcome {
+                    path,
+                    file_state: FileState::placeholder(),
+                    skipped: true,
+                });
+            };
+            let present_file_deleted =
+                before_present && retry_transient!(remove_old_file(&disk_path));
+            if !present_file_deleted && !retry_transient!(can_create_new_file(&disk_path)) {
+                return Ok(CheckoutWriteOutcome {
+                    path,
+                    file_state: FileState::placeholder(),
+                    skipped: true,
+                });
+            }
+            // The reader is passed by `&mut` so it survives a retry: only
+            // failures of the `create_new` open (the `FileCreateError`
+            // marker) are retried or skipped, and that open happens before
+            // any of the content is read.
+            match write_file_to_disk(
+                &self.target_eol_strategy,
+                reflink_source.as_deref(),
+                &disk_path,
+                &mut reader,
+                exec_bit,
+                true,
+            )
+            .block_on()
+            {
+                // The file appeared between the `can_create_new_file` probe
+                // and the write — e.g. a case-colliding sibling task on a
+                // case-insensitive filesystem. Match the serial loop's probe
+                // semantics: record a placeholder and skip the path.
+                Err(err) if is_create_already_exists(&err) => {
+                    return Ok(CheckoutWriteOutcome {
+                        path,
+                        file_state: FileState::placeholder(),
+                        skipped: true,
+                    });
+                }
+                // The `create_new` open failed on a concurrently pruned
+                // parent directory; nothing was created, so there is nothing
+                // to clean up before retrying.
+                Err(err)
+                    if attempt < CREATE_PARENT_DIR_RETRY_ATTEMPTS
+                        && is_transient_create_not_found(&err) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (2u64.pow(attempt.min(6))).min(50),
+                    ));
+                }
+                result => {
+                    let file_state = result?;
+                    return Ok(CheckoutWriteOutcome {
+                        path,
+                        file_state,
+                        skipped: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Bounded thread pool writing checkout `File` entries concurrently. Used
+/// when the backend reads concurrently (a remote backend materializes up to
+/// `Store::concurrency()` blobs at once, at which point disk writes — not
+/// reads — dominate checkout). Deletions, symlinks, submodules, and conflicts
+/// keep their side effects on the consumer thread. Outcomes are collected and
+/// sorted before `FileStatesMap::merge_in`; the first error wins and stops
+/// new dispatches, matching the serial loop's fail-fast semantics.
+struct CheckoutWriterPool {
+    task_tx: Option<SyncSender<CheckoutWriteTask>>,
+    result_rx: Receiver<Result<CheckoutWriteOutcome, CheckoutError>>,
+    workers: Vec<JoinHandle<()>>,
+    failed: Arc<AtomicBool>,
+}
+
+impl CheckoutWriterPool {
+    fn new(writers: usize, context: CheckoutWriterContext) -> Self {
+        let context = Arc::new(context);
+        // Bounded queue: a full queue blocks dispatch, back-pressuring the
+        // buffered materialize stream against slow disk writes.
+        let (task_tx, task_rx) = sync_channel::<CheckoutWriteTask>(writers * 2);
+        let task_rx = Arc::new(Mutex::new(task_rx));
+        let (result_tx, result_rx) = channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let workers = (0..writers)
+            .map(|_| {
+                let context = Arc::clone(&context);
+                let task_rx = Arc::clone(&task_rx);
+                let result_tx = result_tx.clone();
+                let failed = Arc::clone(&failed);
+                std::thread::Builder::new()
+                    .name("checkout-writer".to_owned())
+                    .spawn(move || {
+                        loop {
+                            // Dispatch side closed: no more work.
+                            let Ok(task) = task_rx.lock().unwrap().recv() else {
+                                break;
+                            };
+                            // After a failure only drain the queue; the
+                            // consumer stops dispatching once it sees the
+                            // flag.
+                            if failed.load(AtomicOrdering::Relaxed) {
+                                continue;
+                            }
+                            let result = context.execute(task);
+                            if result.is_err() {
+                                failed.store(true, AtomicOrdering::Relaxed);
+                            }
+                            if result_tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .expect("failed to spawn checkout writer thread")
+            })
+            .collect();
+        Self {
+            task_tx: Some(task_tx),
+            result_rx,
+            workers,
+            failed,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Queue one write. Blocks when the queue is full (intended
+    /// back-pressure). Send only fails when all workers already exited, in
+    /// which case the failure is picked up from the results in `finish`.
+    fn dispatch(&self, task: CheckoutWriteTask) {
+        if let Some(task_tx) = &self.task_tx {
+            task_tx.send(task).ok();
+        }
+    }
+
+    /// Close the queue, wait for all workers, and return every outcome.
+    fn finish(mut self) -> Vec<Result<CheckoutWriteOutcome, CheckoutError>> {
+        self.task_tx = None;
+        let mut worker_panic = None;
+        for worker in self.workers.drain(..) {
+            if let Err(payload) = worker.join() {
+                worker_panic.get_or_insert(payload);
+            }
+        }
+        if let Some(payload) = worker_panic {
+            std::panic::resume_unwind(payload);
+        }
+        self.result_rx.try_iter().collect()
+    }
+}
+
 /// Functions to update local-disk files from the store.
 impl TreeState {
     async fn write_file(
@@ -2067,45 +2595,15 @@ impl TreeState {
         exec_bit: ExecBit,
         apply_eol_conversion: bool,
     ) -> Result<FileState, CheckoutError> {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true) // Don't overwrite un-ignored file. Don't follow symlink.
-            .open(disk_path)
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to open file {} for writing", disk_path.display()),
-                err: err.into(),
-            })?;
-        let contents = if apply_eol_conversion {
-            self.target_eol_strategy
-                .convert_eol_for_update(contents)
-                .await
-                .map_err(|err| CheckoutError::Other {
-                    message: "Failed to convert the EOL for the content".to_string(),
-                    err: err.into(),
-                })?
-        } else {
-            Box::new(contents)
-        };
-        let size = copy_async_to_sync(contents, &mut file)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: format!(
-                    "Failed to write the content to the file {}",
-                    disk_path.display()
-                ),
-                err: err.into(),
-            })?;
-        set_executable(exec_bit, disk_path)
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        // Read the file state from the file descriptor. That way, know that the file
-        // exists and is of the expected type, and the stat information is most likely
-        // accurate, except for other processes modifying the file concurrently (The
-        // mtime is set at write time and won't change when we close the file.)
-        let metadata = file
-            .metadata()
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        FileState::for_file(exec_bit, size as u64, &metadata)
-            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
+        write_file_to_disk(
+            &self.target_eol_strategy,
+            None,
+            disk_path,
+            contents,
+            exec_bit,
+            apply_eol_conversion,
+        )
+        .await
     }
 
     fn write_symlink(&self, disk_path: &Path, target: String) -> Result<FileState, CheckoutError> {
@@ -2179,8 +2677,10 @@ impl TreeState {
         let metadata = file
             .metadata()
             .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        FileState::for_file(exec_bit, size, &metadata)
-            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
+        let file_state = FileState::for_file(exec_bit, size, &metadata)
+            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))?;
+        record_file_written(size, false);
+        Ok(file_state)
     }
 
     pub fn check_out(&mut self, new_tree: &MergedTree) -> Result<CheckoutStats, CheckoutError> {
@@ -2237,6 +2737,29 @@ impl TreeState {
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
         let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
+        let reflink = checkout_reflink_enabled() && self.eol_update_is_identity;
+        // Materialize plain files with a pool of writer threads when the
+        // backend serves reads concurrently (remote backends): the buffered
+        // read stream then overlaps with disk writes instead of serializing
+        // behind them. Local backends (Git: concurrency() == 1) and
+        // VEX_CHECKOUT_WRITERS=0 keep the historical serial loop.
+        let writer_pool = if self.store.concurrency() > 1 {
+            let writers = checkout_writer_count();
+            (writers > 0).then(|| {
+                CheckoutWriterPool::new(
+                    writers,
+                    CheckoutWriterContext {
+                        working_copy_path: self.working_copy_path.clone(),
+                        target_eol_strategy: self.target_eol_strategy.clone(),
+                        store: self.store.clone(),
+                        reflink,
+                    },
+                )
+            })
+        } else {
+            None
+        };
+        let pool_active = writer_pool.is_some();
 
         let mut process_diff_entry = async |path: RepoPathBuf,
                                             before: MergedTreeValue,
@@ -2266,10 +2789,37 @@ impl TreeState {
                 return Ok(());
             }
 
+            // Plain-file writes go to the writer pool when it is active; each
+            // task creates its own parent chain and runs its own path-safety
+            // probes. Every other arm — deletions, symlinks, submodules, and
+            // conflicts — keeps its side effects on this (serial) consumer.
+            let after = match (&writer_pool, after) {
+                (Some(pool), MaterializedTreeValue::File(file))
+                    if !matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_))) =>
+                {
+                    let exec_bit =
+                        ExecBit::new_from_repo(file.executable, self.exec_policy, || {
+                            self.file_states().get_exec_bit(&path)
+                        });
+                    pool.dispatch(CheckoutWriteTask {
+                        id: file.id,
+                        reader: file.reader,
+                        exec_bit,
+                        before_present: before.is_present(),
+                        path,
+                    });
+                    return Ok(());
+                }
+                (_, after) => after,
+            };
+
             // This path and the previous one we did work for may have a common prefix. We
             // can adjust the "working copy" path to the parent directory which we know
             // is already created. If there is no common prefix, this will by default use
             // RepoPath::root() as the common prefix.
+            //
+            // In pool mode `prev_created_path` is never set (see below), so
+            // every entry creates its full parent chain.
             let (common_prefix, adjusted_diff_file_path) =
                 path.split_common_prefix(&prev_created_path);
 
@@ -2307,10 +2857,16 @@ impl TreeState {
                 // `create_parent_dirs` to ensure that the path is only set when
                 // no symlinks are encountered. Otherwise there could be
                 // opportunity for a filesystem write-what-where attack.
-                prev_created_path = path
-                    .parent()
-                    .map(RepoPath::to_owned)
-                    .expect("diff path has no parent");
+                //
+                // With the writer pool active the cache is skipped: pooled
+                // writes and deletions run concurrently with these serial
+                // arms, so a cached parent may vanish between entries.
+                if !pool_active {
+                    prev_created_path = path
+                        .parent()
+                        .map(RepoPath::to_owned)
+                        .expect("diff path has no parent");
+                }
 
                 disk_path
             };
@@ -2373,16 +2929,26 @@ impl TreeState {
                 MaterializedTreeValue::File(file) => {
                     let exec_bit =
                         ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
-                    self.write_file(&disk_path, file.reader, exec_bit, true)
-                        .await?
+                    let reflink_source = reflink
+                        .then(|| self.store.backend().cached_blob_path(&file.id))
+                        .flatten();
+                    write_file_to_disk(
+                        &self.target_eol_strategy,
+                        reflink_source.as_deref(),
+                        &disk_path,
+                        file.reader,
+                        exec_bit,
+                        true,
+                    )
+                    .await
                 }
                 MaterializedTreeValue::Symlink { id: _, target } => {
                     if self.symlink_support {
-                        self.write_symlink(&disk_path, target)?
+                        self.write_symlink(&disk_path, target)
                     } else {
                         // The fake symlink file shouldn't be executable.
                         self.write_file(&disk_path, target.as_bytes(), ExecBit(false), false)
-                            .await?
+                            .await
                     }
                 }
                 MaterializedTreeValue::GitSubmodule(_) => {
@@ -2396,7 +2962,7 @@ impl TreeState {
                             "warning: failed to create submodule directory {path:?}: {err}"
                         ),
                     }
-                    FileState::for_gitsubmodule()
+                    Ok(FileState::for_gitsubmodule())
                 }
                 MaterializedTreeValue::Tree(_) => {
                     panic!("unexpected tree entry in diff at {path:?}");
@@ -2416,12 +2982,17 @@ impl TreeState {
                     );
                     let contents =
                         materialize_merge_result_to_bytes(&file.contents, &file.labels, &options);
-                    let mut file_state =
-                        self.write_conflict(&disk_path, &contents, exec_bit).await?;
-                    file_state.materialized_conflict_data = Some(MaterializedConflictData {
-                        conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
-                    });
-                    file_state
+                    self.write_conflict(&disk_path, &contents, exec_bit)
+                        .await
+                        .map(|mut file_state| {
+                            file_state.materialized_conflict_data =
+                                Some(MaterializedConflictData {
+                                    conflict_marker_len: conflict_marker_len
+                                        .try_into()
+                                        .unwrap_or(u32::MAX),
+                                });
+                            file_state
+                        })
                 }
                 MaterializedTreeValue::OtherConflict { id, labels } => {
                     // Unless all terms are regular files, we can't do much
@@ -2429,8 +3000,21 @@ impl TreeState {
                     let contents = id.describe(&labels);
                     // Since this is a dummy file, it shouldn't be executable.
                     self.write_conflict(&disk_path, contents.as_bytes(), ExecBit(false))
-                        .await?
+                        .await
                 }
+            };
+            let file_state = match file_state {
+                // The target appeared between this thread's
+                // `can_create_new_file` probe and the write — a case-colliding
+                // *pooled* file write landing on a case-insensitive
+                // filesystem. Match the pooled writer's (and the serial
+                // probe's) skip semantics instead of aborting the checkout.
+                Err(err) if pool_active && is_checkout_already_exists(&err) => {
+                    changed_file_states.push((path, FileState::placeholder()));
+                    stats.skipped_files += 1;
+                    return Ok(());
+                }
+                file_state => file_state?,
             };
             changed_file_states.push((path, file_state));
             Ok(())
@@ -2469,23 +3053,84 @@ impl TreeState {
                 HashMap::new()
             };
 
+        // Errors don't return early here: the writer pool must be joined
+        // before this function returns, so the first error is captured and
+        // surfaced after the pool has been drained. Like the serial `?`
+        // returns this is fail-fast — no further entries are processed, the
+        // file states are not merged, and the tree is not updated.
+        let mut first_error: Option<CheckoutError> = None;
         while let Some((path, data)) = diff_stream.next().await {
-            let (before, after) = data?;
-            conflicts_to_rematerialize.remove(&path);
-            process_diff_entry(path, before, after).await?;
+            // A failed writer stops new dispatches; its error is collected
+            // from the pool results below.
+            if writer_pool.as_ref().is_some_and(|pool| pool.failed()) {
+                break;
+            }
+            match data {
+                Ok((before, after)) => {
+                    conflicts_to_rematerialize.remove(&path);
+                    if let Err(err) = process_diff_entry(path, before, after).await {
+                        first_error = Some(err);
+                        break;
+                    }
+                }
+                Err(err) => {
+                    first_error = Some(err.into());
+                    break;
+                }
+            }
         }
 
-        if !conflicts_to_rematerialize.is_empty() {
+        if first_error.is_none()
+            && !writer_pool.as_ref().is_some_and(|pool| pool.failed())
+            && !conflicts_to_rematerialize.is_empty()
+        {
             for (path, conflict) in conflicts_to_rematerialize {
-                let materialized =
-                    materialize_tree_value(&self.store, &path, conflict.clone(), new_tree.labels())
-                        .await?;
-                process_diff_entry(path, conflict, materialized).await?;
+                let materialized = match materialize_tree_value(
+                    &self.store,
+                    &path,
+                    conflict.clone(),
+                    new_tree.labels(),
+                )
+                .await
+                {
+                    Ok(materialized) => materialized,
+                    Err(err) => {
+                        first_error = Some(err.into());
+                        break;
+                    }
+                };
+                if let Err(err) = process_diff_entry(path, conflict, materialized).await {
+                    first_error = Some(err);
+                    break;
+                }
             }
 
             // We need to re-sort the changed file states since we may have inserted a
             // conflicted file out of order.
             changed_file_states.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
+        }
+
+        if let Some(pool) = writer_pool {
+            for result in pool.finish() {
+                match result {
+                    Ok(outcome) => {
+                        if outcome.skipped {
+                            stats.skipped_files += 1;
+                        }
+                        changed_file_states.push((outcome.path, outcome.file_state));
+                    }
+                    Err(err) => {
+                        first_error.get_or_insert(err);
+                    }
+                }
+            }
+            // Pooled writes complete out of order; restore `merge_in`'s
+            // strictly-sorted precondition.
+            changed_file_states.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
         }
 
         self.file_states
@@ -2969,6 +3614,8 @@ impl LockedLocalWorkingCopy {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
     use maplit::hashset;
@@ -2991,6 +3638,102 @@ mod tests {
             mtime: MillisSinceEpoch(0),
             size,
             materialized_conflict_data: None,
+        }
+    }
+
+    /// Reflink materialization either clones the source byte-identically
+    /// (with the exec bit applied and the file state derived from the
+    /// destination) or falls back cleanly, leaving the destination absent so
+    /// the streamed copy's `create_new` open succeeds.
+    #[test]
+    fn test_try_reflink_file() {
+        let test_start = SystemTime::now();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src = temp_dir.path().join("src");
+        let contents = b"reflink contents";
+        std::fs::write(&src, contents).unwrap();
+        // Backdate the source: cache blobs can be arbitrarily old, and
+        // clonefile(2) clones the source's mtime. The materialized file must
+        // get a fresh mtime so mtime-comparing build tools (make/ninja/cargo)
+        // see the checkout write as new.
+        File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(test_start - Duration::from_secs(1_000_000)),
+            )
+            .unwrap();
+        let dst = temp_dir.path().join("dst");
+        match try_reflink_file(&src, &dst, ExecBit(true)) {
+            Some(file_state) => {
+                assert_eq!(std::fs::read(&dst).unwrap(), contents);
+                assert_eq!(
+                    file_state.file_type,
+                    FileType::Normal {
+                        exec_bit: ExecBit(true)
+                    }
+                );
+                assert_eq!(file_state.size, contents.len() as u64);
+                #[cfg(unix)]
+                assert_ne!(dst.metadata().unwrap().permissions().mode() & 0o111, 0);
+                let dst_mtime = dst.metadata().unwrap().modified().unwrap();
+                assert!(
+                    dst_mtime >= test_start - Duration::from_secs(5),
+                    "reflinked file inherited the backdated source mtime: {dst_mtime:?}"
+                );
+            }
+            None => {
+                // Unsupported platform or filesystem: fall back cleanly.
+                assert!(!dst.exists());
+            }
+        }
+        // A missing source must never abort the checkout write, just fall
+        // back to the streamed copy.
+        let missing_dst = temp_dir.path().join("dst2");
+        assert!(
+            try_reflink_file(
+                &temp_dir.path().join("no-such-src"),
+                &missing_dst,
+                ExecBit(false)
+            )
+            .is_none()
+        );
+        assert!(!missing_dst.exists());
+        // A pre-existing destination (e.g. written by a case-colliding
+        // sibling task) must be left intact: the clone created nothing, so
+        // there is nothing to clean up, and the fallback's `create_new` open
+        // must fail like the serial path instead of silently overwriting.
+        let existing_dst = temp_dir.path().join("dst3");
+        std::fs::write(&existing_dst, b"someone else's contents").unwrap();
+        assert!(try_reflink_file(&src, &existing_dst, ExecBit(false)).is_none());
+        assert_eq!(
+            std::fs::read(&existing_dst).unwrap(),
+            b"someone else's contents"
+        );
+        // A dangling symlink planted at the destination must never be
+        // followed (clonefile(2) would otherwise create the clone at the
+        // symlink's target — a write-what-where): the reflink must fail
+        // without creating the target and without touching the symlink, so
+        // the streamed fallback's `create_new` open fails like the serial
+        // path.
+        #[cfg(unix)]
+        {
+            let symlink_dst = temp_dir.path().join("dst4");
+            let planted_target = temp_dir.path().join("planted-target");
+            std::os::unix::fs::symlink(&planted_target, &symlink_dst).unwrap();
+            assert!(try_reflink_file(&src, &symlink_dst, ExecBit(false)).is_none());
+            assert!(
+                !planted_target.exists(),
+                "reflink followed a dangling symlink at the destination"
+            );
+            assert!(
+                symlink_dst
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
         }
     }
 

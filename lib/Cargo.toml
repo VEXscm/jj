@@ -69,7 +69,10 @@ smallvec = { workspace = true }
 strsim = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+# rt-multi-thread + time: the Vex client's shared gRPC runtime
+# (vex.rs shared_grpc_runtime) and its retry/cancellation timers need them even
+# when jj-lib is built standalone (outside the vex workspace's unified features).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 toml_edit = { workspace = true }
 tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-webpki-roots", "tls-ring"] }
 tracing = { workspace = true }

@@ -3148,3 +3148,272 @@ fn test_always_store_empty_tree() -> TestResult {
     assert!(empty_tree.data.is_empty());
     Ok(())
 }
+
+/// The parallel checkout writer pool (`VEX_CHECKOUT_WRITERS` > 0 with a
+/// backend whose `concurrency()` > 1, like the test backend) must produce a
+/// byte-identical worktree, identical tracked file states, and identical
+/// checkout stats to the serial write loop (`VEX_CHECKOUT_WRITERS=0`) —
+/// across subdirectories, symlinks, executable bits, updates, type
+/// transitions, and deletions.
+#[test]
+fn test_checkout_parallel_writers_matches_serial() -> TestResult {
+    /// Recursively describe a worktree as sorted `(relative path, what)`
+    /// pairs, skipping `.jj`.
+    fn walk_worktree(root: &Path) -> std::io::Result<Vec<(String, String)>> {
+        fn visit(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.parent() == Some(root) && path.file_name().is_some_and(|name| name == ".jj")
+                {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/");
+                let metadata = path.symlink_metadata()?;
+                if metadata.file_type().is_symlink() {
+                    out.push((
+                        rel,
+                        format!("symlink -> {}", std::fs::read_link(&path)?.display()),
+                    ));
+                } else if metadata.is_dir() {
+                    out.push((rel, "dir".to_owned()));
+                    visit(&path, root, out)?;
+                } else {
+                    #[cfg(unix)]
+                    let exec = metadata.permissions().mode() & 0o111 != 0;
+                    #[cfg(windows)]
+                    let exec = false;
+                    out.push((
+                        rel,
+                        format!("file exec={exec} contents={:?}", std::fs::read(&path)?),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out)?;
+        out.sort();
+        Ok(out)
+    }
+
+    type FileStateSummary = (RepoPathBuf, jj_lib::local_working_copy::FileType, u64);
+    /// Everything the two write modes must agree on: stats of both checkouts,
+    /// the on-disk worktree, and the tracked file states.
+    type CheckoutRunResult = (
+        CheckoutStats,
+        CheckoutStats,
+        Vec<(String, String)>,
+        Vec<FileStateSummary>,
+    );
+
+    /// Run the same two checkouts (build up, then update with deletions and
+    /// type changes) with the given writer setting.
+    fn run_checkouts(writers: &str) -> TestResult<CheckoutRunResult> {
+        let mut test_workspace = TestWorkspace::init();
+        let repo = test_workspace.repo.clone();
+
+        let tree1 = create_tree_with(&repo, |builder| {
+            for i in 0..40 {
+                builder.file(
+                    &repo_path_buf(format!("dir{}/sub/file{i}", i % 5)),
+                    format!("contents {i}"),
+                );
+            }
+            builder.file(repo_path("top"), "top contents");
+            builder
+                .file(repo_path("bin/tool"), "#!/bin/sh\n")
+                .executable(true);
+            builder.file(repo_path("deep/a/b/c/d/leaf"), "deep");
+            builder.symlink(repo_path("links/link"), "top");
+            builder.file(repo_path("swap/kind"), "was a file");
+        });
+        let tree2 = create_tree_with(&repo, |builder| {
+            // dir3/dir4 are deleted entirely; even-numbered files get new
+            // contents, odd-numbered files are deleted.
+            for i in 0..40 {
+                if i % 5 >= 3 || i % 2 != 0 {
+                    continue;
+                }
+                builder.file(
+                    &repo_path_buf(format!("dir{}/sub/file{i}", i % 5)),
+                    format!("updated {i}"),
+                );
+            }
+            builder.file(repo_path("top"), "top contents");
+            // The exec bit flips off, and file <-> symlink transitions.
+            builder.file(repo_path("bin/tool"), "#!/bin/sh\n");
+            builder.file(repo_path("deep/a/b/c/d/leaf"), "deep updated");
+            builder.file(repo_path("links/link"), "now a file");
+            builder.symlink(repo_path("swap/kind"), "top");
+            builder
+                .file(repo_path("new/x/y/added"), "added")
+                .executable(true);
+        });
+        let commit1 = commit_with_tree(repo.store(), tree1);
+        let commit2 = commit_with_tree(repo.store(), tree2.clone());
+
+        let ws = &mut test_workspace.workspace;
+        // SAFETY: test-scoped env mutation; the setting only tunes the writer
+        // count and must never change checkout results (which is exactly what
+        // this test verifies).
+        unsafe { std::env::set_var("VEX_CHECKOUT_WRITERS", writers) };
+        let result = ws
+            .check_out(repo.op_id().clone(), None, &commit1)
+            .block_on()
+            .and_then(|stats1| {
+                ws.check_out(repo.op_id().clone(), None, &commit2)
+                    .block_on()
+                    .map(|stats2| (stats1, stats2))
+            });
+        unsafe { std::env::remove_var("VEX_CHECKOUT_WRITERS") };
+        let (stats1, stats2) = result?;
+
+        // The final worktree must snapshot back to exactly tree2.
+        let new_tree = test_workspace.snapshot()?;
+        assert_tree_eq!(new_tree, tree2);
+
+        let worktree = walk_worktree(test_workspace.workspace.workspace_root())?;
+        let wc: &LocalWorkingCopy = test_workspace
+            .workspace
+            .working_copy()
+            .downcast_ref()
+            .unwrap();
+        let file_states = wc
+            .file_states()?
+            .iter()
+            .map(|(path, state)| (path.to_owned(), state.file_type, state.size))
+            .collect_vec();
+        Ok((stats1, stats2, worktree, file_states))
+    }
+
+    let serial = run_checkouts("0")?;
+    let parallel = run_checkouts("4")?;
+    assert_eq!(parallel.0, serial.0, "initial checkout stats differ");
+    assert_eq!(parallel.1, serial.1, "update checkout stats differ");
+    assert_eq!(parallel.2, serial.2, "worktrees differ");
+    assert_eq!(parallel.3, serial.3, "tracked file states differ");
+    assert!(!serial.2.is_empty());
+    Ok(())
+}
+
+/// Repo paths that collide on a case-insensitive filesystem (e.g. `file0` vs
+/// `FILE0` on the default macOS APFS) must keep the serial loop's skip
+/// semantics under the parallel writer pool: exactly one entry of each
+/// colliding pair is written and the other is skipped with a placeholder
+/// state — never a checkout abort, and never two recorded states for one
+/// dentry.
+#[test]
+fn test_checkout_parallel_writers_case_colliding_paths() -> TestResult {
+    fn run_checkout(writers: &str) -> TestResult<(CheckoutStats, bool, usize)> {
+        let mut test_workspace = TestWorkspace::init();
+        let repo = test_workspace.repo.clone();
+        let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+        let is_icase_fs = check_icase_fs(&workspace_root);
+
+        // Many colliding pairs sharing one directory widen the probe->write
+        // race window that used to abort (or corrupt) the pooled checkout.
+        // The pair mates differ only in the trailing character's case so they
+        // sort (and thus dispatch to the pool) back-to-back.
+        let tree = create_tree_with(&repo, |builder| {
+            for i in 0..32 {
+                builder.file(
+                    &repo_path_buf(format!("dir/file{i}x")),
+                    format!("lower {i}"),
+                );
+                builder.file(
+                    &repo_path_buf(format!("dir/file{i}X")),
+                    format!("upper {i}"),
+                );
+            }
+        });
+        let commit = commit_with_tree(repo.store(), tree);
+
+        let ws = &mut test_workspace.workspace;
+        // SAFETY: test-scoped env mutation; the setting only tunes the writer
+        // count and must never change checkout results.
+        unsafe { std::env::set_var("VEX_CHECKOUT_WRITERS", writers) };
+        let result = ws.check_out(repo.op_id().clone(), None, &commit).block_on();
+        unsafe { std::env::remove_var("VEX_CHECKOUT_WRITERS") };
+        let stats = result?;
+        let on_disk = std::fs::read_dir(workspace_root.join("dir"))?.count();
+        Ok((stats, is_icase_fs, on_disk))
+    }
+
+    let (serial_stats, serial_icase, serial_on_disk) = run_checkout("0")?;
+    let (parallel_stats, parallel_icase, parallel_on_disk) = run_checkout("4")?;
+    assert_eq!(parallel_icase, serial_icase);
+    // All 64 entries are processed in both modes; on a case-insensitive
+    // filesystem exactly one of each colliding pair lands on disk and the
+    // other is counted as skipped.
+    assert_eq!(serial_stats.added_files, 64);
+    assert_eq!(parallel_stats.added_files, 64);
+    let expected_skipped = if serial_icase { 32 } else { 0 };
+    assert_eq!(serial_stats.skipped_files, expected_skipped);
+    assert_eq!(parallel_stats.skipped_files, expected_skipped, "parallel");
+    let expected_on_disk = if serial_icase { 32 } else { 64 };
+    assert_eq!(serial_on_disk, expected_on_disk);
+    assert_eq!(parallel_on_disk, expected_on_disk, "parallel");
+    Ok(())
+}
+
+/// A case-colliding file+symlink pair (one dentry on a case-insensitive
+/// filesystem) must keep the serial skip semantics under the writer pool: the
+/// pooled file write and the consumer thread's symlink write race for the one
+/// dentry, and whichever loses must be skipped with a placeholder — never a
+/// checkout abort (the consumer's symlink/conflict arms used to hard-fail on
+/// EEXIST when a pooled write landed after their probe).
+#[test]
+fn test_checkout_parallel_writers_case_colliding_file_and_symlink() -> TestResult {
+    fn run_checkout(writers: &str) -> TestResult<(CheckoutStats, bool, usize)> {
+        let mut test_workspace = TestWorkspace::init();
+        let repo = test_workspace.repo.clone();
+        let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+        let is_icase_fs = check_icase_fs(&workspace_root);
+
+        // The file mate sorts first ('N' < 'n'), so it is dispatched to the
+        // writer pool while the consumer thread immediately processes the
+        // colliding symlink — the interleaving where the consumer's probe can
+        // pass before the pooled write lands.
+        let tree = create_tree_with(&repo, |builder| {
+            for i in 0..32 {
+                builder.file(
+                    &repo_path_buf(format!("dir/link{i}NX")),
+                    format!("file {i}"),
+                );
+                builder.symlink(&repo_path_buf(format!("dir/link{i}nx")), "target");
+            }
+        });
+        let commit = commit_with_tree(repo.store(), tree);
+
+        let ws = &mut test_workspace.workspace;
+        // SAFETY: test-scoped env mutation; the setting only tunes the writer
+        // count and must never change checkout results.
+        unsafe { std::env::set_var("VEX_CHECKOUT_WRITERS", writers) };
+        let result = ws.check_out(repo.op_id().clone(), None, &commit).block_on();
+        unsafe { std::env::remove_var("VEX_CHECKOUT_WRITERS") };
+        let stats = result?;
+        let on_disk = std::fs::read_dir(workspace_root.join("dir"))?.count();
+        Ok((stats, is_icase_fs, on_disk))
+    }
+
+    let (serial_stats, serial_icase, serial_on_disk) = run_checkout("0")?;
+    let (parallel_stats, parallel_icase, parallel_on_disk) = run_checkout("4")?;
+    assert_eq!(parallel_icase, serial_icase);
+    // All 64 entries are processed in both modes; on a case-insensitive
+    // filesystem exactly one mate of each pair lands on disk (which one wins
+    // is racy in pool mode) and the other is counted as skipped.
+    assert_eq!(serial_stats.added_files, 64);
+    assert_eq!(parallel_stats.added_files, 64);
+    let expected_skipped = if serial_icase { 32 } else { 0 };
+    assert_eq!(serial_stats.skipped_files, expected_skipped);
+    assert_eq!(parallel_stats.skipped_files, expected_skipped, "parallel");
+    let expected_on_disk = if serial_icase { 32 } else { 64 };
+    assert_eq!(serial_on_disk, expected_on_disk);
+    assert_eq!(parallel_on_disk, expected_on_disk, "parallel");
+    Ok(())
+}

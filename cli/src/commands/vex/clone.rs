@@ -105,6 +105,9 @@ pub(crate) async fn cmd_vex_clone(
         let blob_mode = resolve_clone_blob_mode(args.fs, args.blob_mode);
         let working_copy_mode = resolve_working_copy_mode(args.fs, args.working_copy);
         let working_copy_factory = working_copy_factory(working_copy_mode);
+        // Virtual working copies materialize nothing at checkout, so skip the
+        // pre-checkout blob hydration for them.
+        let hydrate_blobs = !matches!(working_copy_mode, super::VexWorkingCopyMode::Virtual);
         Workspace::clone_vex(
             &settings,
             &canonical_wc_path,
@@ -112,6 +115,8 @@ pub(crate) async fn cmd_vex_clone(
             blob_mode,
             None,
             None,
+            hydrate_blobs,
+            &[],
             &*working_copy_factory,
             None,
         )
