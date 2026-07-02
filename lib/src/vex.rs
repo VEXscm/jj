@@ -459,6 +459,8 @@ pub enum VexClientError {
     PackDecode(String),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error("ref update rejected: {0}")]
+    RefUpdateRejected(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3465,6 +3467,98 @@ impl VexClient {
                     .map(|response| response.into_inner())
             })?;
         Ok(response.refs.into_iter().next().map(|r| r.target_commit_id))
+    }
+
+    /// Resolve many refs by exact name in one round trip; names with no
+    /// stored ref are simply absent from the result. Used for batched
+    /// mapping-ref lookups (e.g. materialization git<->native identity maps)
+    /// where a `resolve_ref`-per-name loop would be one network round trip
+    /// per row.
+    pub async fn resolve_refs(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<jj_backend_api::RefValue>, VexClientError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .resolve_refs(Self::auth_request(
+                        ResolveRefsRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            names: names.to_vec(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
+        Ok(response.refs)
+    }
+
+    /// List every ref whose name starts with `prefix` in one round trip. The
+    /// backend returns the whole matching set unpaginated, so this is only
+    /// suitable for namespaces of bounded size (e.g. a materialization
+    /// identity-mapping namespace of tens of thousands of rows) — not for
+    /// unbounded namespaces like `refs/heads/`.
+    pub async fn list_refs(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<jj_backend_api::RefValue>, VexClientError> {
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .list_refs(Self::auth_request(
+                        jj_backend_api::ListRefsRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            prefix: prefix.to_string(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
+        Ok(response.refs)
+    }
+
+    /// Apply a batch of ref writes. Each update's `expected_version: None`
+    /// inserts a brand-new ref (rejected if one already exists), while
+    /// `Some(version)` CAS-updates an existing ref. Not retried internally:
+    /// callers of batched, content-addressed writes (e.g. materialization
+    /// mapping refs) should pre-filter to only the updates that are actually
+    /// needed (see `materialize_mapping::plan_chunk_writes` in vex-cli) so a
+    /// retry at the call site is safe to re-send verbatim. Returns an error
+    /// if the backend rejects the batch (CAS conflict or validation failure);
+    /// the message is the backend's `error_message`.
+    pub async fn update_refs(
+        &self,
+        updates: Vec<jj_backend_api::RefUpdate>,
+    ) -> Result<(), VexClientError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+            client
+                .update_refs(Self::auth_request(
+                    jj_backend_api::UpdateRefsRequest {
+                        tenant_id: self.config.tenant_id.clone(),
+                        repo_id: self.config.repo_id.clone(),
+                        updates,
+                        policy_lease: String::new(),
+                    },
+                    self.config.access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(VexClientError::RefUpdateRejected(response.error_message))
+        }
     }
 
     pub async fn get_clone_manifest(
