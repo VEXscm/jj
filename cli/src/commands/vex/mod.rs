@@ -15,6 +15,7 @@
 mod clone;
 mod init;
 mod repo_auth;
+mod repository_address;
 
 use clap::Subcommand;
 use jj_lib::local_working_copy::LocalWorkingCopyFactory;

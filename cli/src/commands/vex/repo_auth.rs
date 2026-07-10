@@ -23,6 +23,8 @@ use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::repository_address::RepositoryAccessCatalogEntry;
+use super::repository_address::resolve_repository_address;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
 
@@ -50,6 +52,9 @@ pub(crate) struct RepoAuthArgs {
 pub(crate) struct ResolvedRepoAuth {
     pub endpoint: String,
     pub access_token: Option<String>,
+    /// Server-confirmed repository address. New catalogs advertise `home`;
+    /// legacy catalogs intentionally retain their `main` projection.
+    pub repository_slug: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -66,18 +71,6 @@ struct FileApiConfig {
 #[derive(Clone, Debug, Deserialize)]
 struct RepositoryAccessCatalogResponse {
     repositories: Vec<RepositoryAccessCatalogEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct RepositoryAccessCatalogEntry {
-    organization_slug: String,
-    repository_slug: String,
-    #[serde(default)]
-    repository_scope_kind: Option<String>,
-    #[serde(default)]
-    git_https_supported: Option<bool>,
-    jj_grpc_endpoint: Option<String>,
-    jj_grpc_supported: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -102,19 +95,21 @@ pub(crate) async fn resolve_repo_auth(
                 .clone()
                 .unwrap_or_else(|| jj_lib::vex::DEFAULT_ENDPOINT.to_string()),
             access_token: Some(access_token),
+            repository_slug: repo_slug.to_string(),
         });
     }
 
     let (base_url, api_token) = resolve_api_auth(args)?;
     let catalog = fetch_repository_access_catalog(&base_url, &api_token).await?;
-    let entry = catalog
-        .into_iter()
-        .find(|entry| entry.organization_slug == tenant_slug && entry.repository_slug == repo_slug)
+    let resolved = resolve_repository_address(&catalog, tenant_slug, repo_slug)
+        .map_err(user_error)?
         .ok_or_else(|| {
             user_error(format!(
                 "repository `{tenant_slug}/{repo_slug}` was not found in your accessible Vex catalog"
             ))
         })?;
+    let entry = resolved.entry;
+    let canonical_repo_slug = resolved.token_slug().to_string();
 
     if entry.repository_scope_kind.as_deref() == Some("virtual_repository") {
         return Err(user_error(
@@ -134,15 +129,21 @@ pub(crate) async fn resolve_repo_auth(
     let endpoint = args
         .endpoint
         .clone()
-        .or(entry.jj_grpc_endpoint)
+        .or_else(|| entry.jj_grpc_endpoint.clone())
         .unwrap_or_else(|| jj_lib::vex::DEFAULT_ENDPOINT.to_string());
-    let access_token =
-        create_repository_access_token(&base_url, &api_token, tenant_slug, repo_slug, token_name)
-            .await?;
+    let access_token = create_repository_access_token(
+        &base_url,
+        &api_token,
+        tenant_slug,
+        &canonical_repo_slug,
+        token_name,
+    )
+    .await?;
 
     Ok(ResolvedRepoAuth {
         endpoint,
         access_token: Some(access_token),
+        repository_slug: canonical_repo_slug,
     })
 }
 

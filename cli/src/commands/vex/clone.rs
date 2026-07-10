@@ -94,7 +94,7 @@ pub(crate) async fn cmd_vex_clone(
         let config = VexClient::get_repo(
             &auth.endpoint,
             tenant_slug,
-            repo_slug,
+            &auth.repository_slug,
             auth.access_token.as_deref(),
         )
         .await

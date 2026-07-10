@@ -81,7 +81,7 @@ pub(crate) async fn cmd_vex_init(
     let config = VexClient::init_repo(
         &auth.endpoint,
         tenant_slug,
-        repo_slug,
+        &auth.repository_slug,
         auth.access_token.as_deref(),
     )
     .await

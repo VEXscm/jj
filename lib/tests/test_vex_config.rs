@@ -48,6 +48,29 @@ fn test_vex_repo_config_round_trips_from_repo_and_store_paths() {
 }
 
 #[test]
+fn test_legacy_main_vex_repo_config_loads_without_rewrite() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let metadata_path = repo_dir.join("vex.json");
+    let legacy_json = r#"{
+  "endpoint": "http://127.0.0.1:50051",
+  "tenant_id": "backend-tenant-id",
+  "tenant_slug": "acme",
+  "repo_id": "backend-repo-id",
+  "repo_slug": "main"
+}"#;
+    std::fs::write(&metadata_path, legacy_json).unwrap();
+
+    let config = VexRepoConfig::load_from_repo_path(&repo_dir).unwrap();
+
+    assert_eq!(config.repo_slug, "main");
+    assert_eq!(config.tenant_id, "backend-tenant-id");
+    assert_eq!(config.repo_id, "backend-repo-id");
+    assert_eq!(std::fs::read_to_string(metadata_path).unwrap(), legacy_json);
+}
+
+#[test]
 fn test_vex_repo_config_missing_store_metadata_reports_repo_metadata_path() {
     let temp_dir = tempfile::tempdir().unwrap();
     let repo_dir = temp_dir.path().join("repo");
