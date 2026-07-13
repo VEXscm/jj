@@ -540,7 +540,13 @@ impl VexRepoConfig {
 
     pub fn write_to_repo_path(&self, repo_path: &Path) -> Result<(), VexConfigError> {
         let path = Self::metadata_path_for_repo(repo_path);
-        fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| VexConfigError::InvalidStorePath(path.clone()))?;
+        let contents = serde_json::to_vec_pretty(self)?;
+        let mut temporary = NamedTempFile::new_in(parent)?;
+        temporary.write_all(&contents)?;
+        temporary.persist(&path).map_err(|error| error.error)?;
         Ok(())
     }
 }
