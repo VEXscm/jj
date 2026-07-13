@@ -530,7 +530,7 @@ impl Workspace {
         have_snapshot_commit_ids: &[String],
         working_copy_factory: &dyn WorkingCopyFactory,
         progress: Option<&crate::vex::CloneProgressFn>,
-    ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
+    ) -> Result<(Self, Arc<ReadonlyRepo>, Option<String>), WorkspaceInitError> {
         if let Some(progress) = progress {
             progress(crate::vex::CloneProgress::Connecting);
         }
@@ -636,17 +636,19 @@ impl Workspace {
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
-            let start_commit = match target_commit {
-                Some(commit_id) => repo
-                    .store()
-                    .get_commit_async(commit_id)
-                    .await
-                    .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
+            let (start_commit, resolved_trunk) = match target_commit {
+                Some(commit_id) => (
+                    repo.store()
+                        .get_commit_async(commit_id)
+                        .await
+                        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
+                    None,
+                ),
                 None => {
                     if let Some(commit) =
                         clone_vex_git_ref_start_commit(&repo, &store_path, server_trunk).await?
                     {
-                        commit
+                        (commit, server_trunk.map(str::to_owned))
                     } else {
                         clone_vex_start_commit(&repo, server_trunk).await?
                     }
@@ -720,13 +722,13 @@ impl Workspace {
                 }
                 None => init_working_copy.await?,
             };
-            let repo = if let Some(server_trunk) = server_trunk {
+            let repo = if let Some(resolved_trunk) = resolved_trunk.as_deref() {
                 let mut tx = repo.start_transaction();
                 tx.repo_mut().set_local_bookmark_target(
-                    server_trunk.as_ref(),
+                    resolved_trunk.as_ref(),
                     crate::op_store::RefTarget::normal(start_commit.id().clone()),
                 );
-                tx.commit("set server trunk bookmark").await?
+                tx.commit("set resolved trunk bookmark").await?
             } else {
                 repo
             };
@@ -735,9 +737,12 @@ impl Workspace {
             let workspace = Self::new(workspace_root, repo_dir, working_copy, repo_loader)?;
             workspace_store.add(workspace.workspace_name(), workspace.workspace_root())?;
             if let Some(progress) = progress {
+                if let Some(name) = resolved_trunk.as_ref() {
+                    progress(crate::vex::CloneProgress::TrunkResolved { name: name.clone() });
+                }
                 progress(crate::vex::CloneProgress::Done);
             }
-            Ok((workspace, repo))
+            Ok((workspace, repo, resolved_trunk))
         }
         .await
         .inspect_err(|_err| {
@@ -1046,10 +1051,10 @@ async fn clone_vex_start_commit(
     // bookmark genuinely doesn't exist do we fall back to the local
     // main/master/trunk guesses below.
     server_trunk: Option<&str>,
-) -> Result<Commit, WorkspaceInitError> {
+) -> Result<(Commit, Option<String>), WorkspaceInitError> {
     let mut head_ids = repo.view().heads().iter().cloned().collect::<Vec<_>>();
     if head_ids.is_empty() {
-        return Ok(repo.store().root_commit());
+        return Ok((repo.store().root_commit(), None));
     }
     head_ids.sort();
     let head_id_set = head_ids.iter().cloned().collect::<HashSet<_>>();
@@ -1060,7 +1065,7 @@ async fn clone_vex_start_commit(
         if let Some(commit) =
             clone_vex_bookmark_head(repo, server_trunk, &head_id_set, false).await?
         {
-            return Ok(commit);
+            return Ok((commit, Some(server_trunk.to_owned())));
         }
     }
     // Fallback when the server didn't supply a trunk (or its bookmark doesn't
@@ -1071,16 +1076,17 @@ async fn clone_vex_start_commit(
         if let Some(commit) =
             clone_vex_bookmark_head(repo, bookmark_name, &head_id_set, true).await?
         {
-            return Ok(commit);
+            return Ok((commit, Some(bookmark_name.to_owned())));
         }
     }
-    for (_, target) in repo.view().local_bookmarks() {
+    for (name, target) in repo.view().local_bookmarks() {
         if let Some(head_id) = target.as_normal().filter(|id| head_id_set.contains(*id)) {
-            return repo
+            let commit = repo
                 .store()
                 .get_commit_async(head_id)
                 .await
-                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())));
+                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+            return Ok((commit, Some(name.as_str().to_owned())));
         }
     }
     if let Some(head_id) = repo
@@ -1089,14 +1095,15 @@ async fn clone_vex_start_commit(
         .as_normal()
         .filter(|id| head_id_set.contains(*id))
     {
-        return repo
+        let commit = repo
             .store()
             .get_commit_async(head_id)
             .await
-            .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())));
+            .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+        return Ok((commit, None));
     }
     if let Some(commit) = clone_vex_recent_workspace_commit_from_ops(repo).await? {
-        return Ok(commit);
+        return Ok((commit, None));
     }
     for head_id in repo.view().wc_commit_ids().values() {
         if head_id_set.contains(head_id) {
@@ -1105,7 +1112,10 @@ async fn clone_vex_start_commit(
                 .get_commit_async(head_id)
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-            return clone_vex_peel_discardable_wc_commit(repo, commit).await;
+            return Ok((
+                clone_vex_peel_discardable_wc_commit(repo, commit).await?,
+                None,
+            ));
         }
     }
     let mut selected_commit = None;
@@ -1122,7 +1132,10 @@ async fn clone_vex_start_commit(
             selected_commit = Some(commit);
         }
     }
-    Ok(selected_commit.expect("non-empty heads should produce a checkout target"))
+    Ok((
+        selected_commit.expect("non-empty heads should produce a checkout target"),
+        None,
+    ))
 }
 
 async fn clone_vex_git_ref_start_commit(
@@ -1580,8 +1593,9 @@ mod tests {
         );
         let repo = tx.commit("create multiple heads").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
+        let (start_commit, resolved_trunk) = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), main_head.id());
+        assert_eq!(resolved_trunk.as_deref(), Some("main"));
         assert_ne!(start_commit.id(), fallback_head.id());
         Ok(())
     }
@@ -1629,8 +1643,9 @@ mod tests {
             .commit("create remote trunk and local bookmark")
             .block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
+        let (start_commit, resolved_trunk) = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), master_head.id());
+        assert_eq!(resolved_trunk.as_deref(), Some("master"));
         assert_ne!(start_commit.id(), codex_head.id());
         Ok(())
     }
@@ -1679,9 +1694,46 @@ mod tests {
             .commit("create remote trunk and local bookmark")
             .block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo, Some("master")).block_on()?;
+        let (start_commit, resolved_trunk) =
+            clone_vex_start_commit(&repo, Some("master")).block_on()?;
         assert_eq!(start_commit.id(), master_head.id());
+        assert_eq!(resolved_trunk.as_deref(), Some("master"));
         assert_ne!(start_commit.id(), codex_head.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_start_commit_ignores_missing_server_trunk() -> Result<(), WorkspaceInitError>
+    {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let master_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_remote_bookmark(
+            crate::ref_name::RemoteRefSymbol {
+                name: "master".as_ref(),
+                remote: "vex".as_ref(),
+            },
+            crate::op_store::RemoteRef {
+                target: crate::op_store::RefTarget::normal(master_head.id().clone()),
+                state: crate::op_store::RemoteRefState::Tracked,
+            },
+        );
+        let repo = tx.commit("create master without main").block_on()?;
+
+        let (start_commit, resolved_trunk) =
+            clone_vex_start_commit(&repo, Some("main")).block_on()?;
+
+        assert_eq!(start_commit.id(), master_head.id());
+        assert_eq!(resolved_trunk.as_deref(), Some("master"));
         Ok(())
     }
 
@@ -1748,8 +1800,10 @@ mod tests {
         assert!(heads.contains(master_child.id()));
         assert!(heads.contains(codex_head.id()));
 
-        let start_commit = clone_vex_start_commit(&repo, Some("master")).block_on()?;
+        let (start_commit, resolved_trunk) =
+            clone_vex_start_commit(&repo, Some("master")).block_on()?;
         assert_eq!(start_commit.id(), master_head.id());
+        assert_eq!(resolved_trunk.as_deref(), Some("master"));
         assert_ne!(start_commit.id(), codex_head.id());
         assert_ne!(start_commit.id(), master_child.id());
         Ok(())
@@ -1791,7 +1845,7 @@ mod tests {
         tx.set_workspace_name("secondary".as_ref());
         let repo = tx.commit("record secondary workspace").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
+        let (start_commit, _) = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), other_head.id());
         assert_ne!(start_commit.id(), default_head.id());
         Ok(())
@@ -1823,7 +1877,7 @@ mod tests {
             .map_err(|err| CheckOutCommitError::EditCommit(err.into()))?;
         let repo = tx.commit("record discardable workspace").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
+        let (start_commit, _) = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), base.id());
         Ok(())
     }
@@ -1853,7 +1907,7 @@ mod tests {
             .map_err(CheckOutCommitError::CreateCommit)?;
         let repo = tx.commit("create anonymous heads").block_on()?;
 
-        let start_commit = clone_vex_start_commit(&repo, None).block_on()?;
+        let (start_commit, _) = clone_vex_start_commit(&repo, None).block_on()?;
         assert_eq!(start_commit.id(), newer_head.id());
         assert_ne!(start_commit.id(), older_head.id());
         Ok(())

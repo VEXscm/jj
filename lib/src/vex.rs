@@ -417,6 +417,11 @@ pub enum CloneProgress {
         /// Total files to write.
         files_total: u64,
     },
+    /// The clone selected this existing upstream bookmark as its trunk.
+    TrunkResolved {
+        /// Bookmark name that should back the repo-local `trunk()` alias.
+        name: String,
+    },
     /// The clone is complete.
     Done,
 }
