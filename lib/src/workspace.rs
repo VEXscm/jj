@@ -187,17 +187,18 @@ async fn init_working_copy_at(
     .await
 }
 
-async fn init_working_copy_with_parents(
+/// Commits the operation that adds a workspace to `repo`.
+///
+/// `local_bookmark` is only used by Vex clones to create the local trunk
+/// bookmark in the same operation as the workspace. Keeping those mutations
+/// together means the clone can retry their single op-head CAS as one atomic
+/// view update.
+async fn commit_workspace_operation(
     repo: &Arc<ReadonlyRepo>,
-    workspace_root: &Path,
-    jj_dir: &Path,
-    working_copy_factory: &dyn WorkingCopyFactory,
-    workspace_name: WorkspaceNameBuf,
+    workspace_name: &WorkspaceNameBuf,
     start_commits: &[Commit],
-) -> Result<(Box<dyn WorkingCopy>, Arc<ReadonlyRepo>), WorkspaceInitError> {
-    let working_copy_state_path = jj_dir.join("working_copy");
-    std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
-
+    local_bookmark: Option<(&str, &CommitId)>,
+) -> Result<Arc<ReadonlyRepo>, WorkspaceInitError> {
     let root_commit;
     let start_commits = if start_commits.is_empty() {
         root_commit = repo.store().root_commit();
@@ -233,14 +234,28 @@ async fn init_working_copy_with_parents(
                 .map_err(CheckOutCommitError::EditCommit)?;
         }
     }
-    let repo = tx
-        .commit(format!("add workspace '{}'", workspace_name.as_symbol()))
-        .await?;
+    if let Some((bookmark_name, commit_id)) = local_bookmark {
+        tx.repo_mut().set_local_bookmark_target(
+            bookmark_name.as_ref(),
+            crate::op_store::RefTarget::normal(commit_id.clone()),
+        );
+    }
+    tx.commit(format!("add workspace '{}'", workspace_name.as_symbol()))
+        .await
+        .map_err(Into::into)
+}
 
+async fn finish_init_working_copy(
+    repo: &Arc<ReadonlyRepo>,
+    workspace_root: &Path,
+    working_copy_state_path: &Path,
+    working_copy_factory: &dyn WorkingCopyFactory,
+    workspace_name: WorkspaceNameBuf,
+) -> Result<Box<dyn WorkingCopy>, WorkspaceInitError> {
     let mut working_copy = working_copy_factory.init_working_copy(
         repo.store().clone(),
         workspace_root.to_path_buf(),
-        working_copy_state_path.clone(),
+        working_copy_state_path.to_path_buf(),
         repo.op_id().clone(),
         workspace_name,
         repo.settings(),
@@ -261,6 +276,146 @@ async fn init_working_copy_with_parents(
     }
     let working_copy_type_path = working_copy_state_path.join("type");
     fs::write(&working_copy_type_path, working_copy.name()).context(&working_copy_type_path)?;
+    Ok(working_copy)
+}
+
+async fn init_working_copy_with_parents(
+    repo: &Arc<ReadonlyRepo>,
+    workspace_root: &Path,
+    jj_dir: &Path,
+    working_copy_factory: &dyn WorkingCopyFactory,
+    workspace_name: WorkspaceNameBuf,
+    start_commits: &[Commit],
+) -> Result<(Box<dyn WorkingCopy>, Arc<ReadonlyRepo>), WorkspaceInitError> {
+    let working_copy_state_path = jj_dir.join("working_copy");
+    std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
+
+    let repo = commit_workspace_operation(repo, &workspace_name, start_commits, None).await?;
+    let working_copy = finish_init_working_copy(
+        &repo,
+        workspace_root,
+        &working_copy_state_path,
+        working_copy_factory,
+        workspace_name,
+    )
+    .await?;
+    Ok((working_copy, repo))
+}
+
+/// Vex's production op-head store uses a strict single-head CAS. A large
+/// clone can spend many minutes fetching metadata after loading its initial
+/// operation, so its final workspace transaction is often based on an old
+/// operation head. Retrying the already-written operation cannot work: the
+/// server validates that the operation's parent ids equal the CAS expected
+/// head. Instead, reload the current operation and rebuild the workspace view
+/// mutation on top of it. The workspace name is unique to this clone, so this
+/// preserves concurrent view changes rather than replacing them.
+const MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS: u32 = 3;
+
+fn is_vex_op_heads_cas_conflict(error: &TransactionCommitError) -> bool {
+    matches!(
+        error,
+        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write { source, .. })
+            if source.to_string().contains("CAS conflict on op heads")
+    )
+}
+
+fn vex_clone_local_bookmark_to_set<'name, 'commit>(
+    repo: &ReadonlyRepo,
+    resolved_trunk: Option<&'name str>,
+    initial_target: Option<&crate::op_store::RefTarget>,
+    start_commit: &'commit Commit,
+) -> Option<(&'name str, &'commit CommitId)> {
+    let (name, initial_target) = resolved_trunk.zip(initial_target)?;
+    let bookmark_name: &crate::ref_name::RefName = name.as_ref();
+    (repo.view().get_local_bookmark(bookmark_name) == initial_target)
+        .then_some((name, start_commit.id()))
+}
+
+async fn reload_vex_clone_repo_at_head(
+    repo: &Arc<ReadonlyRepo>,
+) -> Result<Arc<ReadonlyRepo>, WorkspaceInitError> {
+    repo.reload_at_head()
+        .await
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))
+}
+
+async fn commit_vex_clone_workspace_operation(
+    repo: &Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceNameBuf,
+    start_commit: &Commit,
+    resolved_trunk: Option<&str>,
+) -> Result<Arc<ReadonlyRepo>, WorkspaceInitError> {
+    let initial_resolved_trunk_target = resolved_trunk.map(|name| {
+        let bookmark_name: &crate::ref_name::RefName = name.as_ref();
+        repo.view().get_local_bookmark(bookmark_name).clone()
+    });
+    // The clone's first `load_at_head()` happens before manifest/prefetch work.
+    // Refresh immediately before constructing the write transaction, then do
+    // so again after an exact CAS rejection. Each attempt writes a new
+    // operation whose parent is the currently published head.
+    let mut repo = reload_vex_clone_repo_at_head(repo).await?;
+    let mut attempt = 1;
+    loop {
+        // A clone's workspace name is fresh, but the resolved trunk bookmark
+        // is shared state. If another operation moved it while this clone was
+        // fetching, preserve that newer value instead of resetting it to the
+        // clone's earlier checkout target.
+        let local_bookmark = vex_clone_local_bookmark_to_set(
+            &repo,
+            resolved_trunk,
+            initial_resolved_trunk_target.as_ref(),
+            start_commit,
+        );
+        match commit_workspace_operation(
+            &repo,
+            workspace_name,
+            std::slice::from_ref(start_commit),
+            local_bookmark,
+        )
+        .await
+        {
+            Ok(repo) => return Ok(repo),
+            Err(WorkspaceInitError::TransactionCommit(error))
+                if attempt < MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS
+                    && is_vex_op_heads_cas_conflict(&error) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS,
+                    "vex clone workspace op-head CAS conflict; reloading and retrying"
+                );
+                repo = reload_vex_clone_repo_at_head(&repo).await?;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn init_vex_clone_working_copy_at(
+    repo: &Arc<ReadonlyRepo>,
+    workspace_root: &Path,
+    jj_dir: &Path,
+    working_copy_factory: &dyn WorkingCopyFactory,
+    workspace_name: WorkspaceNameBuf,
+    start_commit: &Commit,
+    resolved_trunk: Option<&str>,
+) -> Result<(Box<dyn WorkingCopy>, Arc<ReadonlyRepo>), WorkspaceInitError> {
+    let working_copy_state_path = jj_dir.join("working_copy");
+    std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
+
+    let repo =
+        commit_vex_clone_workspace_operation(repo, &workspace_name, start_commit, resolved_trunk)
+            .await?;
+    let working_copy = finish_init_working_copy(
+        &repo,
+        workspace_root,
+        &working_copy_state_path,
+        working_copy_factory,
+        workspace_name,
+    )
+    .await?;
     Ok((working_copy, repo))
 }
 
@@ -676,13 +831,14 @@ impl Workspace {
                 progress(crate::vex::CloneProgress::CheckingOut);
             }
             let workspace_name = vex_clone_workspace_name(workspace_root);
-            let init_working_copy = init_working_copy_at(
+            let init_working_copy = init_vex_clone_working_copy_at(
                 &repo,
                 workspace_root,
                 &jj_dir,
                 working_copy_factory,
                 workspace_name,
                 &start_commit,
+                resolved_trunk.as_deref(),
             );
             let (working_copy, repo) = match progress {
                 // Materializing progress: the checkout has no progress channel
@@ -721,16 +877,6 @@ impl Workspace {
                     checkout_result?
                 }
                 None => init_working_copy.await?,
-            };
-            let repo = if let Some(resolved_trunk) = resolved_trunk.as_deref() {
-                let mut tx = repo.start_transaction();
-                tx.repo_mut().set_local_bookmark_target(
-                    resolved_trunk.as_ref(),
-                    crate::op_store::RefTarget::normal(start_commit.id().clone()),
-                );
-                tx.commit("set resolved trunk bookmark").await?
-            } else {
-                repo
             };
             let repo_loader = repo.loader().clone();
             let repo_dir = dunce::canonicalize(&repo_dir).context(&repo_dir)?;
@@ -1564,6 +1710,121 @@ mod tests {
             RepoInitError::Path(err) => WorkspaceInitError::Path(err),
         })?;
         Ok((temp_dir, repo))
+    }
+
+    fn vex_op_heads_cas_conflict_error() -> TransactionCommitError {
+        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
+            new_op_id: OperationId::new(vec![7; 32]),
+            source: Box::new(std::io::Error::other("CAS conflict on op heads")),
+        })
+    }
+
+    #[test]
+    fn test_vex_clone_workspace_retry_only_matches_op_head_cas_conflicts() {
+        assert!(is_vex_op_heads_cas_conflict(
+            &vex_op_heads_cas_conflict_error()
+        ));
+
+        let unrelated_write = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
+            new_op_id: OperationId::new(vec![7; 32]),
+            source: Box::new(std::io::Error::other("connection reset by peer")),
+        });
+        assert!(!is_vex_op_heads_cas_conflict(&unrelated_write));
+
+        let read_error = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Read(Box::new(
+            std::io::Error::other("CAS conflict on op heads"),
+        )));
+        assert!(!is_vex_op_heads_cas_conflict(&read_error));
+    }
+
+    #[test]
+    fn test_clone_workspace_operation_adds_local_trunk_in_same_view_update()
+    -> Result<(), WorkspaceInitError> {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let start_commit = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("clone start")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let repo = tx.commit("create clone start").block_on()?;
+
+        let workspace_name: WorkspaceNameBuf = "vex-clone-test".into();
+        let repo = commit_workspace_operation(
+            &repo,
+            &workspace_name,
+            std::slice::from_ref(&start_commit),
+            Some(("main", start_commit.id())),
+        )
+        .block_on()?;
+
+        assert!(
+            repo.view()
+                .get_wc_commit_id(workspace_name.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            repo.view().get_local_bookmark("main".as_ref()).as_normal(),
+            Some(start_commit.id())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_vex_clone_workspace_preserves_concurrently_moved_trunk()
+    -> Result<(), WorkspaceInitError> {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let clone_start = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("clone start")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_local_bookmark_target(
+            "main".as_ref(),
+            crate::op_store::RefTarget::normal(clone_start.id().clone()),
+        );
+        let repo = tx.commit("create clone start").block_on()?;
+        let initial_trunk_target = repo.view().get_local_bookmark("main".as_ref()).clone();
+
+        let mut tx = repo.start_transaction();
+        let advanced_trunk = tx
+            .repo_mut()
+            .new_commit(vec![clone_start.id().clone()], clone_start.tree())
+            .set_description("concurrent trunk advance")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_local_bookmark_target(
+            "main".as_ref(),
+            crate::op_store::RefTarget::normal(advanced_trunk.id().clone()),
+        );
+        let repo = tx.commit("advance trunk concurrently").block_on()?;
+
+        assert_eq!(
+            vex_clone_local_bookmark_to_set(
+                &repo,
+                Some("main"),
+                Some(&initial_trunk_target),
+                &clone_start,
+            ),
+            None
+        );
+        assert_eq!(
+            repo.view().get_local_bookmark("main".as_ref()).as_normal(),
+            Some(advanced_trunk.id())
+        );
+        Ok(())
     }
 
     #[test]
