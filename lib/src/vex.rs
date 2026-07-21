@@ -127,6 +127,22 @@ pub(crate) async fn shared_runtime_sleep(duration: Duration) {
 /// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// A `PutObjects` batch is content-addressed and create-if-missing, so a
+/// response lost during an edge reload may safely be retried verbatim. Keep the
+/// retry window deliberately short: bulk import has many batches in flight and
+/// should fail clearly rather than retaining all of their bodies indefinitely.
+const PIPELINED_PUT_RETRY_ATTEMPTS: usize = 5;
+const PIPELINED_PUT_RETRY_BASE_MS: u64 = 250;
+const PIPELINED_PUT_RETRY_CAP_MS: u64 = 2_000;
+
+/// `CommitOperation` has an explicit replay-success response for an already
+/// published op head. That makes the exact maintenance rejection safe to
+/// retry, but it can last much longer than a transport blip while a shadow GC
+/// pass walks a large Git mirror.
+const COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS: usize = 24;
+const COMMIT_OPERATION_MAINTENANCE_RETRY_BASE_MS: u64 = 1_000;
+const COMMIT_OPERATION_MAINTENANCE_RETRY_CAP_MS: u64 = 15_000;
+
 /// Read a non-negative seconds value from `name`, falling back to `default` when
 /// unset or unparseable. Used for env-tunable gRPC connection timeouts.
 fn env_secs(name: &str, default: u64) -> u64 {
@@ -185,10 +201,26 @@ pub struct VexClientStats {
     pub get_object_rpcs_tree: AtomicU64,
     /// `GetObject` RPCs issued for commit objects.
     pub get_object_rpcs_commit: AtomicU64,
+    /// `GetObject` RPCs issued for JJ operation objects.
+    pub get_object_rpcs_op: AtomicU64,
+    /// `GetObject` RPCs issued for JJ view objects.
+    pub get_object_rpcs_view: AtomicU64,
     /// `GetObject` RPCs issued for all other object kinds.
     pub get_object_rpcs_other: AtomicU64,
     /// Object reads served from the local cache (or the pending-upload buffer).
     pub get_object_cache_hits: AtomicU64,
+    /// Cached blob reads.
+    pub get_object_cache_hits_blob: AtomicU64,
+    /// Cached tree reads.
+    pub get_object_cache_hits_tree: AtomicU64,
+    /// Cached commit reads.
+    pub get_object_cache_hits_commit: AtomicU64,
+    /// Cached JJ operation reads.
+    pub get_object_cache_hits_op: AtomicU64,
+    /// Cached JJ view reads.
+    pub get_object_cache_hits_view: AtomicU64,
+    /// Cached reads for all other object kinds.
+    pub get_object_cache_hits_other: AtomicU64,
     /// Objects received (and verified) via `GetObjectsInline` batch responses.
     pub objects_inline_fetched: AtomicU64,
     /// `GetObjectsInline` batch RPCs issued.
@@ -243,8 +275,16 @@ macro_rules! for_each_vex_client_stat {
             get_object_rpcs_blob,
             get_object_rpcs_tree,
             get_object_rpcs_commit,
+            get_object_rpcs_op,
+            get_object_rpcs_view,
             get_object_rpcs_other,
             get_object_cache_hits,
+            get_object_cache_hits_blob,
+            get_object_cache_hits_tree,
+            get_object_cache_hits_commit,
+            get_object_cache_hits_op,
+            get_object_cache_hits_view,
+            get_object_cache_hits_other,
             objects_inline_fetched,
             inline_batches,
             packs_fetched,
@@ -273,8 +313,16 @@ pub struct VexClientStatsSnapshot {
     pub get_object_rpcs_blob: u64,
     pub get_object_rpcs_tree: u64,
     pub get_object_rpcs_commit: u64,
+    pub get_object_rpcs_op: u64,
+    pub get_object_rpcs_view: u64,
     pub get_object_rpcs_other: u64,
     pub get_object_cache_hits: u64,
+    pub get_object_cache_hits_blob: u64,
+    pub get_object_cache_hits_tree: u64,
+    pub get_object_cache_hits_commit: u64,
+    pub get_object_cache_hits_op: u64,
+    pub get_object_cache_hits_view: u64,
+    pub get_object_cache_hits_other: u64,
     pub objects_inline_fetched: u64,
     pub inline_batches: u64,
     pub packs_fetched: u64,
@@ -321,7 +369,22 @@ impl VexClientStats {
             ObjectKind::Blob => &self.get_object_rpcs_blob,
             ObjectKind::Tree => &self.get_object_rpcs_tree,
             ObjectKind::Commit => &self.get_object_rpcs_commit,
+            ObjectKind::Op => &self.get_object_rpcs_op,
+            ObjectKind::View => &self.get_object_rpcs_view,
             _ => &self.get_object_rpcs_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_get_object_cache_hit(&self, kind: ObjectKind) {
+        self.get_object_cache_hits.fetch_add(1, Ordering::Relaxed);
+        let counter = match kind {
+            ObjectKind::Blob => &self.get_object_cache_hits_blob,
+            ObjectKind::Tree => &self.get_object_cache_hits_tree,
+            ObjectKind::Commit => &self.get_object_cache_hits_commit,
+            ObjectKind::Op => &self.get_object_cache_hits_op,
+            ObjectKind::View => &self.get_object_cache_hits_view,
+            _ => &self.get_object_cache_hits_other,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -408,6 +471,13 @@ pub enum CloneProgress {
         /// Total objects to hydrate.
         total: u64,
     },
+    /// The local JJ repository is being opened after metadata transfer.
+    LoadingRepo,
+    /// The repository's operation/view graph and default commit index are being
+    /// loaded or built.
+    Indexing,
+    /// The new workspace operation is being published before checkout.
+    WorkspacePublish,
     /// Prefetch finished; the working copy is about to be materialized.
     CheckingOut,
     /// Working-copy files are being written to disk during checkout.
@@ -1379,9 +1449,7 @@ impl VexClient {
         let path = self.cache_path(kind, content_id)?;
         let file = fs::File::open(&path).ok()?;
         debug!(kind = kind_to_str(kind), %content_id, cache_path = %path.display(), "vex cache hit (stream)");
-        vex_client_stats()
-            .get_object_cache_hits
-            .fetch_add(1, Ordering::Relaxed);
+        vex_client_stats().record_get_object_cache_hit(kind);
         Some(file)
     }
 
@@ -1715,6 +1783,88 @@ impl VexClient {
         }
     }
 
+    /// `PutObjects` is safe to replay because the server creates immutable,
+    /// content-addressed objects only when missing. In addition to the normal
+    /// transient statuses, Caddy can cancel an in-flight HTTP/2 stream while it
+    /// reloads; only this idempotent write path treats that cancellation as
+    /// retryable.
+    fn is_transient_pipelined_put_error(err: &VexClientError) -> bool {
+        matches!(err, VexClientError::Status(status) if status.code() == tonic::Code::Cancelled)
+            || Self::is_transient_client_error(err)
+    }
+
+    fn is_commit_operation_maintenance_status(status: &tonic::Status) -> bool {
+        status.code() == tonic::Code::Unavailable
+            && status.message() == "repository maintenance is in progress; retry commit"
+    }
+
+    /// `CommitOperation` is the one write RPC whose exact request can safely
+    /// be replayed after the acknowledgement boundary is lost: the server
+    /// accepts an already-current operation head as success, while an ordinary
+    /// CAS conflict remains a normal response for jj to handle. Cover both the
+    /// explicit maintenance fence and a transient/cancelled transport response
+    /// so a Caddy or client timeout after the server commits cannot orphan a
+    /// completed conversion.
+    fn is_retryable_commit_operation_status(status: &tonic::Status) -> bool {
+        Self::is_commit_operation_maintenance_status(status)
+            || status.code() == tonic::Code::Cancelled
+            || Self::is_transient_status(status)
+    }
+
+    fn commit_operation_maintenance_retry_delay(attempt: usize) -> Duration {
+        let shift = attempt.saturating_sub(1).min(6) as u32;
+        let backoff_ms = COMMIT_OPERATION_MAINTENANCE_RETRY_BASE_MS
+            .saturating_mul(1_u64 << shift)
+            .min(COMMIT_OPERATION_MAINTENANCE_RETRY_CAP_MS);
+        let jitter_ms = Self::retry_jitter_ms(backoff_ms / 4 + 1);
+        Duration::from_millis(backoff_ms + jitter_ms)
+    }
+
+    /// Bounded exponential backoff for retries of one idempotent `PutObjects`
+    /// batch. The small jitter keeps concurrently retried batches from
+    /// reconnecting to a recovering edge at the same instant.
+    fn pipelined_put_retry_delay(attempt: usize) -> Duration {
+        let shift = attempt.saturating_sub(1).min(6) as u32;
+        let backoff_ms = PIPELINED_PUT_RETRY_BASE_MS
+            .saturating_mul(1_u64 << shift)
+            .min(PIPELINED_PUT_RETRY_CAP_MS);
+        let jitter_ms = Self::retry_jitter_ms(backoff_ms / 4 + 1);
+        Duration::from_millis(backoff_ms + jitter_ms)
+    }
+
+    /// Retry one idempotent `PutObjects` batch. The first call is allowed to
+    /// reuse the process's pooled channel; retries receive `false` so callers
+    /// reconnect with a fresh channel and client rather than reusing the stream
+    /// Caddy may just have drained.
+    async fn retry_pipelined_put_batch<T, F, Fut>(mut send: F) -> Result<T, VexClientError>
+    where
+        F: FnMut(bool) -> Fut,
+        Fut: Future<Output = Result<T, VexClientError>>,
+    {
+        for attempt in 1..=PIPELINED_PUT_RETRY_ATTEMPTS {
+            match send(attempt == 1).await {
+                Ok(value) => return Ok(value),
+                Err(err)
+                    if Self::is_transient_pipelined_put_error(&err)
+                        && attempt < PIPELINED_PUT_RETRY_ATTEMPTS =>
+                {
+                    let delay = Self::pipelined_put_retry_delay(attempt);
+                    debug!(
+                        attempt,
+                        retry_attempt = attempt + 1,
+                        attempts = PIPELINED_PUT_RETRY_ATTEMPTS,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "transient PutObjects batch failure; reconnecting before retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("a nonzero retry budget always returns from the loop")
+    }
+
     /// Like [`Self::block_on_grpc`] but retries the call on transient errors
     /// with linear backoff. Used for hot read paths (e.g. the per-file
     /// `GetObject` calls a working-copy checkout makes thousands of times),
@@ -1769,6 +1919,57 @@ impl VexClient {
                     Err(status) => return Err(status.into()),
                 }
             }
+        }))
+    }
+
+    /// Retry a transient response for an idempotent `CommitOperation` request.
+    /// This policy is deliberately not shared with other write RPCs: the same
+    /// operation head is replay-safe because the server returns success if it
+    /// is already current.
+    fn block_on_commit_operation_maintenance_retry<T, F, Fut>(
+        endpoint: &str,
+        f: F,
+    ) -> Result<T, VexClientError>
+    where
+        F: Fn(JjBackendClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, tonic::Status>>,
+    {
+        let channel = Self::cached_channel(endpoint)?;
+        // A shadow scan of a large mirror can legitimately occupy this lane for
+        // more than the default window. Operators may raise (but never reduce)
+        // the bounded budget for a known maintenance window without making
+        // ordinary writes retry indefinitely.
+        let attempts = env_secs(
+            "VEX_COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS",
+            COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS as u64,
+        )
+        .max(COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS as u64) as usize;
+        Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
+            for attempt in 1..=attempts {
+                let client = JjBackendClient::new(channel.clone())
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+                match f(client).await {
+                    Ok(value) => return Ok(value),
+                    Err(status)
+                        if Self::is_retryable_commit_operation_status(&status)
+                            && attempt < attempts =>
+                    {
+                        let delay = Self::commit_operation_maintenance_retry_delay(attempt);
+                        debug!(
+                            attempt,
+                            retry_attempt = attempt + 1,
+                            attempts,
+                            delay_ms = delay.as_millis(),
+                            error = %status,
+                            "retryable idempotent op-head publication failure; replaying request"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(status) => return Err(status.into()),
+                }
+            }
+            unreachable!("a nonzero retry budget always returns from the loop")
         }))
     }
 
@@ -2995,7 +3196,19 @@ impl VexClient {
         if inline_batches.is_empty() {
             return Ok(());
         }
-        let channel = Self::cached_channel(&self.config.endpoint)?;
+        // Keep the normal fast path on the shared HTTP/2 connection. If it is
+        // unavailable while being established, let each batch's retry helper
+        // make a fresh connection instead of failing the entire import before
+        // its first request.
+        let initial_channel = match Self::cached_channel(&self.config.endpoint) {
+            Ok(channel) => Some(channel),
+            Err(err) if Self::is_transient_pipelined_put_error(&err) => {
+                debug!(error = %err, "cached PutObjects channel unavailable; reconnecting per batch");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        let endpoint = self.config.endpoint.clone();
         let repo_id = self.config.repo_id.clone();
         let token = self.config.access_token.clone();
         let concurrency = concurrency.max(1);
@@ -3003,19 +3216,37 @@ impl VexClient {
             use futures::stream::TryStreamExt as _;
             futures::stream::iter(inline_batches.into_iter().map(Ok::<_, VexClientError>))
                 .try_for_each_concurrent(concurrency, |objects| {
-                    let channel = channel.clone();
+                    let initial_channel = initial_channel.clone();
+                    let endpoint = endpoint.clone();
                     let repo_id = repo_id.clone();
                     let token = token.clone();
                     async move {
-                        JjBackendClient::new(channel)
-                            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                            .put_objects(Self::auth_request(
-                                PutObjectsRequest { repo_id, objects },
-                                token.as_deref(),
-                            )?)
-                            .await?;
-                        Ok(())
+                        // Keep `objects` intact so a transient connection
+                        // reset after the server accepted the body can replay
+                        // the exact idempotent request.
+                        Self::retry_pipelined_put_batch(move |use_initial_channel| {
+                            let endpoint = endpoint.clone();
+                            let initial_channel = initial_channel.clone();
+                            let repo_id = repo_id.clone();
+                            let token = token.clone();
+                            let objects = objects.clone();
+                            async move {
+                                let channel = match (use_initial_channel, initial_channel) {
+                                    (true, Some(channel)) => channel,
+                                    _ => Self::endpoint(&endpoint)?.connect().await?,
+                                };
+                                JjBackendClient::new(channel)
+                                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                                    .put_objects(Self::auth_request(
+                                        PutObjectsRequest { repo_id, objects },
+                                        token.as_deref(),
+                                    )?)
+                                    .await?;
+                                Ok(())
+                            }
+                        })
+                        .await
                     }
                 })
                 .await
@@ -3089,17 +3320,13 @@ impl VexClient {
     ) -> Result<Vec<u8>, VexClientError> {
         let _t = RpcTimer::start(|| format!("get_object/{}", kind_to_str(kind)));
         if let Some(bytes) = self.read_cached_object(kind, content_id) {
-            vex_client_stats()
-                .get_object_cache_hits
-                .fetch_add(1, Ordering::Relaxed);
+            vex_client_stats().record_get_object_cache_hit(kind);
             return Ok(bytes);
         }
         // An object written earlier this process may still be buffered for batch
         // upload (not yet on disk or the server); serve it from the buffer.
         if let Some(bytes) = self.read_pending_object(kind, content_id) {
-            vex_client_stats()
-                .get_object_cache_hits
-                .fetch_add(1, Ordering::Relaxed);
+            vex_client_stats().record_get_object_cache_hit(kind);
             return Ok(bytes);
         }
         let bytes = self.fetch_object_grpc_verified(kind, content_id).await?;
@@ -3415,7 +3642,9 @@ impl VexClient {
         // that is missing on the server. A flush failure aborts here, leaving
         // the head unchanged (the un-uploaded objects are simply unreferenced).
         self.flush_pending_uploads()?;
-        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
+        let response = Self::block_on_commit_operation_maintenance_retry(
+            &self.config.endpoint,
+            |mut client| async move {
             client
                 .commit_operation(Self::auth_request(
                     jj_backend_api::CommitOperationRequest {
@@ -3429,7 +3658,8 @@ impl VexClient {
                 )?)
                 .await
                 .map(|response| response.into_inner())
-        })?;
+            },
+        )?;
         Ok(response)
     }
 
@@ -3861,9 +4091,7 @@ impl VexClient {
                 .read_cached_object(object.kind, &object.content_id)
                 .is_some()
             {
-                vex_client_stats()
-                    .get_object_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
+                vex_client_stats().record_get_object_cache_hit(object.kind);
                 if let Some(progress) = progress {
                     progress(CloneProgress::LooseObjectFetched {
                         done: loose_done,
@@ -4383,6 +4611,93 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_put_treats_cancelled_and_unavailable_as_transient() {
+        for status in [
+            tonic::Status::cancelled("edge reloaded"),
+            tonic::Status::unavailable("connection reset"),
+        ] {
+            assert!(VexClient::is_transient_pipelined_put_error(
+                &VexClientError::Status(status)
+            ));
+        }
+    }
+
+    #[test]
+    fn commit_operation_retries_only_the_explicit_maintenance_status() {
+        assert!(VexClient::is_commit_operation_maintenance_status(
+            &tonic::Status::unavailable("repository maintenance is in progress; retry commit")
+        ));
+        assert!(!VexClient::is_commit_operation_maintenance_status(
+            &tonic::Status::unavailable("connection reset")
+        ));
+        assert!(!VexClient::is_commit_operation_maintenance_status(
+            &tonic::Status::internal("repository maintenance is in progress; retry commit")
+        ));
+    }
+
+    #[test]
+    fn commit_operation_retries_only_replay_safe_transient_statuses() {
+        assert!(VexClient::is_retryable_commit_operation_status(
+            &tonic::Status::cancelled("Timeout expired")
+        ));
+        assert!(VexClient::is_retryable_commit_operation_status(
+            &tonic::Status::unavailable("connection reset")
+        ));
+        assert!(!VexClient::is_retryable_commit_operation_status(
+            &tonic::Status::permission_denied("not allowed")
+        ));
+        assert!(!VexClient::is_retryable_commit_operation_status(
+            &tonic::Status::invalid_argument("malformed operation")
+        ));
+    }
+
+    #[test]
+    fn commit_operation_maintenance_retry_delay_is_bounded() {
+        assert!(
+            VexClient::commit_operation_maintenance_retry_delay(usize::MAX)
+                <= Duration::from_millis(COMMIT_OPERATION_MAINTENANCE_RETRY_CAP_MS * 5 / 4)
+        );
+    }
+
+    #[test]
+    fn pipelined_put_retries_cancelled_batch_with_fresh_connection() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = VexClient::shared_grpc_runtime().block_on({
+            let calls = calls.clone();
+            let attempts = attempts.clone();
+            VexClient::retry_pipelined_put_batch(move |uses_initial_channel| {
+                let calls = calls.clone();
+                let attempts = attempts.clone();
+                async move {
+                    calls.lock().unwrap().push(uses_initial_channel);
+                    if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                        Err(VexClientError::Status(tonic::Status::cancelled(
+                            "edge reloaded",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+        });
+
+        assert!(
+            result.is_ok(),
+            "cancelled batch should be retried: {result:?}"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![true, false]);
+    }
+
+    #[test]
+    fn pipelined_put_retry_delay_is_bounded() {
+        assert!(
+            VexClient::pipelined_put_retry_delay(usize::MAX)
+                <= Duration::from_millis(PIPELINED_PUT_RETRY_CAP_MS * 5 / 4)
+        );
+    }
+
+    #[test]
     fn pack_transfer_state_round_trip() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut client = sample_client();
@@ -4592,15 +4907,29 @@ mod tests {
         stats.record_get_object_rpc(ObjectKind::Blob);
         stats.record_get_object_rpc(ObjectKind::Blob);
         stats.record_get_object_rpc(ObjectKind::Tree);
+        stats.record_get_object_rpc(ObjectKind::Commit);
+        stats.record_get_object_rpc(ObjectKind::Op);
+        stats.record_get_object_rpc(ObjectKind::View);
         stats.record_get_object_rpc(ObjectKind::Pack);
-        stats.get_object_cache_hits.fetch_add(5, Ordering::Relaxed);
+        stats.record_get_object_cache_hit(ObjectKind::Blob);
+        stats.record_get_object_cache_hit(ObjectKind::Commit);
+        stats.record_get_object_cache_hit(ObjectKind::Op);
+        stats.record_get_object_cache_hit(ObjectKind::View);
+        stats.record_get_object_cache_hit(ObjectKind::Pack);
         stats.hydrated_bytes.fetch_add(4096, Ordering::Relaxed);
         let snapshot = vex_client_stats_snapshot();
         assert_eq!(snapshot.get_object_rpcs_blob, 2);
         assert_eq!(snapshot.get_object_rpcs_tree, 1);
-        assert_eq!(snapshot.get_object_rpcs_commit, 0);
+        assert_eq!(snapshot.get_object_rpcs_commit, 1);
+        assert_eq!(snapshot.get_object_rpcs_op, 1);
+        assert_eq!(snapshot.get_object_rpcs_view, 1);
         assert_eq!(snapshot.get_object_rpcs_other, 1);
         assert_eq!(snapshot.get_object_cache_hits, 5);
+        assert_eq!(snapshot.get_object_cache_hits_blob, 1);
+        assert_eq!(snapshot.get_object_cache_hits_commit, 1);
+        assert_eq!(snapshot.get_object_cache_hits_op, 1);
+        assert_eq!(snapshot.get_object_cache_hits_view, 1);
+        assert_eq!(snapshot.get_object_cache_hits_other, 1);
         assert_eq!(snapshot.hydrated_bytes, 4096);
         vex_client_stats_reset();
         assert_eq!(

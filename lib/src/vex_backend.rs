@@ -485,8 +485,7 @@ impl Backend for VexBackend {
         .find_map(|kind| self.client.read_cached_object(kind, &content_id));
         if cached.is_some() {
             crate::vex::vex_client_stats()
-                .get_object_cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .record_get_object_cache_hit(jj_backend_types::ObjectKind::Symlink);
         }
         let data = match cached {
             Some(data) => data,

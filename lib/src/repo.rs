@@ -762,6 +762,16 @@ impl RepoLoader {
     }
 
     pub async fn load_at_head(&self) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
+        self.load_at_head_with_before_index(|| {}).await
+    }
+
+    /// Loads the repository head and invokes `before_index` immediately before
+    /// constructing its read-only commit index. Clone instrumentation uses this
+    /// boundary to distinguish op/view loading from a cold default-index build.
+    pub(crate) async fn load_at_head_with_before_index(
+        &self,
+        before_index: impl FnOnce(),
+    ) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
         let op = op_heads_store::resolve_op_heads(
             self.op_heads_store.as_ref(),
             &self.op_store,
@@ -769,7 +779,8 @@ impl RepoLoader {
         )
         .await?;
         let view = op.view().await?;
-        self.finish_load(op, view).await
+        self.finish_load_with_before_index(op, view, before_index)
+            .await
     }
 
     #[instrument(skip(self))]
@@ -856,6 +867,17 @@ impl RepoLoader {
         operation: Operation,
         view: View,
     ) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
+        self.finish_load_with_before_index(operation, view, || {})
+            .await
+    }
+
+    async fn finish_load_with_before_index(
+        &self,
+        operation: Operation,
+        view: View,
+        before_index: impl FnOnce(),
+    ) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
+        before_index();
         let index = self
             .index_store
             .get_index_at_op(&operation, &self.store)
@@ -1646,6 +1668,19 @@ impl MutableRepo {
     /// and ancestors of the other heads. The `heads` and ancestor commits
     /// should exist in the store.
     pub async fn add_heads(&mut self, heads: &[Commit]) -> BackendResult<()> {
+        self.add_heads_with_preloaded_commits(heads, &HashMap::new())
+            .await
+    }
+
+    /// Like [`Self::add_heads()`], but consults `preloaded_commits` before
+    /// reading an unindexed ancestor from the store. The map is useful when a
+    /// caller has just constructed a graph out-of-band and still holds its
+    /// commit objects; missing entries continue to be loaded from the store.
+    pub async fn add_heads_with_preloaded_commits(
+        &mut self,
+        heads: &[Commit],
+        preloaded_commits: &HashMap<CommitId, Commit>,
+    ) -> BackendResult<()> {
         let current_heads = self.view.get_mut().heads();
         // Use incremental update for common case of adding a single commit on top a
         // current head. TODO: Also use incremental update when adding a single
@@ -1669,6 +1704,7 @@ impl MutableRepo {
                 }
             }
             _ => {
+                let store = self.store().clone();
                 let missing_commits = dag_walk_async::topo_order_reverse_ord(
                     heads
                         .iter()
@@ -1680,10 +1716,11 @@ impl MutableRepo {
                         stream::iter(commit.parent_ids())
                             .filter_map(async |id| match self.index().has_id(id) {
                                 Ok(false) => Some(
-                                    self.store()
-                                        .get_commit_async(id)
-                                        .await
-                                        .map(CommitByCommitterTimestamp),
+                                    match preloaded_commits.get(id) {
+                                        Some(commit) => Ok(commit.clone()),
+                                        None => store.get_commit_async(id).await,
+                                    }
+                                    .map(CommitByCommitterTimestamp),
                                 ),
                                 Ok(true) => None,
                                 // TODO: indexing error shouldn't be a "BackendError"

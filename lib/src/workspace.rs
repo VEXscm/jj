@@ -401,13 +401,20 @@ async fn init_vex_clone_working_copy_at(
     workspace_name: WorkspaceNameBuf,
     start_commit: &Commit,
     resolved_trunk: Option<&str>,
+    progress: Option<&crate::vex::CloneProgressFn>,
 ) -> Result<(Box<dyn WorkingCopy>, Arc<ReadonlyRepo>), WorkspaceInitError> {
     let working_copy_state_path = jj_dir.join("working_copy");
     std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
 
+    if let Some(progress) = progress {
+        progress(crate::vex::CloneProgress::WorkspacePublish);
+    }
     let repo =
         commit_vex_clone_workspace_operation(repo, &workspace_name, start_commit, resolved_trunk)
             .await?;
+    if let Some(progress) = progress {
+        progress(crate::vex::CloneProgress::CheckingOut);
+    }
     let working_copy = finish_init_working_copy(
         &repo,
         workspace_root,
@@ -781,13 +788,20 @@ impl Workspace {
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             }
 
+            if let Some(progress) = progress {
+                progress(crate::vex::CloneProgress::LoadingRepo);
+            }
             let mut store_factories = StoreFactories::default();
             store_factories.merge(create_store_factories());
             let repo_loader =
                 RepoLoader::init_from_file_system(user_settings, &repo_dir, &store_factories)
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let repo = repo_loader
-                .load_at_head()
+                .load_at_head_with_before_index(|| {
+                    if let Some(progress) = progress {
+                        progress(crate::vex::CloneProgress::Indexing);
+                    }
+                })
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
@@ -827,9 +841,6 @@ impl Workspace {
                 hydration_file_count =
                     hydrate_start_commit_blobs(&repo, &store_path, &start_commit, progress).await;
             }
-            if let Some(progress) = progress {
-                progress(crate::vex::CloneProgress::CheckingOut);
-            }
             let workspace_name = vex_clone_workspace_name(workspace_root);
             let init_working_copy = init_vex_clone_working_copy_at(
                 &repo,
@@ -839,6 +850,7 @@ impl Workspace {
                 workspace_name,
                 &start_commit,
                 resolved_trunk.as_deref(),
+                progress,
             );
             let (working_copy, repo) = match progress {
                 // Materializing progress: the checkout has no progress channel

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
 use jj_lib::index::Index;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
@@ -402,6 +405,98 @@ fn test_add_head_success() -> TestResult {
     let repo = tx.commit("test").block_on()?;
     assert!(repo.view().heads().contains(new_commit.id()));
     assert!(index_has_id(repo.index(), new_commit.id()));
+    Ok(())
+}
+
+#[test]
+fn test_add_heads_with_preloaded_commits_avoids_store_reads() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+
+    // Construct a graph outside the visible repo, as native materialization
+    // does before it indexes the uploaded commits.
+    let mut tx = repo.start_transaction();
+    let parent = write_random_commit(tx.repo_mut());
+    let child = write_random_commit_with_parents(tx.repo_mut(), &[&parent]);
+    drop(tx);
+
+    // Load a fresh Store so neither commit is cached there, then make any
+    // accidental fallback read fail. The retained Commit objects are enough to
+    // add and index the complete graph.
+    let repo = test_repo
+        .env
+        .load_repo_at_head(repo.settings(), test_repo.repo_path());
+    let preloaded_parent = Commit::new(
+        repo.store().clone(),
+        parent.id().clone(),
+        parent.store_commit().clone(),
+    );
+    let preloaded_child = Commit::new(
+        repo.store().clone(),
+        child.id().clone(),
+        child.store_commit().clone(),
+    );
+    let backend = repo
+        .store()
+        .backend_impl::<testutils::test_backend::TestBackend>()
+        .expect("test backend");
+    backend.remove_commit_unchecked(parent.id());
+    backend.remove_commit_unchecked(child.id());
+    let preloaded_commits = HashMap::from([
+        (preloaded_parent.id().clone(), preloaded_parent),
+        (preloaded_child.id().clone(), preloaded_child.clone()),
+    ]);
+
+    let mut tx = repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+    mut_repo
+        .add_heads_with_preloaded_commits(
+            std::slice::from_ref(&preloaded_child),
+            &preloaded_commits,
+        )
+        .block_on()?;
+
+    assert!(index_has_id(mut_repo.index(), parent.id()));
+    assert!(index_has_id(mut_repo.index(), child.id()));
+    assert!(mut_repo.view().heads().contains(child.id()));
+    Ok(())
+}
+
+#[test]
+fn test_add_heads_with_preloaded_commits_reads_missing_ancestors() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+
+    let mut tx = repo.start_transaction();
+    let parent = write_random_commit(tx.repo_mut());
+    let child = write_random_commit_with_parents(tx.repo_mut(), &[&parent]);
+    drop(tx);
+
+    // A fresh Store has no commit cache. Only the child is preloaded, so the
+    // unindexed parent must use the normal Store fallback.
+    let repo = test_repo
+        .env
+        .load_repo_at_head(repo.settings(), test_repo.repo_path());
+    let preloaded_child = Commit::new(
+        repo.store().clone(),
+        child.id().clone(),
+        child.store_commit().clone(),
+    );
+    let preloaded_commits =
+        HashMap::from([(preloaded_child.id().clone(), preloaded_child.clone())]);
+
+    let mut tx = repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+    mut_repo
+        .add_heads_with_preloaded_commits(
+            std::slice::from_ref(&preloaded_child),
+            &preloaded_commits,
+        )
+        .block_on()?;
+
+    assert!(index_has_id(mut_repo.index(), parent.id()));
+    assert!(index_has_id(mut_repo.index(), child.id()));
+    assert!(mut_repo.view().heads().contains(child.id()));
     Ok(())
 }
 
