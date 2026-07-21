@@ -3645,19 +3645,22 @@ impl VexClient {
         let response = Self::block_on_commit_operation_maintenance_retry(
             &self.config.endpoint,
             |mut client| async move {
-            client
-                .commit_operation(Self::auth_request(
-                    jj_backend_api::CommitOperationRequest {
-                        tenant_id: self.config.tenant_id.clone(),
-                        repo_id: self.config.repo_id.clone(),
-                        expected_op_head_ids: expected.iter().map(ToString::to_string).collect(),
-                        new_op_content_id: new_head.to_string(),
-                        new_view_content_id: new_view.to_string(),
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner())
+                client
+                    .commit_operation(Self::auth_request(
+                        jj_backend_api::CommitOperationRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            expected_op_head_ids: expected
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            new_op_content_id: new_head.to_string(),
+                            new_view_content_id: new_view.to_string(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
             },
         )?;
         Ok(response)
