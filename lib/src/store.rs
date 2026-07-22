@@ -157,6 +157,10 @@ impl Store {
         Ok(Commit::new(self.clone(), id.clone(), data))
     }
 
+    pub async fn prefetch_commits(&self, ids: &[CommitId]) -> BackendResult<()> {
+        self.backend.prefetch_commits(ids).await
+    }
+
     async fn get_backend_commit(&self, id: &CommitId) -> BackendResult<Arc<backend::Commit>> {
         {
             let mut locked_cache = self.commit_cache.lock().unwrap();

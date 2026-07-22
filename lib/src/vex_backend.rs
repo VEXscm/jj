@@ -662,6 +662,26 @@ impl Backend for VexBackend {
         }
     }
 
+    async fn prefetch_commits(&self, ids: &[CommitId]) -> BackendResult<()> {
+        let ids = ids
+            .iter()
+            .filter(|id| *id != &self.root_commit_id)
+            .map(|id| {
+                to_content_id(&id.to_bytes(), &id.object_type())
+                    .map(|content_id| (jj_backend_types::ObjectKind::Commit, content_id, None))
+            })
+            .collect::<BackendResult<Vec<_>>>()?;
+        self.client
+            .get_objects_inline_batched(ids, None)
+            .await
+            .map_err(|error| BackendError::ReadObject {
+                object_type: "commit batch".to_string(),
+                hash: "multiple commits".to_string(),
+                source: Box::new(error),
+            })?;
+        Ok(())
+    }
+
     async fn write_commit(
         &self,
         mut commit: Commit,

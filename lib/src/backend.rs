@@ -638,6 +638,13 @@ pub trait Backend: Any + Send + Sync + Debug {
     /// Reads the commit with the given ID.
     async fn read_commit(&self, id: &CommitId) -> BackendResult<Commit>;
 
+    /// Fetches commit objects into any backend-owned local cache.
+    ///
+    /// Backends without a local cache can keep the default no-op behavior.
+    async fn prefetch_commits(&self, _ids: &[CommitId]) -> BackendResult<()> {
+        Ok(())
+    }
+
     /// Writes a commit and returns its ID and the commit itself. The commit
     /// should contain the data that was actually written, which may differ
     /// from the data passed in. For example, the backend may change the

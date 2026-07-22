@@ -241,100 +241,119 @@ pub(crate) async fn cmd_log(
                     forward_stream.boxed_local()
                 }
             };
-            let mut commit_stream = stream
-                .map(|result| async {
-                    let (commit_id, edges) = result?;
-                    let commit = store
-                        .get_commit_async(&commit_id)
-                        .await
-                        .map_err(RevsetEvaluationError::Backend)?;
-                    Ok::<_, RevsetEvaluationError>((commit, edges))
-                })
-                .buffered(store.concurrency());
-            while let Some((commit, edges)) = commit_stream.try_next().await? {
-                // The graph is keyed by (CommitId, is_synthetic)
-                let mut graphlog_edges = vec![];
-                // TODO: Should we update revset.stream_graph() to yield a `has_missing` flag
-                // instead of all the missing edges since we don't care about
-                // where they point here anyway?
-                let mut missing_edge_id = None;
-                let mut elided_targets = vec![];
-                for edge in edges {
-                    match edge.edge_type {
-                        GraphEdgeType::Missing => {
-                            missing_edge_id = Some(edge.target);
-                        }
-                        GraphEdgeType::Direct => {
-                            graphlog_edges.push(GraphEdge::direct((edge.target, false)));
-                        }
-                        GraphEdgeType::Indirect => {
-                            if use_elided_nodes {
-                                elided_targets.push(edge.target.clone());
-                                graphlog_edges.push(GraphEdge::direct((edge.target, true)));
-                            } else {
-                                graphlog_edges.push(GraphEdge::indirect((edge.target, false)));
+            let mut node_chunks = stream.chunks(store.concurrency());
+            while let Some(chunk) = node_chunks.next().await {
+                let nodes = chunk.into_iter().collect::<Result<Vec<_>, _>>()?;
+                let commit_ids = nodes
+                    .iter()
+                    .map(|(commit_id, _)| commit_id.clone())
+                    .collect::<Vec<_>>();
+                if let Err(error) = store.prefetch_commits(&commit_ids).await {
+                    tracing::debug!(%error, "commit prefetch failed");
+                }
+                let commit_stream = stream::iter(nodes)
+                    .map(|(commit_id, edges)| async move {
+                        let commit = store
+                            .get_commit_async(&commit_id)
+                            .await
+                            .map_err(RevsetEvaluationError::Backend)?;
+                        Ok::<_, RevsetEvaluationError>((commit, edges))
+                    })
+                    .buffered(store.concurrency());
+                let chunk = commit_stream.try_collect::<Vec<_>>().await?;
+                let parent_ids = chunk
+                    .iter()
+                    .flat_map(|(commit, _)| commit.parent_ids())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Err(error) = store.prefetch_commits(&parent_ids).await {
+                    tracing::debug!(%error, "parent commit prefetch failed");
+                }
+                for (commit, edges) in chunk {
+                    // The graph is keyed by (CommitId, is_synthetic)
+                    let mut graphlog_edges = vec![];
+                    // TODO: Should we update revset.stream_graph() to yield a `has_missing` flag
+                    // instead of all the missing edges since we don't care about
+                    // where they point here anyway?
+                    let mut missing_edge_id = None;
+                    let mut elided_targets = vec![];
+                    for edge in edges {
+                        match edge.edge_type {
+                            GraphEdgeType::Missing => {
+                                missing_edge_id = Some(edge.target);
+                            }
+                            GraphEdgeType::Direct => {
+                                graphlog_edges.push(GraphEdge::direct((edge.target, false)));
+                            }
+                            GraphEdgeType::Indirect => {
+                                if use_elided_nodes {
+                                    elided_targets.push(edge.target.clone());
+                                    graphlog_edges.push(GraphEdge::direct((edge.target, true)));
+                                } else {
+                                    graphlog_edges.push(GraphEdge::indirect((edge.target, false)));
+                                }
                             }
                         }
                     }
-                }
-                if let Some(missing_edge_id) = missing_edge_id {
-                    graphlog_edges.push(GraphEdge::missing((missing_edge_id, false)));
-                }
-                let mut buffer = vec![];
-                let key = (commit.id().clone(), false);
-                let within_graph =
-                    with_content_format.sub_width(graph.width(&key, &graphlog_edges));
-                within_graph
-                    .write(ui.new_formatter(&mut buffer).as_mut(), async |formatter| {
-                        template.format(&commit, formatter)
-                    })
-                    .await?;
-                if let Some(renderer) = &diff_renderer {
-                    let mut formatter = ui.new_formatter(&mut buffer);
-                    renderer
-                        .show_patch(
-                            ui,
-                            formatter.as_mut(),
-                            &commit,
-                            matcher.as_ref(),
-                            within_graph.width(),
-                        )
-                        .await?;
-                }
-
-                let commit = Some(commit);
-                let node_symbol = format_template(ui, &commit, &node_template);
-                graph.add_node(
-                    &key,
-                    &graphlog_edges,
-                    &node_symbol,
-                    &String::from_utf8_lossy(&buffer),
-                )?;
-
-                let tree = commit.map(|c| c.tree()).unwrap();
-                // TODO: propagate errors
-                explicit_paths
-                    .retain(|&path| tree.path_value(path).block_on().unwrap().is_absent());
-
-                for elided_target in elided_targets {
-                    let elided_key = (elided_target, true);
-                    let real_key = (elided_key.0.clone(), false);
-                    let edges = [GraphEdge::direct(real_key)];
+                    if let Some(missing_edge_id) = missing_edge_id {
+                        graphlog_edges.push(GraphEdge::missing((missing_edge_id, false)));
+                    }
                     let mut buffer = vec![];
+                    let key = (commit.id().clone(), false);
                     let within_graph =
-                        with_content_format.sub_width(graph.width(&elided_key, &edges));
+                        with_content_format.sub_width(graph.width(&key, &graphlog_edges));
                     within_graph
                         .write(ui.new_formatter(&mut buffer).as_mut(), async |formatter| {
-                            writeln!(formatter.labeled("elided"), "(elided revisions)")
+                            template.format(&commit, formatter)
                         })
                         .await?;
-                    let node_symbol = format_template(ui, &None, &node_template);
+                    if let Some(renderer) = &diff_renderer {
+                        let mut formatter = ui.new_formatter(&mut buffer);
+                        renderer
+                            .show_patch(
+                                ui,
+                                formatter.as_mut(),
+                                &commit,
+                                matcher.as_ref(),
+                                within_graph.width(),
+                            )
+                            .await?;
+                    }
+
+                    let commit = Some(commit);
+                    let node_symbol = format_template(ui, &commit, &node_template);
                     graph.add_node(
-                        &elided_key,
-                        &edges,
+                        &key,
+                        &graphlog_edges,
                         &node_symbol,
                         &String::from_utf8_lossy(&buffer),
                     )?;
+
+                    let tree = commit.map(|c| c.tree()).unwrap();
+                    // TODO: propagate errors
+                    explicit_paths
+                        .retain(|&path| tree.path_value(path).block_on().unwrap().is_absent());
+
+                    for elided_target in elided_targets {
+                        let elided_key = (elided_target, true);
+                        let real_key = (elided_key.0.clone(), false);
+                        let edges = [GraphEdge::direct(real_key)];
+                        let mut buffer = vec![];
+                        let within_graph =
+                            with_content_format.sub_width(graph.width(&elided_key, &edges));
+                        within_graph
+                            .write(ui.new_formatter(&mut buffer).as_mut(), async |formatter| {
+                                writeln!(formatter.labeled("elided"), "(elided revisions)")
+                            })
+                            .await?;
+                        let node_symbol = format_template(ui, &None, &node_template);
+                        graph.add_node(
+                            &elided_key,
+                            &edges,
+                            &node_symbol,
+                            &String::from_utf8_lossy(&buffer),
+                        )?;
+                    }
                 }
             }
         } else {

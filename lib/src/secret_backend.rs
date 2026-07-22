@@ -187,6 +187,10 @@ impl Backend for SecretBackend {
         self.inner.read_commit(id).await
     }
 
+    async fn prefetch_commits(&self, ids: &[CommitId]) -> BackendResult<()> {
+        self.inner.prefetch_commits(ids).await
+    }
+
     async fn write_commit(
         &self,
         contents: Commit,
