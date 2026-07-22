@@ -390,6 +390,10 @@ impl From<WorkspaceInitError> for CommandError {
             }
             WorkspaceInitError::SignInit(err) => user_error(err),
             WorkspaceInitError::TransactionCommit(err) => err.into(),
+            // Actionable native-clone failure (roadmap/066): the message
+            // already directs the operator to native conversion or
+            // `vex git clone`.
+            WorkspaceInitError::NativeTrunkMissing { .. } => user_error(err),
         }
     }
 }

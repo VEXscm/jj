@@ -267,6 +267,29 @@ pub struct VexClientStats {
     /// Pre-checkout hydration tree walks skipped because a fully-unpacked
     /// snapshot pack chain already covered the start commit (roadmap/032).
     pub snapshot_walk_skips: AtomicU64,
+    /// Successful native trunk selections: the server-advertised default
+    /// branch resolved through native local/remote-tracking bookmark state
+    /// during `vex clone` (roadmap/066).
+    pub native_trunk_resolutions: AtomicU64,
+    /// Advertised native trunk bookmarks absent from native bookmark state.
+    /// Native clone fails closed instead of falling back to `git/ref/*`
+    /// (roadmap/066).
+    pub native_trunk_missing: AtomicU64,
+    /// Commits whose bytes failed native protobuf decoding and were parsed as
+    /// raw Git commits. Incremented only under explicit
+    /// [`VexObjectReadMode::GitCompatibility`]; any non-zero value in a native
+    /// clone is a correctness regression, not a performance problem.
+    pub git_compat_commit_decodes: AtomicU64,
+    /// Trees parsed as raw Git trees (explicit compatibility mode only; see
+    /// [`Self::git_compat_commit_decodes`]).
+    pub git_compat_tree_decodes: AtomicU64,
+    /// Raw Git SHA-1 names resolved through `git/object/sha1/*` mapping
+    /// lookups (explicit compatibility mode only).
+    pub git_mapping_names_resolved: AtomicU64,
+    /// `ResolveRefs` RPCs issued for `git/object/sha1/*` mapping lookups.
+    pub git_mapping_rpcs: AtomicU64,
+    /// Wall-clock milliseconds spent in `git/object/sha1/*` mapping RPCs.
+    pub git_mapping_elapsed_ms: AtomicU64,
 }
 
 macro_rules! for_each_vex_client_stat {
@@ -302,7 +325,14 @@ macro_rules! for_each_vex_client_stat {
             files_written,
             bytes_written,
             files_reflinked,
-            snapshot_walk_skips
+            snapshot_walk_skips,
+            native_trunk_resolutions,
+            native_trunk_missing,
+            git_compat_commit_decodes,
+            git_compat_tree_decodes,
+            git_mapping_names_resolved,
+            git_mapping_rpcs,
+            git_mapping_elapsed_ms
         )
     };
 }
@@ -341,6 +371,13 @@ pub struct VexClientStatsSnapshot {
     pub bytes_written: u64,
     pub files_reflinked: u64,
     pub snapshot_walk_skips: u64,
+    pub native_trunk_resolutions: u64,
+    pub native_trunk_missing: u64,
+    pub git_compat_commit_decodes: u64,
+    pub git_compat_tree_decodes: u64,
+    pub git_mapping_names_resolved: u64,
+    pub git_mapping_rpcs: u64,
+    pub git_mapping_elapsed_ms: u64,
 }
 
 impl VexClientStats {
@@ -388,6 +425,43 @@ impl VexClientStats {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// A server-advertised trunk bookmark resolved through native bookmark
+    /// state. Called by the clone target selector in `workspace.rs`.
+    pub fn record_native_trunk_resolution(&self) {
+        self.native_trunk_resolutions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A server-advertised trunk bookmark was absent from native bookmark
+    /// state (native clone fails closed). Called by the clone target selector
+    /// in `workspace.rs`.
+    pub fn record_native_trunk_missing(&self) {
+        self.native_trunk_missing.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A commit's bytes were parsed as a raw Git commit under explicit
+    /// [`VexObjectReadMode::GitCompatibility`].
+    pub fn record_git_compat_commit_decode(&self) {
+        self.git_compat_commit_decodes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A tree's bytes were parsed as a raw Git tree under explicit
+    /// [`VexObjectReadMode::GitCompatibility`].
+    pub fn record_git_compat_tree_decode(&self) {
+        self.git_compat_tree_decodes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `git/object/sha1/*` mapping `ResolveRefs` RPC covering
+    /// `names_resolved` SHA-1 names and taking `elapsed` wall-clock time.
+    pub fn record_git_mapping_rpc(&self, names_resolved: u64, elapsed: Duration) {
+        self.git_mapping_rpcs.fetch_add(1, Ordering::Relaxed);
+        self.git_mapping_names_resolved
+            .fetch_add(names_resolved, Ordering::Relaxed);
+        self.git_mapping_elapsed_ms
+            .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
 }
 
 /// The process-global [`VexClientStats`] counters.
@@ -404,6 +478,16 @@ pub fn vex_client_stats_snapshot() -> VexClientStatsSnapshot {
 /// Reset the process-global client counters to zero (bench runs only).
 pub fn vex_client_stats_reset() {
     vex_client_stats().reset();
+}
+
+/// Serializes tests (across `jj-lib` modules) that assert on the
+/// process-global [`VexClientStats`] counters, so a concurrent
+/// [`vex_client_stats_reset`] or counter bump in a parallel test thread
+/// cannot corrupt another test's delta assertions.
+#[cfg(test)]
+pub(crate) fn test_stats_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(Mutex::default)
 }
 
 pub use jj_backend_types::CloneBlobMode;
@@ -538,6 +622,36 @@ pub enum VexClientError {
     RefUpdateRejected(String),
 }
 
+/// Object decode policy for the Vex backend read path (roadmap/066).
+///
+/// `vex clone` and every ordinary repository load are native-only: commit and
+/// tree bytes must decode as native Vex protobuf objects, and a decode failure
+/// is a typed read error (see `vex_backend::VexNativeObjectFormatError`) —
+/// never a signal to parse raw Git bytes or resolve `git/object/sha1/*`
+/// mappings. Only explicit conversion/Git-bridge callers may construct
+/// [`GitCompatibility`](Self::GitCompatibility), and they do so in memory: the
+/// mode is never persisted to `vex.json`, so a normal clone can never inherit
+/// compatibility mode from disk.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VexObjectReadMode {
+    /// Commit/tree bytes must be native Vex protobuf objects (the default).
+    #[default]
+    NativeOnly,
+    /// Failed protobuf decodes fall back to the raw Git parsers
+    /// (`parse_git_commit()` / `read_git_tree()`) and their
+    /// `git/object/sha1/*` mapping lookups. Explicit opt-in only.
+    GitCompatibility,
+}
+
+impl VexObjectReadMode {
+    /// Whether raw Git commit/tree parsing (and its SHA-1 mapping lookups) is
+    /// permitted on this read path.
+    pub fn allows_git_compatibility(self) -> bool {
+        matches!(self, Self::GitCompatibility)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VexRepoConfig {
     pub endpoint: String,
@@ -565,6 +679,14 @@ pub struct VexRepoConfig {
     /// continue to persist to the backend.
     #[serde(default)]
     pub local_writes: bool,
+    /// Object decode policy for backend reads (see [`VexObjectReadMode`]).
+    /// Never serialized: a normal clone's `vex.json` carries no mode field and
+    /// old files without one deserialize to [`VexObjectReadMode::NativeOnly`],
+    /// so compatibility mode can only be constructed explicitly in memory by a
+    /// conversion/Git-bridge caller (or spelled out by hand in a test
+    /// fixture), never inherited from a normal clone.
+    #[serde(default, skip_serializing)]
+    pub object_read_mode: VexObjectReadMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2851,6 +2973,7 @@ impl VexClient {
             virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
+            object_read_mode: VexObjectReadMode::NativeOnly,
         })
     }
 
@@ -2886,6 +3009,7 @@ impl VexClient {
             virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
+            object_read_mode: VexObjectReadMode::NativeOnly,
         })
     }
 
@@ -4551,9 +4675,9 @@ mod tests {
     /// Serializes tests that touch the process-global [`VexClientStats`]
     /// counters, so a concurrent [`vex_client_stats_reset`] cannot corrupt
     /// another test's delta assertions (tests run in parallel threads).
+    /// Shared with `vex_backend`'s tests via [`crate::vex::test_stats_lock`].
     fn stats_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        test_stats_lock()
     }
 
     fn sample_client() -> VexClient {
@@ -4570,6 +4694,7 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
+            object_read_mode: VexObjectReadMode::NativeOnly,
         })
         .unwrap()
     }
@@ -4934,6 +5059,33 @@ mod tests {
         assert_eq!(snapshot.get_object_cache_hits_view, 1);
         assert_eq!(snapshot.get_object_cache_hits_other, 1);
         assert_eq!(snapshot.hydrated_bytes, 4096);
+        vex_client_stats_reset();
+        assert_eq!(
+            vex_client_stats_snapshot(),
+            VexClientStatsSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn native_path_and_git_mapping_counters_snapshot_and_reset() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        vex_client_stats_reset();
+        let stats = vex_client_stats();
+        stats.record_native_trunk_resolution();
+        stats.record_native_trunk_missing();
+        stats.record_git_compat_commit_decode();
+        stats.record_git_compat_commit_decode();
+        stats.record_git_compat_tree_decode();
+        stats.record_git_mapping_rpc(3, Duration::from_millis(25));
+        stats.record_git_mapping_rpc(1, Duration::from_millis(5));
+        let snapshot = vex_client_stats_snapshot();
+        assert_eq!(snapshot.native_trunk_resolutions, 1);
+        assert_eq!(snapshot.native_trunk_missing, 1);
+        assert_eq!(snapshot.git_compat_commit_decodes, 2);
+        assert_eq!(snapshot.git_compat_tree_decodes, 1);
+        assert_eq!(snapshot.git_mapping_names_resolved, 4);
+        assert_eq!(snapshot.git_mapping_rpcs, 2);
+        assert_eq!(snapshot.git_mapping_elapsed_ms, 30);
         vex_client_stats_reset();
         assert_eq!(
             vex_client_stats_snapshot(),

@@ -105,6 +105,18 @@ pub enum WorkspaceInitError {
     SignInit(#[from] SignInitError),
     #[error(transparent)]
     TransactionCommit(#[from] TransactionCommitError),
+    /// The server advertised a default branch (`server_trunk`) but no native
+    /// local or remote-tracking bookmark of that name exists. `vex clone` is
+    /// native-only and fails closed here, before working-copy creation: it
+    /// never falls back to another branch, an arbitrary head, or `git/ref/*`
+    /// (roadmap/066).
+    #[error(
+        "Server-advertised native trunk bookmark \"{trunk}\" was not found among this \
+         repository's native bookmarks. `vex clone` is native-only and does not fall back to \
+         Git refs. Complete the repository's native conversion (or repair its default branch), \
+         or use `vex git clone` for a Git-protocol clone."
+    )]
+    NativeTrunkMissing { trunk: String },
 }
 
 #[derive(Error, Debug)]
@@ -670,13 +682,17 @@ impl Workspace {
         config: VexRepoConfig,
         blob_mode: CloneBlobMode,
         // When `Some`, the working copy is checked out at this exact commit
-        // instead of the bookmark head `clone_vex_start_commit` would pick. CI
-        // runners use this to materialize the pipeline's `commit_sha` directly.
+        // instead of the native bookmark target `clone_vex_native_target`
+        // would pick. CI runners use this to materialize the pipeline's
+        // `commit_sha` directly.
         target_commit: Option<&CommitId>,
         // The trunk the server registered for this repo (`default_branch` from
-        // the repo-access catalog). On the default (`target_commit == None`)
-        // path this selects the start commit; ignored when `target_commit` is
-        // `Some`. `None` falls back to the local main/master/trunk heuristic.
+        // the repo-access catalog): the authoritative native bookmark name.
+        // On the default (`target_commit == None`) path this selects the start
+        // commit through native bookmarks only; if the bookmark is absent the
+        // clone fails closed with `WorkspaceInitError::NativeTrunkMissing`
+        // (never `git/ref/*`). Ignored when `target_commit` is `Some`. `None`
+        // falls back to the native-only main/master/trunk heuristic.
         server_trunk: Option<&str>,
         // Whether to bulk-hydrate the start commit's file/symlink contents into
         // the local cache before checkout (lazy clones only). Callers pass
@@ -805,24 +821,8 @@ impl Workspace {
                 .await
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
-            let (start_commit, resolved_trunk) = match target_commit {
-                Some(commit_id) => (
-                    repo.store()
-                        .get_commit_async(commit_id)
-                        .await
-                        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
-                    None,
-                ),
-                None => {
-                    if let Some(commit) =
-                        clone_vex_git_ref_start_commit(&repo, &store_path, server_trunk).await?
-                    {
-                        (commit, server_trunk.map(str::to_owned))
-                    } else {
-                        clone_vex_start_commit(&repo, server_trunk).await?
-                    }
-                }
-            };
+            let (start_commit, resolved_trunk) =
+                clone_vex_checkout_target(&repo, target_commit, server_trunk).await?;
             // Pre-checkout hydration: a lazy manifest defers every blob and
             // symlink, so materialization would otherwise pay one RPC per
             // file. Batch-fetch the start commit's contents into the cache
@@ -1198,17 +1198,139 @@ async fn clone_vex_bookmark_head(
     Ok(selected_commit)
 }
 
-async fn clone_vex_start_commit(
+/// A native bookmark resolved as the `vex clone` checkout target: the bookmark
+/// name that drove selection plus its target commit. Built only from native
+/// local/remote-tracking bookmark state, never from `git/ref/*`.
+#[derive(Clone, Debug)]
+pub struct NativeBookmarkTarget {
+    pub name: String,
+    pub commit: Commit,
+}
+
+/// Typed result of native `vex clone` target selection (roadmap/066 Stage 1).
+///
+/// `vex clone` is native-only: selection reads only native view state and
+/// never resolves `git/ref/*` or raw Git objects. With a server-advertised
+/// trunk the only outcomes are a resolved [`NativeBookmarkTarget`] or the
+/// typed [`WorkspaceInitError::NativeTrunkMissing`] error — there is no
+/// fallback chain.
+#[derive(Clone, Debug)]
+pub enum NativeCloneTarget {
+    /// The server-advertised trunk resolved through native local or
+    /// remote-tracking bookmarks. Authoritative: the target does not need to
+    /// be a current view head (the trunk may already have descendant commits).
+    ServerTrunk(NativeBookmarkTarget),
+    /// No server trunk was supplied (legacy catalog metadata): a native-only
+    /// heuristic over the view picked the target. `bookmark` is `None` for
+    /// the bookmark-less fallbacks (native-view `git_head`, recent workspace,
+    /// working copy, newest head).
+    LegacyNative {
+        bookmark: Option<String>,
+        commit: Commit,
+    },
+}
+
+impl NativeCloneTarget {
+    pub fn commit(&self) -> &Commit {
+        match self {
+            Self::ServerTrunk(target) => &target.commit,
+            Self::LegacyNative { commit, .. } => commit,
+        }
+    }
+
+    pub fn bookmark(&self) -> Option<&str> {
+        match self {
+            Self::ServerTrunk(target) => Some(&target.name),
+            Self::LegacyNative { bookmark, .. } => bookmark.as_deref(),
+        }
+    }
+
+    fn into_parts(self) -> (Commit, Option<String>) {
+        match self {
+            Self::ServerTrunk(target) => (target.commit, Some(target.name)),
+            Self::LegacyNative { bookmark, commit } => (commit, bookmark),
+        }
+    }
+}
+
+/// Select the commit `clone_vex` checks out. An explicit `target_commit`
+/// (CI/tests) is loaded as an exact native commit ID and bypasses bookmark
+/// selection entirely; otherwise native target selection runs.
+async fn clone_vex_checkout_target(
     repo: &Arc<ReadonlyRepo>,
-    // The trunk the SERVER registered for this repo (`Repository#default_branch`,
-    // surfaced to the clone flow via the repo-access catalog `default_branch`).
-    // It is authoritative: when set and the named bookmark exists (local or
-    // remote-tracking) we check out its target, regardless of name AND regardless
-    // of whether that target is a current view head — the server may register a
-    // trunk that already has descendant commits. Only when it is `None` or the
-    // bookmark genuinely doesn't exist do we fall back to the local
-    // main/master/trunk guesses below.
+    target_commit: Option<&CommitId>,
     server_trunk: Option<&str>,
+) -> Result<(Commit, Option<String>), WorkspaceInitError> {
+    match target_commit {
+        Some(commit_id) => Ok((
+            repo.store()
+                .get_commit_async(commit_id)
+                .await
+                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?,
+            None,
+        )),
+        None => Ok(clone_vex_native_target(repo, server_trunk)
+            .await?
+            .into_parts()),
+    }
+}
+
+/// Native target selection for `vex clone`. See [`NativeCloneTarget`].
+async fn clone_vex_native_target(
+    repo: &Arc<ReadonlyRepo>,
+    server_trunk: Option<&str>,
+) -> Result<NativeCloneTarget, WorkspaceInitError> {
+    match server_trunk {
+        Some(server_trunk) => Ok(NativeCloneTarget::ServerTrunk(
+            clone_vex_server_trunk_target(repo, server_trunk).await?,
+        )),
+        None => {
+            // Legacy catalog metadata supplied no trunk; the heuristic below
+            // stays native-only. Logged so the server metadata can be
+            // repaired (roadmap/066 keeps this path observable; counter
+            // wiring lands with the Stage 3 instrumentation).
+            tracing::debug!(
+                "vex clone: no server trunk advertised; using native view fallback selection"
+            );
+            let (commit, bookmark) = clone_vex_legacy_start_commit(repo).await?;
+            Ok(NativeCloneTarget::LegacyNative { bookmark, commit })
+        }
+    }
+}
+
+/// Resolve the server-advertised trunk (`Repository#default_branch`, surfaced
+/// via the repo-access catalog `default_branch`) through native local and
+/// remote-tracking bookmarks only. The name is authoritative: when the
+/// bookmark exists we check out its target regardless of whether that target
+/// is a current view head — the server may register a trunk that already has
+/// descendant commits. When the bookmark is absent this fails closed with
+/// [`WorkspaceInitError::NativeTrunkMissing`]; it never consults another
+/// branch, an arbitrary head, `git_head`, or `git/ref/*`.
+async fn clone_vex_server_trunk_target(
+    repo: &Arc<ReadonlyRepo>,
+    server_trunk: &str,
+) -> Result<NativeBookmarkTarget, WorkspaceInitError> {
+    // `require_head: false` disables the head-set filter, so the set contents
+    // are irrelevant here.
+    if let Some(commit) =
+        clone_vex_bookmark_head(repo, server_trunk, &HashSet::new(), false).await?
+    {
+        return Ok(NativeBookmarkTarget {
+            name: server_trunk.to_owned(),
+            commit,
+        });
+    }
+    Err(WorkspaceInitError::NativeTrunkMissing {
+        trunk: server_trunk.to_owned(),
+    })
+}
+
+/// Legacy native start-commit selection, used only when the server supplied no
+/// trunk. Reads native view state exclusively: native-only main/master/trunk
+/// bookmarks, local bookmarks, the native view's `git_head`, the most recent
+/// workspace operation, working-copy commits, and finally the newest head.
+async fn clone_vex_legacy_start_commit(
+    repo: &Arc<ReadonlyRepo>,
 ) -> Result<(Commit, Option<String>), WorkspaceInitError> {
     let mut head_ids = repo.view().heads().iter().cloned().collect::<Vec<_>>();
     if head_ids.is_empty() {
@@ -1216,18 +1338,7 @@ async fn clone_vex_start_commit(
     }
     head_ids.sort();
     let head_id_set = head_ids.iter().cloned().collect::<HashSet<_>>();
-    // The server registers the trunk; honor it before any local-name heuristic.
-    // This is authoritative, so do not require the target to be a view head:
-    // the server's trunk (e.g. `master`) may already have descendant commits.
-    if let Some(server_trunk) = server_trunk {
-        if let Some(commit) =
-            clone_vex_bookmark_head(repo, server_trunk, &head_id_set, false).await?
-        {
-            return Ok((commit, Some(server_trunk.to_owned())));
-        }
-    }
-    // Fallback when the server didn't supply a trunk (or its bookmark doesn't
-    // exist): prefer trunk bookmarks (main, then master, then trunk) that are
+    // Prefer trunk bookmarks (main, then master, then trunk) that are
     // current heads. This mirrors the default `trunk()` revset alias (see
     // jj/cli/src/config/revsets.toml).
     for bookmark_name in ["main", "master", "trunk"] {
@@ -1294,33 +1405,6 @@ async fn clone_vex_start_commit(
         selected_commit.expect("non-empty heads should produce a checkout target"),
         None,
     ))
-}
-
-async fn clone_vex_git_ref_start_commit(
-    repo: &Arc<ReadonlyRepo>,
-    store_path: &Path,
-    server_trunk: Option<&str>,
-) -> Result<Option<Commit>, WorkspaceInitError> {
-    let Some(server_trunk) = server_trunk else {
-        return Ok(None);
-    };
-    let client = crate::vex::VexClient::from_store_path(store_path)
-        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-    let Some(content_id) = client
-        .resolve_ref(&format!("git/ref/refs/heads/{server_trunk}"))
-        .await
-        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?
-    else {
-        return Ok(None);
-    };
-    let content_id = jj_backend_types::ContentId::from_hex(&content_id)
-        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-    let commit_id = CommitId::new(content_id.as_bytes().to_vec());
-    repo.store()
-        .get_commit_async(&commit_id)
-        .await
-        .map(Some)
-        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))
 }
 
 /// Bulk-fetch the file/symlink contents of `start_commit` into the local
@@ -1866,10 +1950,11 @@ mod tests {
         );
         let repo = tx.commit("create multiple heads").block_on()?;
 
-        let (start_commit, resolved_trunk) = clone_vex_start_commit(&repo, None).block_on()?;
-        assert_eq!(start_commit.id(), main_head.id());
-        assert_eq!(resolved_trunk.as_deref(), Some("main"));
-        assert_ne!(start_commit.id(), fallback_head.id());
+        let target = clone_vex_native_target(&repo, None).block_on()?;
+        assert!(matches!(target, NativeCloneTarget::LegacyNative { .. }));
+        assert_eq!(target.commit().id(), main_head.id());
+        assert_eq!(target.bookmark(), Some("main"));
+        assert_ne!(target.commit().id(), fallback_head.id());
         Ok(())
     }
 
@@ -1916,10 +2001,11 @@ mod tests {
             .commit("create remote trunk and local bookmark")
             .block_on()?;
 
-        let (start_commit, resolved_trunk) = clone_vex_start_commit(&repo, None).block_on()?;
-        assert_eq!(start_commit.id(), master_head.id());
-        assert_eq!(resolved_trunk.as_deref(), Some("master"));
-        assert_ne!(start_commit.id(), codex_head.id());
+        let target = clone_vex_native_target(&repo, None).block_on()?;
+        assert!(matches!(target, NativeCloneTarget::LegacyNative { .. }));
+        assert_eq!(target.commit().id(), master_head.id());
+        assert_eq!(target.bookmark(), Some("master"));
+        assert_ne!(target.commit().id(), codex_head.id());
         Ok(())
     }
 
@@ -1967,17 +2053,24 @@ mod tests {
             .commit("create remote trunk and local bookmark")
             .block_on()?;
 
-        let (start_commit, resolved_trunk) =
-            clone_vex_start_commit(&repo, Some("master")).block_on()?;
-        assert_eq!(start_commit.id(), master_head.id());
-        assert_eq!(resolved_trunk.as_deref(), Some("master"));
-        assert_ne!(start_commit.id(), codex_head.id());
+        let target = clone_vex_native_target(&repo, Some("master")).block_on()?;
+        assert!(matches!(target, NativeCloneTarget::ServerTrunk(_)));
+        assert_eq!(target.commit().id(), master_head.id());
+        assert_eq!(target.bookmark(), Some("master"));
+        assert_ne!(target.commit().id(), codex_head.id());
         Ok(())
     }
 
     #[test]
-    fn test_clone_vex_start_commit_ignores_missing_server_trunk() -> Result<(), WorkspaceInitError>
-    {
+    fn test_clone_vex_start_commit_missing_server_trunk_fails_closed()
+    -> Result<(), WorkspaceInitError> {
+        // The server advertised `main` but no native `main` bookmark exists.
+        // Native clone must fail with the typed `NativeTrunkMissing` error
+        // (before any working-copy creation) instead of falling through to a
+        // differently named bookmark, an arbitrary head, the view's git_head,
+        // or `git/ref/*`. A same-name raw Git ref and a git_head are present
+        // in the view to prove they are not consulted; the selector takes no
+        // client/store handle, so no `git/ref/*` RPC is even reachable.
         let settings = user_settings();
         let (_temp_dir, repo) = init_test_repo(&settings)?;
 
@@ -1987,6 +2080,13 @@ mod tests {
             .repo_mut()
             .new_commit(vec![root.id().clone()], root.tree())
             .set_description("master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let git_only_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("git-only main")
             .write()
             .block_on()
             .map_err(CheckOutCommitError::CreateCommit)?;
@@ -2000,13 +2100,162 @@ mod tests {
                 state: crate::op_store::RemoteRefState::Tracked,
             },
         );
+        // Raw Git view state for the advertised name must NOT rescue the clone.
+        tx.repo_mut().set_git_ref_target(
+            "refs/heads/main".as_ref(),
+            crate::op_store::RefTarget::normal(git_only_head.id().clone()),
+        );
+        tx.repo_mut()
+            .set_git_head_target(crate::op_store::RefTarget::normal(
+                git_only_head.id().clone(),
+            ));
         let repo = tx.commit("create master without main").block_on()?;
 
-        let (start_commit, resolved_trunk) =
-            clone_vex_start_commit(&repo, Some("main")).block_on()?;
+        let err = clone_vex_native_target(&repo, Some("main"))
+            .block_on()
+            .expect_err("missing advertised native trunk must fail closed");
+        match &err {
+            WorkspaceInitError::NativeTrunkMissing { trunk } => assert_eq!(trunk, "main"),
+            other => panic!("expected NativeTrunkMissing, got {other:?}"),
+        }
+        // The operator guidance must be actionable: native conversion or the
+        // explicit Git clone surface.
+        let message = err.to_string();
+        assert!(message.contains("native conversion"), "{message}");
+        assert!(message.contains("vex git clone"), "{message}");
+        Ok(())
+    }
 
-        assert_eq!(start_commit.id(), master_head.id());
-        assert_eq!(resolved_trunk.as_deref(), Some("master"));
+    #[test]
+    fn test_clone_vex_start_commit_native_bookmark_wins_over_git_ref()
+    -> Result<(), WorkspaceInitError> {
+        // Mixed converted state: the native `master@vex` bookmark and a raw
+        // Git ref `refs/heads/master` (plus git_head) point at different
+        // commits. The server-advertised trunk must resolve to the native
+        // bookmark target; the Git-side commits stay untouched.
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let native_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("native master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let git_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("git master")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_remote_bookmark(
+            crate::ref_name::RemoteRefSymbol {
+                name: "master".as_ref(),
+                remote: "vex".as_ref(),
+            },
+            crate::op_store::RemoteRef {
+                target: crate::op_store::RefTarget::normal(native_head.id().clone()),
+                state: crate::op_store::RemoteRefState::Tracked,
+            },
+        );
+        tx.repo_mut().set_git_ref_target(
+            "refs/heads/master".as_ref(),
+            crate::op_store::RefTarget::normal(git_head.id().clone()),
+        );
+        tx.repo_mut()
+            .set_git_head_target(crate::op_store::RefTarget::normal(git_head.id().clone()));
+        let repo = tx
+            .commit("create conflicting native and git master")
+            .block_on()?;
+
+        let target = clone_vex_native_target(&repo, Some("master")).block_on()?;
+        assert!(matches!(target, NativeCloneTarget::ServerTrunk(_)));
+        assert_eq!(target.commit().id(), native_head.id());
+        assert_eq!(target.bookmark(), Some("master"));
+        assert_ne!(target.commit().id(), git_head.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_start_commit_no_trunk_stays_native_only() -> Result<(), WorkspaceInitError> {
+        // Legacy path (no server trunk): with no native bookmarks, selection
+        // must not adopt a raw Git ref name from the view. The newest native
+        // head wins; the git-ref'd commit is not treated as a trunk.
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let git_reffed_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("git-ref'd older head")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let newer_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("newer anonymous head")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_git_ref_target(
+            "refs/heads/main".as_ref(),
+            crate::op_store::RefTarget::normal(git_reffed_head.id().clone()),
+        );
+        let repo = tx.commit("create git ref without bookmarks").block_on()?;
+
+        let target = clone_vex_native_target(&repo, None).block_on()?;
+        assert!(matches!(target, NativeCloneTarget::LegacyNative { .. }));
+        assert_eq!(target.commit().id(), newer_head.id());
+        assert_eq!(target.bookmark(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_checkout_target_exact_target_commit_bypasses_bookmarks()
+    -> Result<(), WorkspaceInitError> {
+        // An explicit `target_commit` (CI runners) is authoritative: it is
+        // loaded as an exact native commit and bookmark selection never runs,
+        // even when the advertised server trunk is missing (which would
+        // otherwise fail closed with `NativeTrunkMissing`).
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let mut tx = repo.start_transaction();
+        let root = repo.store().root_commit();
+        let exact_commit = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("exact target")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        let other_head = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("other head")
+            .write()
+            .block_on()
+            .map_err(CheckOutCommitError::CreateCommit)?;
+        tx.repo_mut().set_local_bookmark_target(
+            "main".as_ref(),
+            crate::op_store::RefTarget::normal(other_head.id().clone()),
+        );
+        let repo = tx.commit("create exact target and main").block_on()?;
+
+        let (start_commit, resolved_trunk) =
+            clone_vex_checkout_target(&repo, Some(exact_commit.id()), Some("does-not-exist"))
+                .block_on()?;
+        assert_eq!(start_commit.id(), exact_commit.id());
+        assert_eq!(resolved_trunk, None);
+        assert_ne!(start_commit.id(), other_head.id());
         Ok(())
     }
 
@@ -2073,12 +2322,12 @@ mod tests {
         assert!(heads.contains(master_child.id()));
         assert!(heads.contains(codex_head.id()));
 
-        let (start_commit, resolved_trunk) =
-            clone_vex_start_commit(&repo, Some("master")).block_on()?;
-        assert_eq!(start_commit.id(), master_head.id());
-        assert_eq!(resolved_trunk.as_deref(), Some("master"));
-        assert_ne!(start_commit.id(), codex_head.id());
-        assert_ne!(start_commit.id(), master_child.id());
+        let target = clone_vex_native_target(&repo, Some("master")).block_on()?;
+        assert!(matches!(target, NativeCloneTarget::ServerTrunk(_)));
+        assert_eq!(target.commit().id(), master_head.id());
+        assert_eq!(target.bookmark(), Some("master"));
+        assert_ne!(target.commit().id(), codex_head.id());
+        assert_ne!(target.commit().id(), master_child.id());
         Ok(())
     }
 
@@ -2118,9 +2367,9 @@ mod tests {
         tx.set_workspace_name("secondary".as_ref());
         let repo = tx.commit("record secondary workspace").block_on()?;
 
-        let (start_commit, _) = clone_vex_start_commit(&repo, None).block_on()?;
-        assert_eq!(start_commit.id(), other_head.id());
-        assert_ne!(start_commit.id(), default_head.id());
+        let target = clone_vex_native_target(&repo, None).block_on()?;
+        assert_eq!(target.commit().id(), other_head.id());
+        assert_ne!(target.commit().id(), default_head.id());
         Ok(())
     }
 
@@ -2150,8 +2399,8 @@ mod tests {
             .map_err(|err| CheckOutCommitError::EditCommit(err.into()))?;
         let repo = tx.commit("record discardable workspace").block_on()?;
 
-        let (start_commit, _) = clone_vex_start_commit(&repo, None).block_on()?;
-        assert_eq!(start_commit.id(), base.id());
+        let target = clone_vex_native_target(&repo, None).block_on()?;
+        assert_eq!(target.commit().id(), base.id());
         Ok(())
     }
 
@@ -2180,9 +2429,9 @@ mod tests {
             .map_err(CheckOutCommitError::CreateCommit)?;
         let repo = tx.commit("create anonymous heads").block_on()?;
 
-        let (start_commit, _) = clone_vex_start_commit(&repo, None).block_on()?;
-        assert_eq!(start_commit.id(), newer_head.id());
-        assert_ne!(start_commit.id(), older_head.id());
+        let target = clone_vex_native_target(&repo, None).block_on()?;
+        assert_eq!(target.commit().id(), newer_head.id());
+        assert_ne!(target.commit().id(), older_head.id());
         Ok(())
     }
 

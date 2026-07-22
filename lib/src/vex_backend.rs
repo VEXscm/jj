@@ -66,7 +66,9 @@ use crate::simple_backend::commit_to_proto;
 use crate::simple_backend::tree_from_proto;
 use crate::simple_backend::tree_to_proto;
 use crate::vex::VexClient;
+use crate::vex::VexObjectReadMode;
 use crate::vex::VexRepoConfig;
+use crate::vex::vex_client_stats;
 
 const ID_LENGTH: usize = 32;
 const CHANGE_ID_LENGTH: usize = 16;
@@ -112,6 +114,47 @@ fn to_content_id(id: &[u8], object_type: &str) -> BackendResult<jj_backend_types
     Ok(jj_backend_types::ContentId::from_bytes(bytes))
 }
 
+/// Typed error for a native-only read path that fetched commit/tree bytes
+/// which are not a native Vex protobuf object (roadmap/066).
+///
+/// Returned (as the source of a [`BackendError::ReadObject`]) when a backend
+/// in [`VexObjectReadMode::NativeOnly`] — every normal clone/load — fails to
+/// decode an object natively. It names the object kind and the native
+/// repository contract, and deliberately carries no object contents,
+/// credentials, or signed URLs. It is never a signal to retry through the raw
+/// Git parsers: Git-format data belongs to `vex git clone`, Git smart HTTP,
+/// or an explicit conversion that opted into
+/// [`VexObjectReadMode::GitCompatibility`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{object_kind} object is not a native Vex protobuf {object_kind}; this repository is read \
+     under the native-only object contract (native Vex clones never traverse raw Git objects — \
+     complete native conversion, or use `vex git clone`/an explicit Git compatibility operation \
+     for Git-format data)"
+)]
+pub struct VexNativeObjectFormatError {
+    /// The object kind that failed native decoding (`"commit"` or `"tree"`).
+    pub object_kind: &'static str,
+    /// The underlying protobuf decode failure (no object contents).
+    #[source]
+    pub source: prost::DecodeError,
+}
+
+fn native_only_read_error(
+    object_kind: &'static str,
+    hash: String,
+    source: prost::DecodeError,
+) -> BackendError {
+    BackendError::ReadObject {
+        object_type: object_kind.to_string(),
+        hash,
+        source: Box::new(VexNativeObjectFormatError {
+            object_kind,
+            source,
+        }),
+    }
+}
+
 fn map_status_error(
     err: crate::vex::VexClientError,
     object_type: &str,
@@ -140,6 +183,11 @@ pub struct VexBackend {
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
+    /// Object decode policy (roadmap/066). [`VexObjectReadMode::NativeOnly`]
+    /// for every normal clone/load; only explicit conversion/Git-bridge
+    /// callers construct a config carrying
+    /// [`VexObjectReadMode::GitCompatibility`].
+    object_read_mode: VexObjectReadMode,
 }
 
 impl VexBackend {
@@ -167,12 +215,14 @@ impl VexBackend {
             .as_deref()
             .filter(|path| !path.is_empty() && *path != ".")
             .and_then(|path| RepoPathBuf::from_internal_string(path.to_string()).ok());
+        let object_read_mode = client.config().object_read_mode;
         Self {
             client,
             virtual_root_path,
             root_commit_id: CommitId::from_bytes(&[0; ID_LENGTH]),
             root_change_id: ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]),
             empty_tree_id,
+            object_read_mode,
         }
     }
 
@@ -234,12 +284,22 @@ impl VexBackend {
         Ok(tree)
     }
 
+    /// Resolve one raw Git SHA-1 to its native content ID through the
+    /// `git/object/sha1/*` compatibility namespace. Reachable only from the
+    /// raw Git parsers ([`Self::read_git_tree`] / [`Self::parse_git_commit`]),
+    /// which are themselves gated on explicit
+    /// [`VexObjectReadMode::GitCompatibility`] — a native-only read never
+    /// issues these RPCs.
     async fn git_mapping(&self, kind: &str, oid_hex: &str) -> BackendResult<Vec<u8>> {
+        debug_assert!(
+            self.object_read_mode.allows_git_compatibility(),
+            "git_mapping() reached on a NativeOnly read path"
+        );
         let ref_name = format!("git/object/sha1/{kind}/{oid_hex}");
-        let content_id = self
-            .client
-            .resolve_ref(&ref_name)
-            .await
+        let started = std::time::Instant::now();
+        let resolved = self.client.resolve_ref(&ref_name).await;
+        vex_client_stats().record_git_mapping_rpc(1, started.elapsed());
+        let content_id = resolved
             .map_err(|err| BackendError::ReadObject {
                 object_type: "git-mapping".to_string(),
                 hash: oid_hex.to_string(),
@@ -546,7 +606,19 @@ impl Backend for VexBackend {
             .await?;
         let tree = match crate::protos::simple_store::Tree::decode(&*data) {
             Ok(proto) => tree_from_proto(proto),
-            Err(_) => self.read_git_tree(&data).await?,
+            // A decode failure is NOT a mode selector: under the native-only
+            // contract it is a typed read error, and only a backend whose
+            // config explicitly opted into Git compatibility (conversion /
+            // Git-bridge callers) may parse the bytes as a raw Git tree.
+            Err(err) => match self.object_read_mode {
+                VexObjectReadMode::NativeOnly => {
+                    return Err(native_only_read_error("tree", id.hex(), err));
+                }
+                VexObjectReadMode::GitCompatibility => {
+                    vex_client_stats().record_git_compat_tree_decode();
+                    self.read_git_tree(&data).await?
+                }
+            },
         };
         if path.is_root() {
             self.project_tree_to_virtual_root(tree).await
@@ -576,7 +648,17 @@ impl Backend for VexBackend {
             .await?;
         match crate::protos::simple_store::Commit::decode(&*data) {
             Ok(proto) => Ok(commit_from_proto(proto)),
-            Err(_) => self.parse_git_commit(&data, id).await,
+            // See `read_tree`: decode failure is a typed native error, never
+            // an implicit switch into the raw Git compatibility parser.
+            Err(err) => match self.object_read_mode {
+                VexObjectReadMode::NativeOnly => {
+                    Err(native_only_read_error("commit", id.hex(), err))
+                }
+                VexObjectReadMode::GitCompatibility => {
+                    vex_client_stats().record_git_compat_commit_decode();
+                    self.parse_git_commit(&data, id).await
+                }
+            },
         }
     }
 
@@ -621,13 +703,29 @@ impl Backend for VexBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::VexBackend;
+    use super::VexNativeObjectFormatError;
     use super::sha256_bytes;
     use crate::backend::Backend as _;
+    use crate::backend::BackendError;
+    use crate::backend::ChangeId;
+    use crate::backend::Commit;
+    use crate::backend::CommitId;
     use crate::backend::FileId;
+    use crate::backend::MillisSinceEpoch;
+    use crate::backend::Signature;
+    use crate::backend::Timestamp;
+    use crate::backend::TreeValue;
+    use crate::merge::Merge;
     use crate::object_id::ObjectId as _;
     use crate::repo_path::RepoPath;
+    use crate::repo_path::RepoPathComponentBuf;
+    use crate::vex::VexObjectReadMode;
     use crate::vex::VexRepoConfig;
+    use crate::vex::test_stats_lock;
+    use crate::vex::vex_client_stats_snapshot;
     use futures::AsyncReadExt as _;
     use pollster::FutureExt as _;
 
@@ -645,6 +743,52 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
+            object_read_mode: VexObjectReadMode::NativeOnly,
+        }
+    }
+
+    /// Scaffold a loadable repo dir whose `vex.json` carries the given object
+    /// read mode, and return a backend loaded from it. The endpoint is
+    /// unreachable (`127.0.0.1:1`), so any attempted RPC — e.g. a
+    /// `git/object/sha1/*` mapping lookup — fails instead of silently
+    /// succeeding; objects are served from the local `vex-cache` only.
+    fn load_backend_with_mode(repo_dir: &Path, mode: VexObjectReadMode) -> VexBackend {
+        let store_dir = repo_dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        // `object_read_mode` is deliberately never serialized (a normal clone
+        // must not persist compatibility mode), so spell the field out by
+        // hand for the compatibility fixture.
+        let mut value = serde_json::to_value(sample_config()).unwrap();
+        if mode.allows_git_compatibility() {
+            value["object_read_mode"] = serde_json::Value::String("git_compatibility".to_string());
+        }
+        std::fs::write(
+            repo_dir.join("vex.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        VexBackend::load(&store_dir).unwrap()
+    }
+
+    /// Write `data` into the local object cache under its content address so
+    /// backend reads resolve without any network.
+    fn put_cached_object(repo_dir: &Path, kind_dir: &str, data: &[u8]) -> Vec<u8> {
+        let id = sha256_bytes(data).to_vec();
+        let path = repo_dir
+            .join("vex-cache")
+            .join(kind_dir)
+            .join(super::hex_bytes(&id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, data).unwrap();
+        id
+    }
+
+    fn native_format_source(err: &BackendError) -> Option<&VexNativeObjectFormatError> {
+        match err {
+            BackendError::ReadObject { source, .. } => {
+                source.downcast_ref::<VexNativeObjectFormatError>()
+            }
+            _ => None,
         }
     }
 
@@ -690,5 +834,179 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).block_on().unwrap();
         assert_eq!(buf, data);
+    }
+
+    /// Native protobuf commits and trees decode successfully under the
+    /// default `NativeOnly` mode, entirely from the local cache.
+    #[test]
+    fn native_only_mode_reads_native_protobuf_commit_and_tree() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let backend = load_backend_with_mode(&repo_dir, VexObjectReadMode::NativeOnly);
+
+        let tree = crate::backend::Tree::from_sorted_entries(vec![(
+            RepoPathComponentBuf::new("file".to_string()).unwrap(),
+            TreeValue::File {
+                id: FileId::new(sha256_bytes(b"contents").to_vec()),
+                executable: false,
+                copy_id: crate::backend::CopyId::placeholder(),
+            },
+        )]);
+        let (tree_id, tree_bytes) = super::serialize_tree(&tree);
+        put_cached_object(&repo_dir, "tree", &tree_bytes);
+
+        let signature = Signature {
+            name: "author".to_string(),
+            email: "author@example.test".to_string(),
+            timestamp: Timestamp {
+                timestamp: MillisSinceEpoch(0),
+                tz_offset: 0,
+            },
+        };
+        let commit = Commit {
+            parents: vec![CommitId::from_bytes(&[0; super::ID_LENGTH])],
+            predecessors: vec![],
+            root_tree: Merge::resolved(tree_id.clone()),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::from_bytes(&[7; super::CHANGE_ID_LENGTH]),
+            description: "native protobuf commit".to_string(),
+            author: signature.clone(),
+            committer: signature,
+            secure_sig: None,
+        };
+        let (commit_id, commit_bytes) = super::serialize_commit(&commit);
+        put_cached_object(&repo_dir, "commit", &commit_bytes);
+
+        let read_tree = backend
+            .read_tree(RepoPath::root(), &tree_id)
+            .block_on()
+            .unwrap();
+        assert_eq!(read_tree, tree);
+
+        let read_commit = backend.read_commit(&commit_id).block_on().unwrap();
+        assert_eq!(read_commit.description, "native protobuf commit");
+        assert_eq!(read_commit.root_tree, Merge::resolved(tree_id));
+    }
+
+    /// Raw Git commit bytes are a typed native object-format error under
+    /// `NativeOnly` — the read never enters `parse_git_commit()` and the
+    /// error names the contract without echoing the object contents.
+    #[test]
+    fn native_only_mode_rejects_raw_git_commit_bytes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let backend = load_backend_with_mode(&repo_dir, VexObjectReadMode::NativeOnly);
+        let data = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nsecret commit message";
+        let id = CommitId::new(put_cached_object(&repo_dir, "commit", data));
+
+        let err = backend.read_commit(&id).block_on().unwrap_err();
+
+        let typed = native_format_source(&err).expect("expected VexNativeObjectFormatError");
+        assert_eq!(typed.object_kind, "commit");
+        let message = typed.to_string();
+        assert!(message.contains("native-only"), "message: {message}");
+        // The typed error names the contract, never the object contents.
+        assert!(!message.contains("secret commit message"));
+        assert!(!message.contains("4b825dc6"));
+    }
+
+    /// Raw Git tree bytes are rejected under `NativeOnly` without a single
+    /// `git/object/sha1/*` mapping lookup. A mapping attempt would both fail
+    /// differently (the endpoint is unreachable) and bump the mapping
+    /// counters, which must stay untouched.
+    #[test]
+    fn native_only_mode_rejects_raw_git_tree_bytes_without_mapping_lookup() {
+        let _guard = test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let backend = load_backend_with_mode(&repo_dir, VexObjectReadMode::NativeOnly);
+        let mut data = b"40000 dir\0".to_vec();
+        data.extend_from_slice(&[0xaa; 20]);
+        let id = crate::backend::TreeId::new(put_cached_object(&repo_dir, "tree", &data));
+
+        let before = vex_client_stats_snapshot();
+        let err = backend
+            .read_tree(RepoPath::root(), &id)
+            .block_on()
+            .unwrap_err();
+        let after = vex_client_stats_snapshot();
+
+        let typed = native_format_source(&err).expect("expected VexNativeObjectFormatError");
+        assert_eq!(typed.object_kind, "tree");
+        assert_eq!(after.git_mapping_rpcs, before.git_mapping_rpcs);
+        assert_eq!(
+            after.git_mapping_names_resolved,
+            before.git_mapping_names_resolved
+        );
+        assert_eq!(
+            after.git_compat_tree_decodes,
+            before.git_compat_tree_decodes
+        );
+    }
+
+    /// Explicit `GitCompatibility` preserves the raw Git tree parser: a
+    /// gitlink-only tree (which needs no SHA-1 mapping lookup) still decodes,
+    /// and the compatibility decode counter records it.
+    #[test]
+    fn git_compatibility_mode_decodes_raw_git_tree() {
+        let _guard = test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let backend = load_backend_with_mode(&repo_dir, VexObjectReadMode::GitCompatibility);
+        let submodule_oid = [0x04; 20];
+        let mut data = b"160000 sub\0".to_vec();
+        data.extend_from_slice(&submodule_oid);
+        let id = crate::backend::TreeId::new(put_cached_object(&repo_dir, "tree", &data));
+
+        let before = vex_client_stats_snapshot();
+        let tree = backend.read_tree(RepoPath::root(), &id).block_on().unwrap();
+        let after = vex_client_stats_snapshot();
+
+        let component = RepoPathComponentBuf::new("sub".to_string()).unwrap();
+        assert_eq!(
+            tree.value(&component),
+            Some(&TreeValue::GitSubmodule(CommitId::from_bytes(
+                &submodule_oid
+            )))
+        );
+        assert_eq!(
+            after.git_compat_tree_decodes,
+            before.git_compat_tree_decodes + 1
+        );
+        // A gitlink entry carries its id inline; no mapping RPC is needed.
+        assert_eq!(after.git_mapping_rpcs, before.git_mapping_rpcs);
+    }
+
+    /// Explicit `GitCompatibility` still routes non-protobuf commit bytes
+    /// into `parse_git_commit()` (here failing on a commit with no tree
+    /// header — a parser error, not the native-only typed error) and records
+    /// the compatibility decode.
+    #[test]
+    fn git_compatibility_mode_still_enters_raw_git_commit_parser() {
+        let _guard = test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let backend = load_backend_with_mode(&repo_dir, VexObjectReadMode::GitCompatibility);
+        let data = b"parent deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n\nno tree header";
+        let id = CommitId::new(put_cached_object(&repo_dir, "commit", data));
+
+        let before = vex_client_stats_snapshot();
+        let err = backend.read_commit(&id).block_on().unwrap_err();
+        let after = vex_client_stats_snapshot();
+
+        // The compatibility parser ran (and failed on its own terms); the
+        // native-only typed rejection was NOT raised.
+        assert!(native_format_source(&err).is_none(), "unexpected: {err:?}");
+        assert!(matches!(err, BackendError::ReadObject { .. }));
+        assert_eq!(
+            after.git_compat_commit_decodes,
+            before.git_compat_commit_decodes + 1
+        );
     }
 }
