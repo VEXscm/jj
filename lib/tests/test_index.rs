@@ -798,6 +798,153 @@ fn test_reindex_missing_commit() -> TestResult {
     Ok(())
 }
 
+/// Historical op-log views may reference raw Git-format commits. Under the
+/// NativeOnly boundary those reads raise `VexNativeObjectFormatError`; the
+/// index builder must skip them (not fail) so a fresh native clone can still
+/// index the native tips (roadmap/066).
+#[test]
+fn test_reindex_skips_native_object_format_errors() -> TestResult {
+    let settings = testutils::user_settings();
+    let test_repo = TestRepo::init();
+    let test_env = &test_repo.env;
+    let repo = &test_repo.repo;
+
+    let mut tx = repo.start_transaction();
+    let git_format_commit = write_random_commit(tx.repo_mut());
+    let repo = tx.commit("historical git-format tip").block_on()?;
+
+    let mut tx = repo.start_transaction();
+    tx.repo_mut().remove_head(git_format_commit.id());
+    let native_commit = write_random_commit(tx.repo_mut());
+    let repo = tx.commit("native tip after repair").block_on()?;
+
+    // Simulate: historical commit bytes are raw Git; current tip is native.
+    let test_backend: &TestBackend = repo.store().backend_impl().unwrap();
+    test_backend.mark_commit_native_format_error(git_format_commit.id());
+    let repo = test_env.load_repo_at_head(&settings, test_repo.repo_path());
+    assert!(
+        jj_lib::vex_backend::VexBackend::is_native_object_format_error(
+            &repo.store().get_commit(git_format_commit.id()).unwrap_err()
+        )
+    );
+
+    let before = jj_lib::vex::vex_client_stats_snapshot();
+    let default_index_store: &DefaultIndexStore = repo.index_store().downcast_ref().unwrap();
+    default_index_store.reinit()?;
+    let index = default_index_store
+        .build_index_at_operation(repo.operation(), repo.store())
+        .block_on()?;
+    let after = jj_lib::vex::vex_client_stats_snapshot();
+
+    assert!(
+        index.has_id(native_commit.id()).unwrap(),
+        "native tip must be indexed"
+    );
+    assert!(
+        !index.has_id(git_format_commit.id()).unwrap(),
+        "raw-git historical commit must be skipped, not indexed"
+    );
+    // Skipping must not enter Git compatibility decoding or mapping RPCs.
+    assert_eq!(
+        after.git_compat_commit_decodes,
+        before.git_compat_commit_decodes
+    );
+    assert_eq!(
+        after.git_compat_tree_decodes,
+        before.git_compat_tree_decodes
+    );
+    assert_eq!(after.git_mapping_rpcs, before.git_mapping_rpcs);
+    assert_eq!(
+        after.git_mapping_names_resolved,
+        before.git_mapping_names_resolved
+    );
+    Ok(())
+}
+
+/// Native commits whose parents are raw-Git-format commits (the git-import
+/// boundary) must index successfully: the raw parent is skipped and the
+/// parent edge is truncated so the native child becomes a root of the
+/// native subgraph — never a panic on "parent commit is not indexed".
+#[test]
+fn test_reindex_truncates_parent_edges_to_skipped_raw_git_commits() -> TestResult {
+    let settings = testutils::user_settings();
+    let test_repo = TestRepo::init();
+    let test_env = &test_repo.env;
+    let repo = &test_repo.repo;
+    let root_id = repo.store().root_commit_id().clone();
+
+    let mut tx = repo.start_transaction();
+    let git_format_parent = write_random_commit(tx.repo_mut());
+    // Sibling keeps a live path to the store root so the root stays indexed
+    // and `is_ancestor` assertions below are well-defined.
+    let native_sibling = write_random_commit(tx.repo_mut());
+    let native_child = write_random_commit_with_parents(tx.repo_mut(), &[&git_format_parent]);
+    let repo = tx.commit("native child of raw-git parent").block_on()?;
+
+    // The commit object still lists the raw-git parent; only the index walk
+    // truncates that edge.
+    assert_eq!(native_child.parent_ids(), &[git_format_parent.id().clone()]);
+
+    let test_backend: &TestBackend = repo.store().backend_impl().unwrap();
+    test_backend.mark_commit_native_format_error(git_format_parent.id());
+    let repo = test_env.load_repo_at_head(&settings, test_repo.repo_path());
+
+    let before = jj_lib::vex::vex_client_stats_snapshot();
+    let default_index_store: &DefaultIndexStore = repo.index_store().downcast_ref().unwrap();
+    default_index_store.reinit()?;
+    let index = default_index_store
+        .build_index_at_operation(repo.operation(), repo.store())
+        .block_on()
+        .expect("index build must not panic when a native child has a raw-git parent");
+    let after = jj_lib::vex::vex_client_stats_snapshot();
+
+    assert!(
+        index.has_id(native_child.id()).unwrap(),
+        "native child must be indexed"
+    );
+    assert!(
+        index.has_id(native_sibling.id()).unwrap(),
+        "native sibling must be indexed"
+    );
+    assert!(
+        !index.has_id(git_format_parent.id()).unwrap(),
+        "raw-git parent must be absent from the index"
+    );
+    // Sibling still reaches the store root through its native parent edge.
+    assert!(index.is_ancestor(&root_id, native_sibling.id()).unwrap());
+    // Truncated parent edge: store root is no longer an indexed ancestor of
+    // the native child (the only path went through the skipped raw parent),
+    // so the child is a root of the native subgraph.
+    assert!(
+        !index.is_ancestor(&root_id, native_child.id()).unwrap(),
+        "raw parent edge must be dropped so the native child is a native-subgraph root"
+    );
+    assert_eq!(
+        after.git_compat_commit_decodes,
+        before.git_compat_commit_decodes
+    );
+    assert_eq!(
+        after.git_compat_tree_decodes,
+        before.git_compat_tree_decodes
+    );
+    assert_eq!(after.git_mapping_rpcs, before.git_mapping_rpcs);
+    assert_eq!(
+        after.git_mapping_names_resolved,
+        before.git_mapping_names_resolved
+    );
+    Ok(())
+}
+
+/// Non-format read errors (object-not-found) during index build must still
+/// fail closed — only the typed native-object-format error is skippable.
+#[test]
+fn test_reindex_still_fails_on_object_not_found() -> TestResult {
+    // Alias of the existing missing-commit regression: keep an explicit name
+    // so roadmap/066's "non-format error still fails" acceptance stays
+    // discoverable next to the skip test above.
+    test_reindex_missing_commit()
+}
+
 /// Test that .jj/repo/index/type is created when the repo is created.
 #[test]
 fn test_index_store_type() -> TestResult {

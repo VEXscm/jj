@@ -140,6 +140,19 @@ pub struct VexNativeObjectFormatError {
     pub source: prost::DecodeError,
 }
 
+impl VexNativeObjectFormatError {
+    /// Build a format error for tests that simulate raw Git bytes under a
+    /// NativeOnly read path (no real protobuf decode attempt).
+    pub fn for_tests(object_kind: &'static str) -> Self {
+        #[allow(deprecated)]
+        let source = prost::DecodeError::new("simulated non-native object bytes");
+        Self {
+            object_kind,
+            source,
+        }
+    }
+}
+
 fn native_only_read_error(
     object_kind: &'static str,
     hash: String,
@@ -204,6 +217,36 @@ impl VexBackend {
         let client =
             VexClient::from_store_path(store_path).map_err(|err| BackendLoadError(err.into()))?;
         Ok(Self::new(client))
+    }
+
+    /// Load a backend from `store_path`, overriding the on-disk object-read
+    /// mode with `object_read_mode`.
+    ///
+    /// Used by conversion/materialization: `object_read_mode` is never
+    /// persisted to `vex.json` (`#[serde(skip_serializing)]`), so a plain
+    /// [`Self::load`] always gets [`VexObjectReadMode::NativeOnly`]. Callers
+    /// that must read historical raw-Git commit bytes (repair / import)
+    /// construct [`VexObjectReadMode::GitCompatibility`] here in memory.
+    pub fn load_with_object_read_mode(
+        store_path: &Path,
+        object_read_mode: VexObjectReadMode,
+    ) -> Result<Self, BackendLoadError> {
+        let client = VexClient::from_store_path_with_object_read_mode(store_path, object_read_mode)
+            .map_err(|err| BackendLoadError(err.into()))?;
+        Ok(Self::new(client))
+    }
+
+    /// Whether `err` is the typed native-object-format rejection from a
+    /// [`VexObjectReadMode::NativeOnly`] read. Used by the index builder to
+    /// skip historical git-format commits without treating them as a hard
+    /// failure (and without entering Git compatibility decoding).
+    pub fn is_native_object_format_error(err: &BackendError) -> bool {
+        match err {
+            BackendError::ReadObject { source, .. } => source
+                .downcast_ref::<VexNativeObjectFormatError>()
+                .is_some(),
+            _ => false,
+        }
     }
 
     fn new(client: VexClient) -> Self {
@@ -999,6 +1042,47 @@ mod tests {
         );
         // A gitlink entry carries its id inline; no mapping RPC is needed.
         assert_eq!(after.git_mapping_rpcs, before.git_mapping_rpcs);
+    }
+
+    /// `load_with_object_read_mode` applies an in-memory override after reading
+    /// `vex.json` (which never persists the mode). Conversion relies on this
+    /// so a NativeOnly on-disk file still yields a GitCompatibility backend.
+    #[test]
+    fn load_with_object_read_mode_overrides_disk_native_only() {
+        let _guard = test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let store_dir = repo_dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        // Persist without a mode field (product write path).
+        sample_config().write_to_repo_path(&repo_dir).unwrap();
+        let data = b"parent deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n\nno tree header";
+        let id = CommitId::new(put_cached_object(&repo_dir, "commit", data));
+
+        let native_only = VexBackend::load(&store_dir).unwrap();
+        assert!(
+            VexBackend::is_native_object_format_error(
+                &native_only.read_commit(&id).block_on().unwrap_err()
+            ),
+            "plain load must stay NativeOnly"
+        );
+
+        let compat =
+            VexBackend::load_with_object_read_mode(&store_dir, VexObjectReadMode::GitCompatibility)
+                .unwrap();
+        let before = vex_client_stats_snapshot();
+        let err = compat.read_commit(&id).block_on().unwrap_err();
+        let after = vex_client_stats_snapshot();
+        assert!(
+            !VexBackend::is_native_object_format_error(&err),
+            "override must enter the git parser, not the native-only rejection"
+        );
+        assert_eq!(
+            after.git_compat_commit_decodes,
+            before.git_compat_commit_decodes + 1
+        );
     }
 
     /// Explicit `GitCompatibility` still routes non-protobuf commit bytes

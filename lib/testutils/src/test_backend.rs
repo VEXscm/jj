@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
@@ -53,6 +54,7 @@ use jj_lib::index::Index;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::vex_backend::VexNativeObjectFormatError;
 use tokio::runtime::Runtime;
 
 const HASH_LENGTH: usize = 10;
@@ -67,6 +69,10 @@ type TestBackendDataMap = HashMap<PathBuf, Arc<Mutex<TestBackendData>>>;
 #[derive(Default)]
 pub struct TestBackendData {
     commits: HashMap<CommitId, Commit>,
+    /// Commit ids that still exist in the map but must surface the typed
+    /// native-object-format error on read (simulates raw Git bytes under a
+    /// NativeOnly Vex backend — roadmap/066 index-build skip).
+    native_format_error_commits: HashSet<CommitId>,
     trees: HashMap<RepoPathBuf, HashMap<TreeId, Tree>>,
     files: HashMap<RepoPathBuf, HashMap<FileId, Vec<u8>>>,
     symlinks: HashMap<RepoPathBuf, HashMap<SymlinkId, String>>,
@@ -148,6 +154,17 @@ impl TestBackend {
 
     pub fn remove_commit_unchecked(&self, id: &CommitId) {
         self.locked_data().commits.remove(id);
+    }
+
+    /// Mark `id` so subsequent `read_commit` calls return
+    /// [`VexNativeObjectFormatError`] (as the source of
+    /// [`BackendError::ReadObject`]), while leaving the commit bytes in the
+    /// map. Models a Vex NativeOnly backend confronting raw Git-format
+    /// object bytes during index build.
+    pub fn mark_commit_native_format_error(&self, id: &CommitId) {
+        self.locked_data()
+            .native_format_error_commits
+            .insert(id.clone());
     }
 
     async fn run_async<R: Send + 'static>(
@@ -386,13 +403,22 @@ impl Backend for TestBackend {
             ));
         }
         let id = id.clone();
-        self.run_async(move |data| match data.commits.get(&id).cloned() {
-            None => Err(BackendError::ObjectNotFound {
-                object_type: "commit".to_string(),
-                hash: id.hex(),
-                source: "".into(),
-            }),
-            Some(commit) => Ok(commit),
+        self.run_async(move |data| {
+            if data.native_format_error_commits.contains(&id) {
+                return Err(BackendError::ReadObject {
+                    object_type: "commit".to_string(),
+                    hash: id.hex(),
+                    source: Box::new(VexNativeObjectFormatError::for_tests("commit")),
+                });
+            }
+            match data.commits.get(&id).cloned() {
+                None => Err(BackendError::ObjectNotFound {
+                    object_type: "commit".to_string(),
+                    hash: id.hex(),
+                    source: "".into(),
+                }),
+                Some(commit) => Ok(commit),
+            }
         })
         .await
     }

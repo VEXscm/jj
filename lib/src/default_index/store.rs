@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::slice;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -64,6 +65,7 @@ use crate::op_store::OperationId;
 use crate::op_walk;
 use crate::operation::Operation;
 use crate::store::Store;
+use crate::vex_backend::VexBackend;
 
 // BLAKE2b-512 hash length in hex string
 const SEGMENT_FILE_NAME_LENGTH: usize = 64 * 2;
@@ -300,13 +302,39 @@ impl DefaultIndexStore {
                 .as_ref()
                 .is_some_and(|index| index.has_id_impl(id))
         };
+        // Under NativeOnly, historical op-log views may still reference raw
+        // Git-format commits (git push imports / incomplete conversion). Those
+        // produce a typed `VexNativeObjectFormatError` and must be skipped —
+        // not indexed, not parent-walked, and not a hard index-build failure —
+        // so a fresh native clone can still index the native tips. Native
+        // children that listed a skipped commit as a parent are indexed with
+        // that edge dropped (native-subgraph truncation at the Git boundary).
+        // Genuine transport/ObjectNotFound errors still fail the build.
+        // Fail-closed for the selected checkout target remains in VexBackend
+        // reads during checkout (roadmap/066).
+        //
+        // Commits already present in a parent index segment (indexed by an
+        // older CLI that may have stored raw-Git tips) are left alone via
+        // `parent_index_has_id` — we never remove historical index entries.
+        let skipped_native_format: Mutex<HashSet<CommitId>> = Mutex::new(HashSet::new());
         let get_commit_with_op = |commit_id: &CommitId, op_id: &OperationId| {
             let op_id = op_id.clone();
             match store.get_commit(commit_id) {
                 // Propagate head's op_id to report possible source of an error.
                 // The op_id doesn't have to be included in the sort key, but
                 // that wouldn't matter since the commit should be unique.
-                Ok(commit) => Ok((CommitByCommitterTimestamp(commit), op_id)),
+                Ok(commit) => Ok(Some((CommitByCommitterTimestamp(commit), op_id))),
+                Err(source) if VexBackend::is_native_object_format_error(&source) => {
+                    skipped_native_format
+                        .lock()
+                        .unwrap()
+                        .insert(commit_id.clone());
+                    tracing::debug!(
+                        "skipping non-native commit during index build (not a native Vex \
+                         protobuf commit)"
+                    );
+                    Ok(None)
+                }
                 Err(source) => Err(DefaultIndexStoreError::IndexCommits { op_id, source }),
             }
         };
@@ -324,6 +352,9 @@ impl DefaultIndexStore {
                 if ancestors.contains(&commit_id) || parent_index_has_id(&commit_id) {
                     continue;
                 }
+                // Format-error commits are already skipped by `if let Ok`;
+                // other read failures are likewise ignored here (legacy
+                // predecessor discovery is best-effort).
                 if let Ok(commit) = store.get_commit(&commit_id) {
                     work.extend(commit.parent_ids().iter().cloned());
                 }
@@ -333,16 +364,24 @@ impl DefaultIndexStore {
         } else {
             HashSet::new()
         };
+        let mut start = Vec::new();
+        for (commit_id, op_id) in historical_heads
+            .iter()
+            .filter(|&(commit_id, _)| !parent_index_has_id(commit_id))
+        {
+            match get_commit_with_op(commit_id, op_id)? {
+                Some(item) => start.push(Ok(item)),
+                None => {}
+            }
+        }
         let commits = dag_walk_async::topo_order_reverse_ord(
-            historical_heads
-                .iter()
-                .filter(|&(commit_id, _)| !parent_index_has_id(commit_id))
-                .map(|(commit_id, op_id)| get_commit_with_op(commit_id, op_id)),
+            start,
             |(CommitByCommitterTimestamp(commit), _)| commit.id().clone(),
             async |(CommitByCommitterTimestamp(commit), op_id)| {
                 let keep_predecessors =
                     commits_to_keep_immediate_predecessors.contains(commit.id());
-                itertools::chain(
+                let mut neighbors = Vec::new();
+                for commit_id in itertools::chain(
                     commit.parent_ids(),
                     keep_predecessors
                         .then_some(&commit.store_commit().predecessors)
@@ -350,19 +389,50 @@ impl DefaultIndexStore {
                         .flatten(),
                 )
                 .filter(|&id| !parent_index_has_id(id))
-                .map(|commit_id| get_commit_with_op(commit_id, op_id))
-                .collect_vec()
+                {
+                    match get_commit_with_op(commit_id, op_id) {
+                        Ok(Some(item)) => neighbors.push(Ok(item)),
+                        Ok(None) => {}
+                        Err(err) => neighbors.push(Err(err)),
+                    }
+                }
+                neighbors
             },
             |_| panic!("graph has cycle"),
         )
         .await?;
+        // Walk is complete: take ownership of the skipped set so parent-edge
+        // truncation below does not hold the mutex across awaits.
+        let skipped_ids = std::mem::take(&mut *skipped_native_format.lock().unwrap());
         for (CommitByCommitterTimestamp(commit), op_id) in commits.iter().rev() {
-            mutable_index.add_commit(commit).await.map_err(|source| {
-                DefaultIndexStoreError::IndexCommits {
+            // Truncate at the native/Git boundary: drop parent edges that
+            // point at skipped raw-Git commits so the native child indexes
+            // with only its native parents (possibly zero → native-subgraph
+            // root). Parents already in a parent index segment are kept.
+            let parent_ids = commit
+                .parent_ids()
+                .iter()
+                .filter(|id| !skipped_ids.contains(id))
+                .cloned()
+                .collect_vec();
+            mutable_index
+                .add_commit_with_parents(commit, &parent_ids)
+                .await
+                .map_err(|source| DefaultIndexStoreError::IndexCommits {
                     op_id: op_id.clone(),
                     source,
-                }
-            })?;
+                })?;
+        }
+
+        let skipped = skipped_ids.len();
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "skipped historical commits that are not native Vex protobuf objects during \
+                 index build; they are not indexed, their parents were not walked, and native \
+                 children had those parent edges dropped. Selected checkout targets still fail \
+                 closed under the native-only object contract."
+            );
         }
 
         let index = self.save_mutable_index(mutable_index, operation.id())?;

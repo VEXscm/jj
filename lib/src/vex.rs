@@ -1242,6 +1242,27 @@ impl VexClient {
 
     pub fn from_store_path(store_path: &Path) -> Result<Self, VexConfigError> {
         let config = VexRepoConfig::load_from_store_path(store_path)?;
+        Self::from_store_path_and_config(store_path, config)
+    }
+
+    /// Like [`Self::from_store_path`], but forces `object_read_mode` after
+    /// loading `vex.json`. Needed because the mode field is never serialized
+    /// (`#[serde(skip_serializing)]`), so disk-backed loads always see
+    /// [`VexObjectReadMode::NativeOnly`] unless an explicit conversion/
+    /// materialization caller overrides it here.
+    pub fn from_store_path_with_object_read_mode(
+        store_path: &Path,
+        object_read_mode: VexObjectReadMode,
+    ) -> Result<Self, VexConfigError> {
+        let mut config = VexRepoConfig::load_from_store_path(store_path)?;
+        config.object_read_mode = object_read_mode;
+        Self::from_store_path_and_config(store_path, config)
+    }
+
+    fn from_store_path_and_config(
+        store_path: &Path,
+        config: VexRepoConfig,
+    ) -> Result<Self, VexConfigError> {
         Self::validate_endpoint(&config.endpoint)?;
         let repo_path = store_path
             .parent()
@@ -6543,10 +6564,29 @@ mod tests {
 }
 
 pub fn create_store_factories() -> StoreFactories {
+    create_store_factories_with_object_read_mode(VexObjectReadMode::NativeOnly)
+}
+
+/// Store factories for a Vex-backed repo load, with an explicit object-read
+/// mode applied after reading `vex.json`.
+///
+/// Ordinary clones/loads use [`create_store_factories`] ([`VexObjectReadMode::NativeOnly`]).
+/// Conversion/materialization must pass [`VexObjectReadMode::GitCompatibility`]
+/// because they open repos whose op-log views may still reference raw Git
+/// commit bytes; the mode cannot be inherited from disk (it is never
+/// serialized into `vex.json`).
+pub fn create_store_factories_with_object_read_mode(
+    object_read_mode: VexObjectReadMode,
+) -> StoreFactories {
     let mut store_factories = StoreFactories::empty();
     store_factories.add_backend(
         VexBackend::name_static(),
-        Box::new(|_settings, store_path| Ok(Box::new(VexBackend::load(store_path)?))),
+        Box::new(move |_settings, store_path| {
+            Ok(Box::new(VexBackend::load_with_object_read_mode(
+                store_path,
+                object_read_mode,
+            )?))
+        }),
     );
     store_factories.add_op_store(
         VexOpStore::name_static(),

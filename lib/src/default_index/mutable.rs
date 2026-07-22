@@ -492,12 +492,26 @@ impl DefaultMutableIndex {
 
     #[tracing::instrument(skip(self))]
     pub(super) async fn add_commit(&mut self, commit: &Commit) -> BackendResult<()> {
+        self.add_commit_with_parents(commit, commit.parent_ids())
+            .await
+    }
+
+    /// Index `commit` using an explicit parent list instead of
+    /// [`Commit::parent_ids`].
+    ///
+    /// Used by the Vex NativeOnly index builder (roadmap/066) to truncate the
+    /// graph at the native/Git boundary: raw-Git parents that were skipped
+    /// during the walk are omitted here so the native child indexes as a root
+    /// of the native subgraph rather than panicking on a missing parent.
+    /// Changed-path indexing still runs against the full commit object.
+    #[tracing::instrument(skip(self, parent_ids))]
+    pub(super) async fn add_commit_with_parents(
+        &mut self,
+        commit: &Commit,
+        parent_ids: &[CommitId],
+    ) -> BackendResult<()> {
         let new_commit_pos = GlobalCommitPosition(self.num_commits());
-        self.add_commit_data(
-            commit.id().clone(),
-            commit.change_id().clone(),
-            commit.parent_ids(),
-        );
+        self.add_commit_data(commit.id().clone(), commit.change_id().clone(), parent_ids);
         if new_commit_pos == GlobalCommitPosition(self.num_commits()) {
             return Ok(()); // commit already indexed
         }
