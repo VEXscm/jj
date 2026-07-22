@@ -1286,9 +1286,9 @@ async fn clone_vex_native_target(
         )),
         None => {
             // Legacy catalog metadata supplied no trunk; the heuristic below
-            // stays native-only. Logged so the server metadata can be
-            // repaired (roadmap/066 keeps this path observable; counter
-            // wiring lands with the Stage 3 instrumentation).
+            // stays native-only. Counted and logged so the server metadata
+            // can be repaired (roadmap/066 Stage 3 observability).
+            crate::vex::vex_client_stats().record_native_trunk_missing();
             tracing::debug!(
                 "vex clone: no server trunk advertised; using native view fallback selection"
             );
@@ -1315,11 +1315,13 @@ async fn clone_vex_server_trunk_target(
     if let Some(commit) =
         clone_vex_bookmark_head(repo, server_trunk, &HashSet::new(), false).await?
     {
+        crate::vex::vex_client_stats().record_native_trunk_resolution();
         return Ok(NativeBookmarkTarget {
             name: server_trunk.to_owned(),
             commit,
         });
     }
+    crate::vex::vex_client_stats().record_native_trunk_missing();
     Err(WorkspaceInitError::NativeTrunkMissing {
         trunk: server_trunk.to_owned(),
     })
