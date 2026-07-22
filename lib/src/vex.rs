@@ -848,7 +848,11 @@ const INLINE_FETCH_CONCURRENCY: usize = 8;
 /// Default number of clone packs fetched+unpacked in parallel during
 /// [`VexClient::prefetch_clone_manifest`]. Overridable via
 /// `VEX_CLONE_PACK_CONCURRENCY` (set `1` to restore the serial pack loop).
-const PACK_FETCH_CONCURRENCY: usize = 4;
+/// Default tuned by a 2026-07-22 production sweep (271.4 MB pinned JJ
+/// fixture): pack transfer means were 24.0 s at 4×8, 7.1 s at 16×32, and only
+/// 6.8 s at 32×64, so throughput flattens at 16×32 (~38 MB/s) while 64 pack
+/// workers added writer-contention variance.
+const PACK_FETCH_CONCURRENCY: usize = 16;
 
 fn pack_fetch_concurrency() -> usize {
     std::env::var("VEX_CLONE_PACK_CONCURRENCY")
@@ -862,9 +866,11 @@ fn pack_fetch_concurrency() -> usize {
 /// fetches are reorder-buffered (`.buffered(W)` yields results in input
 /// order), so the single writer still appends to the `.part` file strictly in
 /// chunk order. Peak buffered memory is bounded at pack workers × W × the
-/// 512KiB chunk size. Overridable via `VEX_CLONE_CHUNK_CONCURRENCY` (set `1`
-/// to restore the serial chunk loop).
-const CHUNK_FETCH_CONCURRENCY: usize = 8;
+/// 512KiB chunk size (~256 MB worst case at the 16×32 defaults). The same
+/// 2026-07-22 sweep showed 8×64 regressing ~35% from head-of-line blocking in
+/// the index-ordered `.part` writer, so keep W moderate. Overridable via
+/// `VEX_CLONE_CHUNK_CONCURRENCY` (set `1` to restore the serial chunk loop).
+const CHUNK_FETCH_CONCURRENCY: usize = 32;
 
 /// Effective chunk-fetch concurrency (env `VEX_CLONE_CHUNK_CONCURRENCY`,
 /// default [`CHUNK_FETCH_CONCURRENCY`]). Public so `vex bench clone` can
