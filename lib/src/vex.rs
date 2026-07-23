@@ -130,12 +130,15 @@ pub(crate) async fn shared_runtime_sleep(duration: Duration) {
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A `PutObjects` batch is content-addressed and create-if-missing, so a
-/// response lost during an edge reload may safely be retried verbatim. Keep the
-/// retry window deliberately short: bulk import has many batches in flight and
-/// should fail clearly rather than retaining all of their bodies indefinitely.
-const PIPELINED_PUT_RETRY_ATTEMPTS: usize = 5;
-const PIPELINED_PUT_RETRY_BASE_MS: u64 = 250;
-const PIPELINED_PUT_RETRY_CAP_MS: u64 = 2_000;
+/// response lost during an edge reload or backend restart may safely be
+/// retried verbatim (fresh connection each attempt). Bulk materialize used to
+/// fail the whole import after ~6s of INTERNAL_ERROR/stream resets while
+/// jj-backend recovered from memory pressure; mirror the commit-ops ladder so
+/// a brief restart/pressure window (~60–90s) is survivable. Bodies are held
+/// only for the in-flight pipeline window, not the whole repo.
+const PIPELINED_PUT_RETRY_ATTEMPTS: usize = 12;
+const PIPELINED_PUT_RETRY_BASE_MS: u64 = 1_000;
+const PIPELINED_PUT_RETRY_CAP_MS: u64 = 10_000;
 
 /// `CommitOperation` has an explicit replay-success response for an already
 /// published op head. That makes the exact maintenance rejection safe to
@@ -2058,8 +2061,9 @@ impl VexClient {
     }
 
     /// Bounded exponential backoff for retries of one idempotent `PutObjects`
-    /// batch. The small jitter keeps concurrently retried batches from
-    /// reconnecting to a recovering edge at the same instant.
+    /// batch. Sized so the full ladder (~12 attempts, 1s base, 10s cap) covers
+    /// a brief backend restart/pressure window. The small jitter keeps
+    /// concurrently retried batches from reconnecting at the same instant.
     fn pipelined_put_retry_delay(attempt: usize) -> Duration {
         let shift = attempt.saturating_sub(1).min(6) as u32;
         let backoff_ms = PIPELINED_PUT_RETRY_BASE_MS
@@ -5296,6 +5300,26 @@ mod tests {
         assert!(
             VexClient::pipelined_put_retry_delay(usize::MAX)
                 <= Duration::from_millis(PIPELINED_PUT_RETRY_CAP_MS * 5 / 4)
+        );
+    }
+
+    #[test]
+    fn pipelined_put_retry_ladder_covers_backend_restart_window() {
+        // Sum of uncapped backoff (no jitter) across the inter-attempt delays
+        // should land in the ~60–90s band so bulk import survives a short
+        // jj-backend OOM/restart rather than failing after a few seconds.
+        let mut total_ms = 0u64;
+        for attempt in 1..PIPELINED_PUT_RETRY_ATTEMPTS {
+            let shift = attempt.saturating_sub(1).min(6) as u32;
+            total_ms += PIPELINED_PUT_RETRY_BASE_MS
+                .saturating_mul(1_u64 << shift)
+                .min(PIPELINED_PUT_RETRY_CAP_MS);
+        }
+        assert!(
+            (60_000..=90_000).contains(&total_ms),
+            "expected ~60–90s retry window, got {total_ms}ms \
+             (attempts={PIPELINED_PUT_RETRY_ATTEMPTS} base={PIPELINED_PUT_RETRY_BASE_MS} \
+             cap={PIPELINED_PUT_RETRY_CAP_MS})"
         );
     }
 
