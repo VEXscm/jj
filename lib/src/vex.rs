@@ -4416,9 +4416,8 @@ impl VexClient {
         // manifest serves in well under a second, so waiting a flat 3 s after
         // one edge blip quantized the whole manifest phase to ~3+ s
         // (measured 2.7-5.7 s outliers vs a ~0.8 s healthy floor).
-        let transient_backoff_floor = std::time::Duration::from_millis(
-            env_secs("VEX_CLONE_MANIFEST_RETRY_MS", 250).max(50),
-        );
+        let transient_backoff_floor =
+            std::time::Duration::from_millis(env_secs("VEX_CLONE_MANIFEST_RETRY_MS", 250).max(50));
         let mut transient_backoff = transient_backoff_floor;
         let started = std::time::Instant::now();
         loop {

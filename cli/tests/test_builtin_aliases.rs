@@ -124,18 +124,11 @@ fn test_builtin_alias_trunk_matches_master_at_vex() {
     work_dir
         .run_jj(["git", "remote", "rename", "origin", "vex"])
         .success();
-    work_dir
-        .run_jj(["bookmark", "forget", "master"])
-        .success();
+    work_dir.run_jj(["bookmark", "forget", "master"]).success();
     // Drop the repo-level preset if present so the built-in candidate list
     // (which includes `master@vex`) is what resolves trunk(). Ignore failure
     // when rename already cleared the preset.
-    drop(work_dir.run_jj([
-        "config",
-        "unset",
-        "--repo",
-        "revset-aliases.'trunk()'",
-    ]));
+    drop(work_dir.run_jj(["config", "unset", "--repo", "revset-aliases.'trunk()'"]));
 
     let output = work_dir.run_jj(["log", "-r", "trunk()"]);
     insta::assert_snapshot!(output, @"
