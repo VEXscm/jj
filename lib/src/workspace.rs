@@ -398,6 +398,7 @@ async fn commit_vex_clone_workspace_operation(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn init_vex_clone_working_copy_at(
     repo: &Arc<ReadonlyRepo>,
     workspace_root: &Path,
@@ -406,6 +407,10 @@ async fn init_vex_clone_working_copy_at(
     workspace_name: WorkspaceNameBuf,
     start_commit: &Commit,
     resolved_trunk: Option<&str>,
+    // Whether the workspace operation CASes the server op heads during the
+    // clone. When false, the armed op-heads-store marker makes the commit below
+    // record the operation locally instead of publishing it.
+    register_workspace: bool,
     progress: Option<&crate::vex::CloneProgressFn>,
 ) -> Result<(Box<dyn WorkingCopy>, Arc<ReadonlyRepo>), WorkspaceInitError> {
     let working_copy_state_path = jj_dir.join("working_copy");
@@ -421,7 +426,7 @@ async fn init_vex_clone_working_copy_at(
     )?;
     let locked_wc = working_copy.start_mutation().await?;
 
-    if let Some(progress) = progress {
+    if register_workspace && let Some(progress) = progress {
         progress(crate::vex::CloneProgress::WorkspacePublish);
     }
     let publish =
@@ -718,6 +723,7 @@ impl Workspace {
         })
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn clone_vex(
         user_settings: &UserSettings,
         workspace_root: &Path,
@@ -748,6 +754,11 @@ impl Workspace {
         // manifest request on top of the shared cache's `.snapshots` markers
         // (`vex bench clone --have`).
         have_snapshot_commit_ids: &[String],
+        // Whether to publish the workspace operation to the server during the
+        // clone. When false, the workspace operation is committed locally only
+        // and published transparently by the first mutating operation. Ignored
+        // (always local) for `local_writes` repos.
+        register_workspace: bool,
         working_copy_factory: &dyn WorkingCopyFactory,
         progress: Option<&crate::vex::CloneProgressFn>,
     ) -> Result<(Self, Arc<ReadonlyRepo>, Option<String>), WorkspaceInitError> {
@@ -899,6 +910,13 @@ impl Workspace {
                     hydrate_start_commit_blobs(&repo, &store_path, &start_commit, progress).await;
             }
             let workspace_name = vex_clone_workspace_name(workspace_root);
+            // Arm the op-heads store so the workspace operation below commits
+            // locally; the first mutating operation publishes it transparently.
+            // `local_writes` repos remain local forever.
+            if !register_workspace && !config.local_writes {
+                VexOpHeadsStore::arm_deferred_registration(&op_heads_path, workspace_name.as_str())
+                    .context(&op_heads_path)?;
+            }
             let init_working_copy = init_vex_clone_working_copy_at(
                 &repo,
                 workspace_root,
@@ -907,6 +925,7 @@ impl Workspace {
                 workspace_name,
                 &start_commit,
                 resolved_trunk.as_deref(),
+                register_workspace,
                 progress,
             );
             let (working_copy, repo) = match progress {

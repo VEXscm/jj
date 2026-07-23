@@ -1448,6 +1448,191 @@ fn test_colocated_workspace_update_stale() {
     "#);
 }
 
+#[test]
+fn test_workspace_gc_removes_stale_empty_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "stale", "../stale"])
+        .success();
+
+    let output = main_dir.run_jj(["workspace", "gc", "--older-than=7d"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Cleaning up 1 workspace:
+      stale
+    [EOF]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "root", "--name", "stale"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: No such workspace: stale
+    [EOF]
+    [exit status: 1]
+    ");
+}
+
+#[test]
+fn test_workspace_gc_dry_run_does_not_write() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "stale", "../stale"])
+        .success();
+    let operation_id = main_dir.current_operation_id();
+
+    let output = main_dir.run_jj(["workspace", "gc", "--dry-run"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Would clean up 1 workspace:
+      stale
+    Dry-run requested; no workspaces were removed.
+    [EOF]
+    ");
+    assert_eq!(main_dir.current_operation_id(), operation_id);
+
+    let output = main_dir.run_jj(["workspace", "root", "--name", "stale"]);
+    insta::assert_snapshot!(output, @"
+    $TEST_ENV/stale
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_workspace_gc_rejects_invalid_duration() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    let output = main_dir.run_jj(["workspace", "gc", "--older-than=0d"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: --older-than must be a positive duration like 30d, 24h, or 60m
+    [EOF]
+    [exit status: 1]
+    ");
+}
+
+#[test]
+fn test_workspace_gc_keeps_fresh_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir
+        .run_jj([
+            "--config=debug.commit-timestamp=2099-01-01T00:00:00+00:00",
+            "workspace",
+            "add",
+            "--name",
+            "fresh",
+            "../fresh",
+        ])
+        .success();
+
+    let output = main_dir.run_jj(["workspace", "gc"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Nothing to clean up.
+    [EOF]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "root", "--name", "fresh"]);
+    insta::assert_snapshot!(output, @"
+    $TEST_ENV/fresh
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_workspace_gc_keeps_bookmarked_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "bookmarked", "../bookmarked"])
+        .success();
+    main_dir
+        .run_jj(["bookmark", "set", "keep", "-r", "bookmarked@"])
+        .success();
+
+    let output = main_dir.run_jj(["workspace", "gc"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Nothing to clean up.
+    [EOF]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "root", "--name", "bookmarked"]);
+    insta::assert_snapshot!(output, @"
+    $TEST_ENV/bookmarked
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_workspace_gc_keeps_workspace_with_description() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir
+        .run_jj([
+            "workspace",
+            "add",
+            "--name",
+            "described",
+            "-m",
+            "keep this workspace",
+            "../described",
+        ])
+        .success();
+
+    let output = main_dir.run_jj(["workspace", "gc"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Nothing to clean up.
+    [EOF]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "root", "--name", "described"]);
+    insta::assert_snapshot!(output, @"
+    $TEST_ENV/described
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_workspace_gc_keeps_current_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let current_dir = test_env.work_dir("current");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "current", "../current"])
+        .success();
+
+    let output = current_dir.run_jj(["workspace", "gc"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Nothing to clean up.
+    [EOF]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "root", "--name", "current"]);
+    insta::assert_snapshot!(output, @"
+    $TEST_ENV/current
+    [EOF]
+    ");
+}
+
 /// Test forgetting workspaces
 #[test]
 fn test_workspaces_forget() {

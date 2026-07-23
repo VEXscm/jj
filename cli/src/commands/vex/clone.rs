@@ -118,6 +118,9 @@ pub(crate) async fn cmd_vex_clone(
                 None,
                 hydrate_blobs,
                 &[],
+                // `jj vex clone` is an internal/dev command and preserves
+                // eager workspace registration.
+                true,
                 &*working_copy_factory,
                 None,
             )

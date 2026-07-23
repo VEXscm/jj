@@ -14,6 +14,7 @@
 
 mod add;
 mod forget;
+mod gc;
 mod list;
 mod rename;
 mod root;
@@ -26,6 +27,8 @@ use self::add::WorkspaceAddArgs;
 use self::add::cmd_workspace_add;
 use self::forget::WorkspaceForgetArgs;
 use self::forget::cmd_workspace_forget;
+use self::gc::WorkspaceGcArgs;
+use self::gc::cmd_workspace_gc;
 use self::list::WorkspaceListArgs;
 use self::list::cmd_workspace_list;
 use self::rename::WorkspaceRenameArgs;
@@ -53,6 +56,7 @@ use crate::ui::Ui;
 pub(crate) enum WorkspaceCommand {
     Add(WorkspaceAddArgs),
     Forget(WorkspaceForgetArgs),
+    Gc(WorkspaceGcArgs),
     List(WorkspaceListArgs),
     Rename(WorkspaceRenameArgs),
     Root(WorkspaceRootArgs),
@@ -68,6 +72,7 @@ pub(crate) async fn cmd_workspace(
     match subcommand {
         WorkspaceCommand::Add(args) => cmd_workspace_add(ui, command, args).await,
         WorkspaceCommand::Forget(args) => cmd_workspace_forget(ui, command, args).await,
+        WorkspaceCommand::Gc(args) => cmd_workspace_gc(ui, command, args).await,
         WorkspaceCommand::List(args) => cmd_workspace_list(ui, command, args).await,
         WorkspaceCommand::Rename(args) => cmd_workspace_rename(ui, command, args).await,
         WorkspaceCommand::Root(args) => cmd_workspace_root(ui, command, args).await,
