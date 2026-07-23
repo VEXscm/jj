@@ -175,7 +175,7 @@ fn test_gerrit_upload_default_revision_already_in_trunk() {
     ------- stderr -------
     No revision provided and @ has no description. Defaulting to @-
     Error: Commit 57df4838fd85 is immutable
-    Hint: Could not modify commit: rlvkpnrz 57df4838 main@origin | main
+    Hint: Could not modify commit: rlvkpnrz 57df4838 main | main
     Hint: Immutable commits are used to protect shared history.
     Hint: For more information, see:
           - https://docs.jj-vcs.dev/latest/config/#set-of-immutable-commits

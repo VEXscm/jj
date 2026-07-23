@@ -214,6 +214,16 @@ pub(super) fn try_resolve_trunk_alias(
         .aliases_map
         .get_function("trunk", 0)
         .expect("trunk() should be defined by default");
+    try_resolve_trunk_expression(repo, context, revset_str)
+}
+
+/// Like [`try_resolve_trunk_alias`], but resolves an arbitrary trunk expression
+/// string (used when recovering from a bad repo-level override).
+pub(super) fn try_resolve_trunk_expression(
+    repo: &dyn Repo,
+    context: &RevsetParseContext,
+    revset_str: &str,
+) -> Result<Option<Arc<ResolvedRevsetExpression>>, RevsetResolutionError> {
     let Ok(expression) = revset::parse(&mut RevsetDiagnostics::new(), revset_str, context) else {
         return Ok(None);
     };
@@ -222,6 +232,28 @@ pub(super) fn try_resolve_trunk_alias(
     let symbol_resolver = SymbolResolver::new(repo, context.extensions.symbol_resolvers());
     let resolved = expression.resolve_user_expression(repo, &symbol_resolver)?;
     Ok(Some(resolved))
+}
+
+/// Bare bookmark names that `vex clone` / import historically wrote as
+/// `revset-aliases."trunk()"`. When those names are absent (Vex repos usually
+/// track `master@vex`), resolution fails on every command. Recover by falling
+/// back to the built-in candidate expression instead of warning.
+pub(super) fn is_recoverable_vex_trunk_alias(trunk_str: &str) -> bool {
+    matches!(trunk_str.trim(), "main" | "master" | "trunk")
+}
+
+/// Built-in `trunk()` definition from the Default config layer (see
+/// `config/revsets.toml`). Used when a Vex repo override is a bare well-known
+/// name that does not resolve.
+pub(super) fn default_trunk_alias_expression(config: &StackedConfig) -> Option<String> {
+    for layer in config.layers_for(ConfigSource::Default) {
+        if let Ok(Some(item)) = layer.look_up_item(["revset-aliases", "trunk()"])
+            && let Some(value) = item.as_str()
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
 }
 
 pub(super) async fn evaluate_revset_to_single_commit<'a>(

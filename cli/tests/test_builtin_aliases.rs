@@ -83,6 +83,70 @@ fn test_builtin_alias_trunk_matches_master() {
 }
 
 #[test]
+fn test_builtin_alias_trunk_matches_master_at_vex() {
+    // Vex-native clones track the default bookmark as `master@vex` (no
+    // `@origin`). The built-in trunk() alias must find that remote bookmark.
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "origin"]).success();
+    let origin_dir = test_env.work_dir("origin");
+    let origin_git_repo_path = origin_dir
+        .root()
+        .join(".jj")
+        .join("repo")
+        .join("store")
+        .join("git");
+
+    origin_dir
+        .run_jj(["describe", "-m=description 1"])
+        .success();
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "master"])
+        .success();
+    origin_dir.run_jj(["git", "export"]).success();
+
+    test_env
+        .run_jj_in(
+            ".",
+            [
+                "git",
+                "clone",
+                "--config=remotes.origin.auto-track-bookmarks='*'",
+                origin_git_repo_path.to_str().unwrap(),
+                "local",
+            ],
+        )
+        .success();
+    let work_dir = test_env.work_dir("local");
+    // Rewrite origin → vex to mimic a native Vex remote-tracking bookmark.
+    // Remote rename also rewrites the repo-level trunk() preset to
+    // `master@vex`; forget the local bookmark so resolution must go through
+    // that remote-tracking name (and the built-in `@vex` candidates).
+    work_dir
+        .run_jj(["git", "remote", "rename", "origin", "vex"])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "forget", "master"])
+        .success();
+    // Drop the repo-level preset if present so the built-in candidate list
+    // (which includes `master@vex`) is what resolves trunk(). Ignore failure
+    // when rename already cleared the preset.
+    drop(work_dir.run_jj([
+        "config",
+        "unset",
+        "--repo",
+        "revset-aliases.'trunk()'",
+    ]));
+
+    let output = work_dir.run_jj(["log", "-r", "trunk()"]);
+    insta::assert_snapshot!(output, @"
+    ◆  qpvuntsm test.user@example.com 2001-02-03 08:05:08 master@vex 9b2e76de
+    │  (empty) description 1
+    ~
+    [EOF]
+    ");
+}
+
+#[test]
 fn test_builtin_alias_trunk_matches_trunk() {
     let test_env = set_up("trunk");
     let work_dir = test_env.work_dir("local");

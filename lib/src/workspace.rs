@@ -63,6 +63,7 @@ use crate::signing::SignInitError;
 use crate::signing::Signer;
 use crate::simple_backend::SimpleBackend;
 use crate::transaction::TransactionCommitError;
+use crate::transaction::is_op_heads_cas_conflict;
 use crate::vex::CloneBlobMode;
 use crate::vex::VexRepoConfig;
 use crate::vex::create_store_factories;
@@ -324,14 +325,6 @@ async fn init_working_copy_with_parents(
 /// preserves concurrent view changes rather than replacing them.
 const MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS: u32 = 3;
 
-fn is_vex_op_heads_cas_conflict(error: &TransactionCommitError) -> bool {
-    matches!(
-        error,
-        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write { source, .. })
-            if source.to_string().contains("CAS conflict on op heads")
-    )
-}
-
 fn vex_clone_local_bookmark_to_set<'name, 'commit>(
     repo: &ReadonlyRepo,
     resolved_trunk: Option<&'name str>,
@@ -390,7 +383,7 @@ async fn commit_vex_clone_workspace_operation(
             Ok(repo) => return Ok(repo),
             Err(WorkspaceInitError::TransactionCommit(error))
                 if attempt < MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS
-                    && is_vex_op_heads_cas_conflict(&error) =>
+                    && is_op_heads_cas_conflict(&error) =>
             {
                 tracing::warn!(
                     attempt,
@@ -1823,31 +1816,6 @@ mod tests {
             RepoInitError::Path(err) => WorkspaceInitError::Path(err),
         })?;
         Ok((temp_dir, repo))
-    }
-
-    fn vex_op_heads_cas_conflict_error() -> TransactionCommitError {
-        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
-            new_op_id: OperationId::new(vec![7; 32]),
-            source: Box::new(std::io::Error::other("CAS conflict on op heads")),
-        })
-    }
-
-    #[test]
-    fn test_vex_clone_workspace_retry_only_matches_op_head_cas_conflicts() {
-        assert!(is_vex_op_heads_cas_conflict(
-            &vex_op_heads_cas_conflict_error()
-        ));
-
-        let unrelated_write = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
-            new_op_id: OperationId::new(vec![7; 32]),
-            source: Box::new(std::io::Error::other("connection reset by peer")),
-        });
-        assert!(!is_vex_op_heads_cas_conflict(&unrelated_write));
-
-        let read_error = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Read(Box::new(
-            std::io::Error::other("CAS conflict on op heads"),
-        )));
-        assert!(!is_vex_op_heads_cas_conflict(&read_error));
     }
 
     #[test]

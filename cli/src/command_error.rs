@@ -56,6 +56,7 @@ use jj_lib::secure_config::SecureConfigError;
 use jj_lib::str_util::StringPatternParseError;
 use jj_lib::trailer::TrailerParseError;
 use jj_lib::transaction::TransactionCommitError;
+use jj_lib::transaction::is_op_heads_cas_conflict;
 use jj_lib::view::RenameWorkspaceError;
 use jj_lib::working_copy::RecoverWorkspaceError;
 use jj_lib::working_copy::ResetError;
@@ -456,7 +457,19 @@ impl From<ResetError> for CommandError {
 
 impl From<TransactionCommitError> for CommandError {
     fn from(err: TransactionCommitError) -> Self {
-        internal_error(err)
+        if is_op_heads_cas_conflict(&err) {
+            user_error_with_message(
+                "Another Vex writer advanced the repository while this command was writing \
+                 (op-head conflict); your files are untouched.",
+                err,
+            )
+            .hinted(
+                "Rerun the command. If it keeps failing, run `vex status` to check for a stale \
+                 working copy.",
+            )
+        } else {
+            internal_error(err)
+        }
     }
 }
 
@@ -1163,4 +1176,42 @@ pub fn print_parse_diagnostics<T: error::Error>(
         // find_source_parse_error_hint() and print it here.
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use jj_lib::op_store::OperationId;
+
+    use super::*;
+
+    #[test]
+    fn test_op_heads_cas_conflict_is_a_guided_user_error() {
+        let transaction_error =
+            TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
+                new_op_id: OperationId::new(vec![7; 32]),
+                source: Box::new(std::io::Error::other("CAS conflict on op heads")),
+            });
+
+        let error = CommandError::from(transaction_error);
+
+        assert_eq!(error.kind, CommandErrorKind::User);
+        assert_eq!(
+            error.error.to_string(),
+            "Another Vex writer advanced the repository while this command was writing \
+             (op-head conflict); your files are untouched."
+        );
+        assert!(matches!(
+            error.hints.as_slice(),
+            [ErrorHint::PlainText(hint)]
+                if hint == "Rerun the command. If it keeps failing, run `vex status` to check for \
+                    a stale working copy."
+        ));
+        let mut source = error.error.source();
+        let mut found_cas_detail = false;
+        while let Some(current) = source {
+            found_cas_detail |= current.to_string() == "CAS conflict on op heads";
+            source = current.source();
+        }
+        assert!(found_cas_detail);
+    }
 }

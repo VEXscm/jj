@@ -47,6 +47,21 @@ pub enum TransactionCommitError {
     OpStore(#[from] OpStoreError),
 }
 
+/// Returns whether `error` is the Vex backend's strict op-head CAS rejection.
+///
+/// The backend response is currently carried as the source of an
+/// [`OpHeadsStoreError::Write`], so the message is the only specific signal
+/// preserved in [`TransactionCommitError`]. Keep this deliberately narrow:
+/// network, storage, and other write failures must not be treated as safe
+/// concurrency retries.
+pub fn is_op_heads_cas_conflict(error: &TransactionCommitError) -> bool {
+    matches!(
+        error,
+        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write { source, .. })
+            if source.to_string().contains("CAS conflict on op heads")
+    )
+}
+
 /// An in-memory representation of a repo and any changes being made to it.
 ///
 /// Within the scope of a transaction, changes to the repository are made
@@ -229,5 +244,34 @@ impl UnpublishedOperation {
 
     pub fn leave_unpublished(self) -> Arc<ReadonlyRepo> {
         self.repo
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::op_store::OperationId;
+
+    use super::*;
+
+    fn write_error(message: &str) -> TransactionCommitError {
+        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
+            new_op_id: OperationId::new(vec![7; 32]),
+            source: Box::new(std::io::Error::other(message.to_owned())),
+        })
+    }
+
+    #[test]
+    fn test_is_op_heads_cas_conflict() {
+        assert!(is_op_heads_cas_conflict(&write_error(
+            "CAS conflict on op heads"
+        )));
+        assert!(!is_op_heads_cas_conflict(&write_error(
+            "connection reset by peer"
+        )));
+
+        let read_error = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Read(Box::new(
+            std::io::Error::other("CAS conflict on op heads"),
+        )));
+        assert!(!is_op_heads_cas_conflict(&read_error));
     }
 }

@@ -131,6 +131,7 @@ use jj_lib::str_util::StringMatcher;
 use jj_lib::str_util::StringPattern;
 use jj_lib::transaction::Transaction;
 use jj_lib::transaction::TransactionCommitError;
+use jj_lib::transaction::is_op_heads_cas_conflict;
 use jj_lib::working_copy;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
@@ -478,7 +479,9 @@ impl CommandHelper {
             Ok(stats) => (workspace_command, stats),
             Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
-                let auto_update_stale = self.settings().get_bool("snapshot.auto-update-stale")?;
+                let is_vex = current_cli_name() == "vex";
+                let auto_update_stale =
+                    is_vex || self.settings().get_bool("snapshot.auto-update-stale")?;
                 if !auto_update_stale {
                     return Err(err);
                 }
@@ -487,6 +490,13 @@ impl CommandHelper {
                 // auto-update-stale, so let's do that now. We need to do it up here, not at a
                 // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
                 // of the working copy.
+                if is_vex {
+                    writeln!(
+                        ui.status(),
+                        "Concurrent Vex operation left the working copy stale; recovering \
+                         automatically."
+                    )?;
+                }
                 self.recover_stale_working_copy(ui).await?
             }
         };
@@ -509,25 +519,34 @@ impl CommandHelper {
         if let Err(err) =
             revset_util::try_resolve_trunk_alias(repo.as_ref(), &env.revset_parse_context())
         {
-            // The fallback can be builtin_trunk() if we're willing to support
-            // inferred trunk forever. (#7990)
-            let fallback = "root()";
-            writeln!(
-                ui.warning_default(),
-                "Failed to resolve `revset-aliases.trunk()`: {err}"
-            )?;
-            writeln!(
-                ui.warning_no_heading(),
-                "The `trunk()` alias is temporarily set to `{fallback}`."
-            )?;
-            writeln!(
-                ui.hint_default(),
-                "Use `jj config edit --repo` to adjust the `trunk()` alias."
-            )?;
-            env.revset_aliases_map
-                .insert("trunk()", fallback, None)
-                .expect("valid syntax");
-            env.reload_revset_expressions(ui)?;
+            // Vex repos often have a repo-level `trunk() = "main"` (or similar)
+            // written by older clone/import flows, while the real bookmark is
+            // `master@vex`. Fall back to the built-in candidate expression
+            // without warning for those well-known bare names only — custom
+            // user aliases still surface resolution errors.
+            let recovered = current_cli_name() == "vex"
+                && try_recover_vex_trunk_alias(ui, repo.as_ref(), &mut env)?;
+            if !recovered {
+                // The fallback can be builtin_trunk() if we're willing to support
+                // inferred trunk forever. (#7990)
+                let fallback = "root()";
+                writeln!(
+                    ui.warning_default(),
+                    "Failed to resolve `revset-aliases.trunk()`: {err}"
+                )?;
+                writeln!(
+                    ui.warning_no_heading(),
+                    "The `trunk()` alias is temporarily set to `{fallback}`."
+                )?;
+                writeln!(
+                    ui.hint_default(),
+                    "Use `jj config edit --repo` to adjust the `trunk()` alias."
+                )?;
+                env.revset_aliases_map
+                    .insert("trunk()", fallback, None)
+                    .expect("valid syntax");
+                env.reload_revset_expressions(ui)?;
+            }
         }
         WorkspaceCommandHelper::new(ui, workspace, repo, env, self.is_at_head_operation())
     }
@@ -588,6 +607,78 @@ impl CommandHelper {
         let op_id = workspace.working_copy().operation_id();
 
         match workspace.repo_loader().load_operation(op_id).await {
+            Ok(op) if current_cli_name() != "vex" => {
+                // Preserve jj's merge-capable stale-workspace recovery. Local
+                // op-head stores can publish the snapshot from the stale
+                // operation and then reconcile the resulting divergent heads.
+                let repo = workspace.repo_loader().load_at(&op).await?;
+                let mut workspace_command = self.for_workable_repo(ui, workspace, repo)?;
+                workspace_command.check_working_copy_writable()?;
+
+                let stale_stats = workspace_command
+                    .snapshot_working_copy(ui)
+                    .await
+                    .map_err(|err| err.into_command_error())?;
+
+                let wc_commit_id = workspace_command.get_wc_commit_id().unwrap();
+                let repo = workspace_command.repo().clone();
+                let stale_wc_commit = repo.store().get_commit_async(wc_commit_id).await?;
+
+                let mut workspace_command = self.workspace_helper_no_snapshot(ui).await?;
+                let repo = workspace_command.repo().clone();
+                let (mut locked_ws, desired_wc_commit) = workspace_command
+                    .unchecked_start_working_copy_mutation()
+                    .await?;
+                match WorkingCopyFreshness::check_stale(
+                    locked_ws.locked_wc(),
+                    &desired_wc_commit,
+                    &repo,
+                )
+                .await?
+                {
+                    WorkingCopyFreshness::Fresh | WorkingCopyFreshness::Updated(_) => {
+                        drop(locked_ws);
+                        writeln!(
+                            ui.status(),
+                            "Attempted recovery, but the working copy is not stale"
+                        )?;
+                    }
+                    WorkingCopyFreshness::WorkingCopyStale
+                    | WorkingCopyFreshness::SiblingOperation => {
+                        let stats = update_stale_working_copy(
+                            locked_ws,
+                            repo.op_id().clone(),
+                            &stale_wc_commit,
+                            &desired_wc_commit,
+                        )
+                        .await?;
+                        workspace_command.print_updated_working_copy_stats(
+                            ui,
+                            Some(&stale_wc_commit),
+                            &desired_wc_commit,
+                            &stats,
+                        )?;
+                        writeln!(
+                            ui.status(),
+                            "Updated working copy to fresh commit {}",
+                            short_commit_hash(desired_wc_commit.id())
+                        )?;
+                    }
+                }
+
+                let fresh_stats = workspace_command
+                    .maybe_snapshot_impl(ui)
+                    .await
+                    .map_err(|err| err.into_command_error())?;
+                let merged_stats = {
+                    let SnapshotStats {
+                        mut untracked_paths,
+                    } = stale_stats;
+                    untracked_paths.extend(fresh_stats.untracked_paths);
+                    SnapshotStats { untracked_paths }
+                };
+                Ok((workspace_command, merged_stats))
+            }
             Ok(_op) => {
                 // The working copy's recorded operation is no longer an op head.
                 //
@@ -1091,6 +1182,8 @@ enum SnapshotWorkingCopyError {
     Command(CommandError),
     StaleWorkingCopy(CommandError),
 }
+
+const MAX_OP_HEAD_SNAPSHOT_ATTEMPTS: u32 = 3;
 
 impl SnapshotWorkingCopyError {
     fn into_command_error(self) -> CommandError {
@@ -2029,52 +2122,102 @@ to the current parents may contain changes from multiple commits.
             snapshot_start.elapsed(),
         );
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
-            let mut tx = start_repo_transaction(
-                &self.user_repo.repo,
-                &workspace_name,
-                self.env.command.string_args(),
-            );
-            tx.set_is_snapshot(true);
-            let mut_repo = tx.repo_mut();
-            let commit = mut_repo
-                .rewrite_commit(&wc_commit)
-                .set_tree(new_tree.clone())
-                .write()
-                .await
-                .map_err(snapshot_command_error)?;
-            mut_repo
-                .set_wc_commit(workspace_name, commit.id().clone())
-                .map_err(snapshot_command_error)?;
-
-            // Rebase descendants
-            let num_rebased = mut_repo
-                .rebase_descendants()
-                .await
-                .map_err(snapshot_command_error)?;
-            if num_rebased > 0 {
-                writeln!(
-                    ui.status(),
-                    "Rebased {num_rebased} descendant commits onto updated working copy"
-                )
-                .map_err(snapshot_command_error)?;
-            }
-
-            #[cfg(feature = "git")]
-            if self.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
-                let old_tree = wc_commit.tree();
-                let new_tree = commit.tree();
-                export_working_copy_changes_to_git(ui, mut_repo, &old_tree, &new_tree)
+            let mut attempt = 1;
+            loop {
+                let Some(current_wc_commit_id) = self
+                    .user_repo
+                    .repo
+                    .view()
+                    .get_wc_commit_id(&workspace_name)
+                    .cloned()
+                else {
+                    // A concurrent operation deleted this workspace. There is no
+                    // workspace view entry on which to rebuild the snapshot.
+                    break;
+                };
+                let current_wc_commit = self
+                    .user_repo
+                    .repo
+                    .store()
+                    .get_commit_async(&current_wc_commit_id)
                     .await
                     .map_err(snapshot_command_error)?;
-            }
+                if new_tree.tree_ids_and_labels() == current_wc_commit.tree().tree_ids_and_labels()
+                {
+                    break;
+                }
 
-            let repo = self
-                .env
-                .command
-                .maybe_commit_transaction(tx, "snapshot working copy")
-                .await
-                .map_err(snapshot_command_error)?;
-            self.user_repo = ReadonlyUserRepo::new(repo);
+                let mut tx = start_repo_transaction(
+                    &self.user_repo.repo,
+                    &workspace_name,
+                    self.env.command.string_args(),
+                );
+                tx.set_is_snapshot(true);
+                let mut_repo = tx.repo_mut();
+                let commit = mut_repo
+                    .rewrite_commit(&current_wc_commit)
+                    .set_tree(new_tree.clone())
+                    .write()
+                    .await
+                    .map_err(snapshot_command_error)?;
+                mut_repo
+                    .set_wc_commit(workspace_name.clone(), commit.id().clone())
+                    .map_err(snapshot_command_error)?;
+
+                let num_rebased = mut_repo
+                    .rebase_descendants()
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if num_rebased > 0 {
+                    writeln!(
+                        ui.status(),
+                        "Rebased {num_rebased} descendant commits onto updated working copy"
+                    )
+                    .map_err(snapshot_command_error)?;
+                }
+
+                #[cfg(feature = "git")]
+                if self.working_copy_shared_with_git && self.env.command.should_commit_transaction()
+                {
+                    let old_tree = current_wc_commit.tree();
+                    let new_tree = commit.tree();
+                    export_working_copy_changes_to_git(ui, mut_repo, &old_tree, &new_tree)
+                        .await
+                        .map_err(snapshot_command_error)?;
+                }
+
+                match self
+                    .env
+                    .command
+                    .maybe_commit_transaction(tx, "snapshot working copy")
+                    .await
+                {
+                    Ok(repo) => {
+                        self.user_repo = ReadonlyUserRepo::new(repo);
+                        break;
+                    }
+                    Err(error)
+                        if attempt < MAX_OP_HEAD_SNAPSHOT_ATTEMPTS
+                            && is_op_heads_cas_conflict(&error) =>
+                    {
+                        writeln!(
+                            ui.status(),
+                            "Concurrent Vex operation detected; reloading and retrying the \
+                             working-copy snapshot."
+                        )
+                        .map_err(snapshot_command_error)?;
+                        let repo = self
+                            .user_repo
+                            .repo
+                            .reload_at_head()
+                            .await
+                            .map_err(snapshot_command_error)?;
+                        self.user_repo = ReadonlyUserRepo::new(repo);
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(snapshot_command_error(error)),
+                }
+            }
         }
 
         #[cfg(feature = "git")]
@@ -2225,17 +2368,30 @@ to the current parents may contain changes from multiple commits.
         if let Err(err) =
             revset_util::try_resolve_trunk_alias(tx.repo(), &self.env.revset_parse_context())
         {
-            // The warning would be printed above if working copies exist.
-            if tx.repo().view().wc_commit_ids().is_empty() {
+            // See workspace_helper_no_snapshot: Vex recovers bare main/master/trunk
+            // overrides via the built-in candidate alias without warning.
+            let recovered = current_cli_name() == "vex" && {
+                let (_, _, trunk_str, _) = self
+                    .env
+                    .revset_parse_context()
+                    .aliases_map
+                    .get_function("trunk", 0)
+                    .expect("trunk() should be defined by default");
+                revset_util::is_recoverable_vex_trunk_alias(trunk_str)
+            };
+            if !recovered {
+                // The warning would be printed above if working copies exist.
+                if tx.repo().view().wc_commit_ids().is_empty() {
+                    writeln!(
+                        ui.warning_default(),
+                        "Failed to resolve `revset-aliases.trunk()`: {err}"
+                    )?;
+                }
                 writeln!(
-                    ui.warning_default(),
-                    "Failed to resolve `revset-aliases.trunk()`: {err}"
+                    ui.hint_default(),
+                    "Use `jj config edit --repo` to adjust the `trunk()` alias."
                 )?;
             }
-            writeln!(
-                ui.hint_default(),
-                "Use `jj config edit --repo` to adjust the `trunk()` alias."
-            )?;
         }
 
         let old_repo = tx.base_repo().clone();
@@ -2808,6 +2964,34 @@ pub fn start_repo_transaction(
     tx
 }
 
+async fn update_stale_working_copy(
+    mut locked_ws: LockedWorkspace<'_>,
+    op_id: OperationId,
+    stale_commit: &Commit,
+    new_commit: &Commit,
+) -> Result<CheckoutStats, CommandError> {
+    // The same check as start_working_copy_mutation(), but with the stale
+    // working-copy commit.
+    if stale_commit.tree().tree_ids_and_labels()
+        != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
+    {
+        return Err(user_error("Concurrent working copy operation. Try again."));
+    }
+    let stats = locked_ws
+        .locked_wc()
+        .check_out(new_commit)
+        .await
+        .map_err(|err| {
+            internal_error_with_message(
+                format!("Failed to check out commit {}", new_commit.id().hex()),
+                err,
+            )
+        })?;
+    locked_ws.finish(op_id).await?;
+
+    Ok(stats)
+}
+
 /// Check if the working copy is stale and reload the repo if the repo is ahead
 /// of the working copy.
 ///
@@ -2843,6 +3027,19 @@ async fn handle_stale_working_copy(
             }
         }
         Ok(WorkingCopyFreshness::WorkingCopyStale) => {
+            if current_cli_name() == "vex" {
+                return Err(SnapshotWorkingCopyError::StaleWorkingCopy(
+                    user_error(format!(
+                        "The working copy is stale (not updated since operation {}). This usually \
+                         follows a lost op-head race.",
+                        short_operation_hash(&old_op_id)
+                    ))
+                    .hinted(
+                        "Run `vex workspace update-stale` to preserve the current files in a \
+                         recovery commit on the latest operation head.",
+                    ),
+                ));
+            }
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(
                 user_error(format!(
                     "The working copy is stale (not updated since operation {}).",
@@ -2856,6 +3053,20 @@ See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy \
             ))
         }
         Ok(WorkingCopyFreshness::SiblingOperation) => {
+            if current_cli_name() == "vex" {
+                return Err(SnapshotWorkingCopyError::StaleWorkingCopy(
+                    user_error(format!(
+                        "The repo was loaded at operation {}, which is a sibling of the working \
+                         copy's operation {}. This usually follows a lost op-head race.",
+                        short_operation_hash(repo.op_id()),
+                        short_operation_hash(&old_op_id)
+                    ))
+                    .hinted(
+                        "Run `vex workspace update-stale` to preserve the current files in a \
+                         recovery commit on the latest operation head.",
+                    ),
+                ));
+            }
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(
                 internal_error(format!(
                     "The repo was loaded at operation {}, which seems to be a sibling of the \
@@ -2871,6 +3082,18 @@ See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy \
             ))
         }
         Err(OpStoreError::ObjectNotFound { .. }) => {
+            if current_cli_name() == "vex" {
+                return Err(SnapshotWorkingCopyError::StaleWorkingCopy(
+                    user_error(
+                        "Could not read the working copy's operation. This usually follows a lost \
+                         op-head race.",
+                    )
+                    .hinted(
+                        "Run `vex workspace update-stale` to preserve the current files in a \
+                         recovery commit on the latest operation head.",
+                    ),
+                ));
+            }
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(
                 user_error("Could not read working copy's operation.").hinted(
                     "Run `jj workspace update-stale` to recover.
@@ -3844,6 +4067,41 @@ pub(crate) fn current_cli_name() -> String {
         .map(|name| name.strip_suffix(".exe").unwrap_or(&name).to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "jj".to_string())
+}
+
+/// For `vex`, replace a failing bare `main`/`master`/`trunk` `trunk()` override
+/// with the built-in candidate expression (`master@vex`, `main@origin`, …).
+///
+/// Returns `true` when the alias was rewritten and resolves successfully.
+fn try_recover_vex_trunk_alias(
+    ui: &Ui,
+    repo: &dyn jj_lib::repo::Repo,
+    env: &mut WorkspaceCommandEnvironment,
+) -> Result<bool, CommandError> {
+    let trunk_str = {
+        let (_, _, trunk_str, _) = env
+            .revset_parse_context()
+            .aliases_map
+            .get_function("trunk", 0)
+            .expect("trunk() should be defined by default");
+        trunk_str.to_owned()
+    };
+    if !revset_util::is_recoverable_vex_trunk_alias(&trunk_str) {
+        return Ok(false);
+    }
+    let Some(default_trunk) = revset_util::default_trunk_alias_expression(env.settings.config())
+    else {
+        return Ok(false);
+    };
+    // Skip if the active alias is already the built-in expression.
+    if trunk_str.trim() == default_trunk.trim() {
+        return Ok(false);
+    }
+    env.revset_aliases_map
+        .insert("trunk()", default_trunk.as_str(), None)
+        .expect("valid syntax");
+    env.reload_revset_expressions(ui)?;
+    Ok(revset_util::try_resolve_trunk_alias(repo, &env.revset_parse_context()).is_ok())
 }
 
 fn current_repo_name() -> &'static str {
