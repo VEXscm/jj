@@ -327,6 +327,22 @@ pub struct VexClientStats {
     pub git_mapping_rpcs: AtomicU64,
     /// Wall-clock milliseconds spent in `git/object/sha1/*` mapping RPCs.
     pub git_mapping_elapsed_ms: AtomicU64,
+    /// Wall-clock milliseconds spent acquiring presigned URL fetch hints
+    /// (the `GetObjects` hint RPC), summed per call.
+    pub pack_presign_wait_ms: AtomicU64,
+    /// Wall-clock milliseconds awaiting presigned HTTP GETs (chunk fetches
+    /// and streamed whole packs), summed per request across concurrent
+    /// workers — with W-way concurrency the sum can exceed wall time.
+    pub pack_http_wait_ms: AtomicU64,
+    /// Per-pack download wall time (chunked path), summed across packs.
+    /// Concurrent pack workers make the sum exceed wall time by design.
+    pub pack_download_ms: AtomicU64,
+    /// Per-pack decode+unpack wall time, summed across packs (chunked and
+    /// whole-pack fallback paths).
+    pub pack_unpack_ms: AtomicU64,
+    /// Wall-clock milliseconds spent in the serial per-object `GetObject`
+    /// loop that tails the clone-manifest prefetch.
+    pub pack_loose_object_ms: AtomicU64,
 }
 
 macro_rules! for_each_vex_client_stat {
@@ -369,7 +385,12 @@ macro_rules! for_each_vex_client_stat {
             git_compat_tree_decodes,
             git_mapping_names_resolved,
             git_mapping_rpcs,
-            git_mapping_elapsed_ms
+            git_mapping_elapsed_ms,
+            pack_presign_wait_ms,
+            pack_http_wait_ms,
+            pack_download_ms,
+            pack_unpack_ms,
+            pack_loose_object_ms
         )
     };
 }
@@ -415,6 +436,11 @@ pub struct VexClientStatsSnapshot {
     pub git_mapping_names_resolved: u64,
     pub git_mapping_rpcs: u64,
     pub git_mapping_elapsed_ms: u64,
+    pub pack_presign_wait_ms: u64,
+    pub pack_http_wait_ms: u64,
+    pub pack_download_ms: u64,
+    pub pack_unpack_ms: u64,
+    pub pack_loose_object_ms: u64,
 }
 
 impl VexClientStats {
@@ -885,11 +911,12 @@ const INLINE_FETCH_CONCURRENCY: usize = 8;
 /// Default number of clone packs fetched+unpacked in parallel during
 /// [`VexClient::prefetch_clone_manifest`]. Overridable via
 /// `VEX_CLONE_PACK_CONCURRENCY` (set `1` to restore the serial pack loop).
-/// Default tuned by a 2026-07-22 production sweep (271.4 MB pinned JJ
-/// fixture): pack transfer means were 24.0 s at 4×8, 7.1 s at 16×32, and only
-/// 6.8 s at 32×64, so throughput flattens at 16×32 (~38 MB/s) while 64 pack
-/// workers added writer-contention variance.
-const PACK_FETCH_CONCURRENCY: usize = 16;
+/// A 2026-07-22 production sweep (271.4 MB pinned JJ fixture) showed
+/// throughput flattening around ~38 MB/s once enough requests were in
+/// flight; with the server-side pack reshape (~16 MiB compressed packs,
+/// 2 MiB chunks) far fewer, larger transfers carry the same bytes, so 8 pack
+/// workers keep the pipe full without writer-contention variance.
+const PACK_FETCH_CONCURRENCY: usize = 8;
 
 fn pack_fetch_concurrency() -> usize {
     std::env::var("VEX_CLONE_PACK_CONCURRENCY")
@@ -902,12 +929,15 @@ fn pack_fetch_concurrency() -> usize {
 /// Default number of chunk fetches in flight within one pack transfer. The
 /// fetches are reorder-buffered (`.buffered(W)` yields results in input
 /// order), so the single writer still appends to the `.part` file strictly in
-/// chunk order. Peak buffered memory is bounded at pack workers × W × the
-/// 512KiB chunk size (~256 MB worst case at the 16×32 defaults). The same
-/// 2026-07-22 sweep showed 8×64 regressing ~35% from head-of-line blocking in
-/// the index-ordered `.part` writer, so keep W moderate. Overridable via
-/// `VEX_CLONE_CHUNK_CONCURRENCY` (set `1` to restore the serial chunk loop).
-const CHUNK_FETCH_CONCURRENCY: usize = 32;
+/// chunk order. Chunks are now typically 2 MiB (server-side pack reshape), so
+/// peak buffered memory is bounded at pack workers × W × 2 MiB — 8 × 16 ×
+/// 2 MiB = 256 MB worst case, the same bound as the previous 16×32×512 KiB
+/// defaults. The 2026-07-22 sweep showed very wide W regressing from
+/// head-of-line blocking in the index-ordered `.part` writer, so keep W
+/// moderate. Overridable via `VEX_CLONE_CHUNK_CONCURRENCY` (set `1` to
+/// restore the serial chunk loop); `VEX_CLONE_PACK_CONCURRENCY` covers the
+/// pack-level knob.
+const CHUNK_FETCH_CONCURRENCY: usize = 16;
 
 /// Effective chunk-fetch concurrency (env `VEX_CLONE_CHUNK_CONCURRENCY`,
 /// default [`CHUNK_FETCH_CONCURRENCY`]). Public so `vex bench clone` can
@@ -2345,7 +2375,12 @@ impl VexClient {
         headers: std::collections::HashMap<String, String>,
         expected_len: Option<u64>,
     ) -> Result<Vec<u8>, VexClientError> {
-        match Self::spawn_http_get(url, headers, expected_len).await {
+        let http_started = std::time::Instant::now();
+        let joined = Self::spawn_http_get(url, headers, expected_len).await;
+        vex_client_stats()
+            .pack_http_wait_ms
+            .fetch_add(http_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        match joined {
             Ok(result) => {
                 if let Ok(bytes) = &result {
                     let stats = vex_client_stats();
@@ -2426,6 +2461,7 @@ impl VexClient {
                 .fetch_add(total_bytes, Ordering::Relaxed);
             Ok(())
         }));
+        let http_started = std::time::Instant::now();
         let (write_result, task_result) = Self::shared_grpc_runtime().block_on(async {
             use futures::StreamExt as _;
             let mut write_result: Result<(), std::io::Error> = Ok(());
@@ -2446,6 +2482,9 @@ impl VexClient {
             };
             (write_result, task_result)
         });
+        vex_client_stats()
+            .pack_http_wait_ms
+            .fetch_add(http_started.elapsed().as_millis() as u64, Ordering::Relaxed);
         write_result?;
         task_result?;
         out.flush()?;
@@ -2914,6 +2953,7 @@ impl VexClient {
             partial_file.seek(SeekFrom::Start(0))?;
             state.next_chunk_index = 0;
         }
+        let download_started = std::time::Instant::now();
         let fetch_result = self
             .fetch_chunks_into_partial(
                 pack,
@@ -2925,6 +2965,10 @@ impl VexClient {
                 &mut partial_file,
             )
             .await;
+        vex_client_stats().pack_download_ms.fetch_add(
+            download_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         // Persist progress once at the end — and on error, so a resumed
         // transfer continues from the last appended chunk rather than the last
         // batched save. The fetch's own error wins over a save failure.
@@ -2934,11 +2978,17 @@ impl VexClient {
         partial_file.flush()?;
         drop(partial_file);
         let chunk_ids: Vec<ContentId> = chunks.iter().map(|chunk| chunk.content_id).collect();
-        if let Err(err) = self.prefetch_pack_entries_from_file(
+        let unpack_started = std::time::Instant::now();
+        let unpack_result = self.prefetch_pack_entries_from_file(
             &pack.content_id,
             &partial_path,
             prefetched_objects,
-        ) {
+        );
+        vex_client_stats().pack_unpack_ms.fetch_add(
+            unpack_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        if let Err(err) = unpack_result {
             // A fully-fetched `.part` that fails decode is poison, not
             // resumable progress: the completed state passes every resume
             // consistency check (equal length), so without clearing it every
@@ -4131,6 +4181,7 @@ impl VexClient {
         objects: &[(ObjectKind, ContentId)],
     ) -> Result<Vec<jj_backend_api::PresignedGet>, VexClientError> {
         let _t = RpcTimer::start(|| format!("get_object_fetch_hints[{}]", objects.len()));
+        let presign_started = std::time::Instant::now();
         let response =
             Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
                 client
@@ -4151,6 +4202,10 @@ impl VexClient {
                     .await
                     .map(|response| response.into_inner())
             })?;
+        vex_client_stats().pack_presign_wait_ms.fetch_add(
+            presign_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         Ok(response.get_instructions)
     }
 
@@ -4295,6 +4350,7 @@ impl VexClient {
 
         let total_loose = manifest.objects.len() as u64;
         let mut loose_done = 0_u64;
+        let loose_started = std::time::Instant::now();
         for object in &manifest.objects {
             loose_done += 1;
             if self
@@ -4338,6 +4394,10 @@ impl VexClient {
                 });
             }
         }
+        vex_client_stats().pack_loose_object_ms.fetch_add(
+            loose_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         debug!(
             repo_id = %self.config.repo_id,
             blob_mode = ?manifest.blob_mode,
@@ -4524,11 +4584,16 @@ impl VexClient {
             .direct_fetch_pack_to_file(pack, pack_hints, temp_pack.as_file_mut())
             .unwrap_or(false);
         if streamed {
+            let unpack_started = std::time::Instant::now();
             self.prefetch_pack_entries_from_file(
                 &pack.content_id,
                 temp_pack.path(),
                 prefetched_objects,
             )?;
+            stats.pack_unpack_ms.fetch_add(
+                unpack_started.elapsed().as_millis() as u64,
+                Ordering::Relaxed,
+            );
             packs_counter.fetch_add(1, Ordering::Relaxed);
             bytes_counter.fetch_add(pack.size_bytes, Ordering::Relaxed);
             return Ok(());
@@ -4539,6 +4604,7 @@ impl VexClient {
             Ok(None) | Err(_) => self.get_object(ObjectKind::Pack, &pack.content_id).await?,
         };
         bytes_counter.fetch_add(pack_bytes.len() as u64, Ordering::Relaxed);
+        let unpack_started = std::time::Instant::now();
         let object_pack = decode_object_pack(&pack_bytes)
             .or_else(|_| decode_object_pack_reader(BufReader::new(pack_bytes.as_slice())))
             .map_err(|err| VexClientError::PackDecode(err.to_string()))?;
@@ -4549,6 +4615,10 @@ impl VexClient {
             }
             Ok(())
         })?;
+        stats.pack_unpack_ms.fetch_add(
+            unpack_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         packs_counter.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
