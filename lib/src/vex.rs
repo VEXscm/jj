@@ -152,6 +152,43 @@ fn env_secs(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Process-wide HTTP/2 `:authority` override for every Vex gRPC channel.
+///
+/// The Vex hosted-listener path dials a stable VIP (`http://10.88.0.2:8444`)
+/// that routes by `:authority` to an internal service name
+/// (e.g. `grpc.jj-backend.internal`). tonic derives `:authority` from the
+/// dialed URI, so without an override the listener's catch-all 404s. Set once
+/// per process (CLI flag `vex materialize --grpc-authority`, or the
+/// `VEX_GRPC_AUTHORITY` env var) before the first channel is built; blank
+/// values are ignored and the dialed host:port stays the authority (today's
+/// behavior).
+static GRPC_AUTHORITY_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Set the `:authority` presented on every subsequent Vex gRPC connection in
+/// this process. Returns `false` (and changes nothing) if an override was
+/// already set or `authority` is blank. Channels are cached per endpoint, so
+/// call this before the first Vex RPC of the process.
+pub fn set_grpc_authority_override(authority: &str) -> bool {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return false;
+    }
+    GRPC_AUTHORITY_OVERRIDE.set(authority.to_string()).is_ok()
+}
+
+/// The effective `:authority` override: the programmatic setter wins, then the
+/// `VEX_GRPC_AUTHORITY` env var; `None` (the default) keeps tonic's derivation
+/// from the dialed URI.
+fn grpc_authority_override() -> Option<String> {
+    if let Some(authority) = GRPC_AUTHORITY_OVERRIDE.get() {
+        return Some(authority.clone());
+    }
+    std::env::var("VEX_GRPC_AUTHORITY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Whether `VEX_RPC_TIMING` is set — enables per-RPC wall-time logging to stderr
 /// for latency attribution. Cached so the env lookup happens once.
 fn rpc_timing_enabled() -> bool {
@@ -1814,7 +1851,26 @@ impl VexClient {
         // keychain — falling back to the system trust store only when
         // `VEX_TLS_NATIVE_ROOTS` is set (see `native_tls_roots_requested`).
         let is_https = Self::endpoint_is_https(endpoint);
+        let endpoint_str = endpoint;
         let mut endpoint = Endpoint::from_shared(endpoint.to_string()).map_err(mkerr)?;
+        // Listener-routed deployments dial a stable VIP but must present the
+        // internal service name as `:authority` (see
+        // `set_grpc_authority_override`). `Endpoint::origin` swaps the URI the
+        // requests are built against (scheme + authority) while the transport
+        // still connects to the dialed address.
+        if let Some(authority) = grpc_authority_override() {
+            let scheme = if is_https { "https" } else { "http" };
+            let origin = tonic::transport::Uri::builder()
+                .scheme(scheme)
+                .authority(authority.as_str())
+                .path_and_query("/")
+                .build()
+                .map_err(|err| VexConfigError::InvalidEndpoint {
+                    endpoint: endpoint_str.to_string(),
+                    message: format!("invalid gRPC authority override `{authority}`: {err}"),
+                })?;
+            endpoint = endpoint.origin(origin);
+        }
         if is_https {
             let tls = tonic::transport::ClientTlsConfig::new();
             let tls = if Self::native_tls_roots_requested() {
