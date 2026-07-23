@@ -434,16 +434,8 @@ async fn init_vex_clone_working_copy_at(
     // `start_commit`, so materialize that known tree while the server publishes
     // the operation. Keep the mutation locked and unfinished until the
     // published operation id is available for the working-copy state.
-    let checkout_start_commit = start_commit.clone();
-    let checkout = async move {
-        crate::vex::VexClient::shared_grpc_runtime()
-            .spawn_blocking(move || {
-                let mut locked_wc = locked_wc;
-                pollster::block_on(locked_wc.check_out(&checkout_start_commit))?;
-                Ok::<_, WorkspaceInitError>(locked_wc)
-            })
-            .await
-    };
+    let mut locked_wc = locked_wc;
+    let checkout = locked_wc.check_out(start_commit);
     let (publish_result, checkout_result) = futures::join!(publish, checkout);
     let repo = match publish_result {
         Ok(repo) => repo,
@@ -452,14 +444,13 @@ async fn init_vex_clone_working_copy_at(
             // publishing fails. Restore the empty tree when checkout completed
             // so callers that supplied an existing empty directory don't keep
             // an unpublished worktree.
-            if let Ok(Ok(mut locked_wc)) = checkout_result {
+            if checkout_result.is_ok() {
                 locked_wc.check_out(&repo.store().root_commit()).await.ok();
             }
             return Err(error);
         }
     };
-    let mut locked_wc = checkout_result
-        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(Box::new(err))))??;
+    checkout_result?;
 
     // A CAS retry reloads the repo before rebuilding the workspace operation.
     // The normal single-parent result still points at `start_commit`, but
