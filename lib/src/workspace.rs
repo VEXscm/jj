@@ -411,23 +411,81 @@ async fn init_vex_clone_working_copy_at(
     let working_copy_state_path = jj_dir.join("working_copy");
     std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
 
+    let working_copy = working_copy_factory.init_working_copy(
+        repo.store().clone(),
+        workspace_root.to_path_buf(),
+        working_copy_state_path.clone(),
+        repo.op_id().clone(),
+        workspace_name.clone(),
+        repo.settings(),
+    )?;
+    let locked_wc = working_copy.start_mutation().await?;
+
     if let Some(progress) = progress {
         progress(crate::vex::CloneProgress::WorkspacePublish);
     }
-    let repo =
-        commit_vex_clone_workspace_operation(repo, &workspace_name, start_commit, resolved_trunk)
-            .await?;
+    let publish =
+        commit_vex_clone_workspace_operation(repo, &workspace_name, start_commit, resolved_trunk);
     if let Some(progress) = progress {
         progress(crate::vex::CloneProgress::CheckingOut);
     }
-    let working_copy = finish_init_working_copy(
-        &repo,
-        workspace_root,
-        &working_copy_state_path,
-        working_copy_factory,
-        workspace_name,
-    )
-    .await?;
+
+    // The single-parent workspace operation deterministically checks out
+    // `start_commit`, so materialize that known tree while the server publishes
+    // the operation. Keep the mutation locked and unfinished until the
+    // published operation id is available for the working-copy state.
+    let checkout_start_commit = start_commit.clone();
+    let checkout = async move {
+        crate::vex::VexClient::shared_grpc_runtime()
+            .spawn_blocking(move || {
+                let mut locked_wc = locked_wc;
+                pollster::block_on(locked_wc.check_out(&checkout_start_commit))?;
+                Ok::<_, WorkspaceInitError>(locked_wc)
+            })
+            .await
+    };
+    let (publish_result, checkout_result) = futures::join!(publish, checkout);
+    let repo = match publish_result {
+        Ok(repo) => repo,
+        Err(error) => {
+            // Unlike the old sequential order, files may now exist when
+            // publishing fails. Restore the empty tree when checkout completed
+            // so callers that supplied an existing empty directory don't keep
+            // an unpublished worktree.
+            if let Ok(Ok(mut locked_wc)) = checkout_result {
+                locked_wc.check_out(&repo.store().root_commit()).await.ok();
+            }
+            return Err(error);
+        }
+    };
+    let mut locked_wc = checkout_result
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(Box::new(err))))??;
+
+    // A CAS retry reloads the repo before rebuilding the workspace operation.
+    // The normal single-parent result still points at `start_commit`, but
+    // reconcile against the published view before finalizing in case that ever
+    // changes. A missing workspace is equivalent to the old empty checkout.
+    let published_wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(workspace_name.as_ref())
+        .cloned();
+    match published_wc_commit_id {
+        Some(commit_id) if commit_id != *start_commit.id() => {
+            let wc_commit = repo
+                .store()
+                .get_commit_async(&commit_id)
+                .await
+                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+            locked_wc.check_out(&wc_commit).await?;
+        }
+        None => {
+            locked_wc.check_out(&repo.store().root_commit()).await?;
+        }
+        Some(_) => {}
+    }
+    let working_copy = locked_wc.finish(repo.op_id().clone()).await?;
+    let working_copy_type_path = working_copy_state_path.join("type");
+    fs::write(&working_copy_type_path, working_copy.name()).context(&working_copy_type_path)?;
     Ok((working_copy, repo))
 }
 

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
@@ -50,7 +51,8 @@ use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
     CloneManifest, ContentId, ObjectKind, ObjectPackEntry, SnapshotPackSet, decode_object_pack,
-    decode_object_pack_reader, decode_object_pack_with_visitor,
+    decode_object_pack_reader, decode_object_pack_with_visitor, decode_pack_chunk_entries,
+    parse_pack_header,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -1947,7 +1949,7 @@ impl VexClient {
     /// Shared multi-threaded runtime for all blocking gRPC calls. Reused across
     /// every call so we don't pay runtime-construction cost per request and so
     /// batches can be issued concurrently over one HTTP/2 connection.
-    fn shared_grpc_runtime() -> &'static tokio::runtime::Runtime {
+    pub(crate) fn shared_grpc_runtime() -> &'static tokio::runtime::Runtime {
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RUNTIME.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -2897,6 +2899,17 @@ impl VexClient {
         prefetched_objects: &AtomicU64,
         concurrency: usize,
     ) -> Result<bool, VexClientError> {
+        if pack.chunk_frames {
+            return self
+                .prefetch_chunk_framed_pack_via_chunks(
+                    pack,
+                    hints,
+                    snapshot,
+                    prefetched_objects,
+                    concurrency,
+                )
+                .await;
+        }
         let Some(chunks) = normalized_valid_pack_chunks(pack) else {
             return Ok(false);
         };
@@ -3003,6 +3016,303 @@ impl VexClient {
         }
         self.clear_pack_transfer_state(&pack.content_id, &chunk_ids)?;
         Ok(true)
+    }
+
+    /// Fetch and unpack a pack whose chunks are independently decodable zstd
+    /// frames. The transfer's `.part` file remains the byte-for-byte,
+    /// in-order resume journal used by the legacy path; unpack consumes each
+    /// verified in-memory chunk instead of rereading the growing file.
+    ///
+    /// A resumed prefix is decoded from `.part` before new chunks are fetched.
+    /// This is deliberately idempotent: a prior process may have unpacked some
+    /// of that prefix before it failed, while a crash before its unpack leaves
+    /// it only in the journal. Per-object cache writes already tolerate either
+    /// case, and every prefix entry is therefore made available before the
+    /// transfer is declared complete.
+    #[expect(clippy::too_many_arguments)]
+    async fn prefetch_chunk_framed_pack_via_chunks(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        hints: &[jj_backend_api::PresignedGet],
+        snapshot: bool,
+        prefetched_objects: &AtomicU64,
+        concurrency: usize,
+    ) -> Result<bool, VexClientError> {
+        let Some(chunks) = normalized_valid_pack_chunks(pack) else {
+            return Ok(false);
+        };
+        let Some(partial_path) = self.transfer_partial_path(&pack.content_id) else {
+            return Ok(false);
+        };
+        if let Some(parent) = partial_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut state =
+            self.load_pack_transfer_state(&pack.content_id)?
+                .unwrap_or(PackTransferState {
+                    pack_content_id: pack.content_id.to_string(),
+                    chunk_count: chunks.len(),
+                    next_chunk_index: 0,
+                });
+        if state.chunk_count != chunks.len() || state.next_chunk_index > chunks.len() {
+            state.chunk_count = chunks.len();
+            state.next_chunk_index = 0;
+            drop(fs::remove_file(&partial_path));
+        }
+        let mut partial_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&partial_path)?;
+        let expected_prefix_bytes: u64 = chunks
+            .iter()
+            .take(state.next_chunk_index)
+            .map(|chunk| chunk.size_bytes)
+            .sum();
+        let partial_len = partial_file.metadata()?.len();
+        if partial_len > expected_prefix_bytes {
+            debug!(
+                pack = %pack.content_id,
+                partial_len,
+                expected_prefix_bytes,
+                next_chunk_index = state.next_chunk_index,
+                "pack `.part` ahead of recorded transfer state; truncating to the trusted prefix"
+            );
+            partial_file.set_len(expected_prefix_bytes)?;
+            partial_file.seek(SeekFrom::Start(expected_prefix_bytes))?;
+        } else if partial_len < expected_prefix_bytes {
+            partial_file.set_len(0)?;
+            partial_file.seek(SeekFrom::Start(0))?;
+            state.next_chunk_index = 0;
+        }
+
+        let chunk_ids: Vec<ContentId> = chunks.iter().map(|chunk| chunk.content_id).collect();
+        let mut decoded_entries = 0_usize;
+        let mut expected_entries = None;
+        let mut prefix_file = File::open(&partial_path)?;
+        for (index, chunk) in chunks.iter().take(state.next_chunk_index).enumerate() {
+            let mut bytes = vec![0; chunk.size_bytes as usize];
+            prefix_file.read_exact(&mut bytes)?;
+            if index == 0 {
+                expected_entries = Some(
+                    parse_pack_header(&bytes)
+                        .map_err(|err| VexClientError::PackDecode(err.to_string()))?
+                        .entry_count,
+                );
+            }
+            match self
+                .unpack_chunk_frame_entries(chunk, Arc::new(bytes), prefetched_objects)
+                .await
+            {
+                Ok(count) => decoded_entries += count,
+                Err(err) => {
+                    if matches!(err, VexClientError::PackDecode(_)) {
+                        drop(self.clear_pack_transfer_state(&pack.content_id, &chunk_ids));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        drop(prefix_file);
+
+        let download_started = std::time::Instant::now();
+        let download_elapsed_ms = Arc::new(AtomicU64::new(0));
+        let decode_failed = Arc::new(AtomicBool::new(false));
+        let fetch_result = self
+            .fetch_chunk_frames_into_partial(
+                pack,
+                &chunks,
+                hints,
+                snapshot,
+                concurrency,
+                &mut state,
+                &mut partial_file,
+                &mut decoded_entries,
+                &mut expected_entries,
+                &download_elapsed_ms,
+                &decode_failed,
+                download_started,
+                prefetched_objects,
+            )
+            .await;
+        let downloaded_ms = download_elapsed_ms.load(Ordering::Relaxed);
+        vex_client_stats().pack_download_ms.fetch_add(
+            if downloaded_ms == 0 && fetch_result.is_err() {
+                download_started.elapsed().as_millis() as u64
+            } else {
+                downloaded_ms
+            },
+            Ordering::Relaxed,
+        );
+        let save_result = self.save_pack_transfer_state(&pack.content_id, &state);
+        if let Err(err) = fetch_result {
+            if decode_failed.load(Ordering::Relaxed) {
+                drop(self.clear_pack_transfer_state(&pack.content_id, &chunk_ids));
+            }
+            return Err(err);
+        }
+        save_result?;
+        partial_file.flush()?;
+        drop(partial_file);
+
+        let Some(expected_entries) = expected_entries else {
+            let err = VexClientError::PackDecode(format!(
+                "chunk-framed pack {} did not contain chunk zero",
+                pack.content_id
+            ));
+            drop(self.clear_pack_transfer_state(&pack.content_id, &chunk_ids));
+            return Err(err);
+        };
+        if decoded_entries != expected_entries {
+            let err = VexClientError::PackDecode(format!(
+                "chunk-framed pack {} decoded {decoded_entries} entries; header declares {expected_entries}",
+                pack.content_id
+            ));
+            drop(self.clear_pack_transfer_state(&pack.content_id, &chunk_ids));
+            return Err(err);
+        }
+        self.clear_pack_transfer_state(&pack.content_id, &chunk_ids)?;
+        Ok(true)
+    }
+
+    /// Decode and cache one verified chunk frame on Tokio's blocking pool.
+    /// Each frame gets its own pack-resident payload id (`chunk.content_id`):
+    /// the regular per-pack payload is mutable while it is being assembled, so
+    /// sharing it across concurrent frame writes would lose index records.
+    /// Object content IDs remain unchanged and loose writes are already
+    /// idempotent, preserving skip-known-object behavior.
+    async fn unpack_chunk_frame_entries(
+        &self,
+        chunk: &jj_backend_types::PackChunkDescriptor,
+        bytes: Arc<Vec<u8>>,
+        prefetched_objects: &AtomicU64,
+    ) -> Result<usize, VexClientError> {
+        let client = self.clone();
+        let chunk_index = chunk.chunk_index;
+        let chunk_content_id = chunk.content_id;
+        let unpacked_objects = Arc::new(AtomicU64::new(0));
+        let unpacked_objects_for_task = Arc::clone(&unpacked_objects);
+        let unpack_started = std::time::Instant::now();
+        let handle = Self::shared_grpc_runtime().spawn_blocking(move || {
+            let entries = decode_pack_chunk_entries(&bytes, chunk_index)
+                .map_err(|err| VexClientError::PackDecode(err.to_string()))?;
+            let entry_count = entries.len();
+            let mut entries = Some(entries);
+            client.unpack_pack_entries(
+                &chunk_content_id,
+                unpacked_objects_for_task.as_ref(),
+                move |sink| {
+                    for entry in entries.take().expect("unpack drives frame entries once") {
+                        sink(entry)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok::<_, VexClientError>(entry_count)
+        });
+        let result = handle
+            .await
+            .map_err(|err| VexClientError::PackDecode(format!("chunk unpack task failed: {err}")));
+        vex_client_stats().pack_unpack_ms.fetch_add(
+            unpack_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        let entry_count = result??;
+        prefetched_objects.fetch_add(unpacked_objects.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(entry_count)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn fetch_chunk_frames_into_partial(
+        &self,
+        pack: &jj_backend_types::PackDescriptor,
+        chunks: &[jj_backend_types::PackChunkDescriptor],
+        hints: &[jj_backend_api::PresignedGet],
+        snapshot: bool,
+        concurrency: usize,
+        state: &mut PackTransferState,
+        partial_file: &mut File,
+        decoded_entries: &mut usize,
+        expected_entries: &mut Option<usize>,
+        download_elapsed_ms: &AtomicU64,
+        decode_failed: &AtomicBool,
+        download_started: std::time::Instant,
+        prefetched_objects: &AtomicU64,
+    ) -> Result<(), VexClientError> {
+        use futures::stream::StreamExt as _;
+        let mut fetched =
+            futures::stream::iter(chunks.iter().enumerate().skip(state.next_chunk_index).map(
+                |(index, chunk)| async move {
+                    let bytes = self
+                        .fetch_pack_chunk_with_retry(
+                            &chunk.content_id,
+                            hints,
+                            Some(chunk.size_bytes),
+                        )
+                        .await?;
+                    download_elapsed_ms.fetch_max(
+                        download_started.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != chunk.size_bytes {
+                        return Err(VexClientError::PackDecode(format!(
+                            "chunk size mismatch for pack {} chunk {}",
+                            pack.content_id, index
+                        )));
+                    }
+                    let header_entries = if index == 0 {
+                        match parse_pack_header(&bytes) {
+                            Ok(header) => Some(header.entry_count),
+                            Err(err) => {
+                                decode_failed.store(true, Ordering::Relaxed);
+                                return Err(VexClientError::PackDecode(err.to_string()));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let bytes = Arc::new(bytes);
+                    let entry_count = match self
+                        .unpack_chunk_frame_entries(chunk, Arc::clone(&bytes), prefetched_objects)
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(err) => {
+                            if matches!(err, VexClientError::PackDecode(_)) {
+                                decode_failed.store(true, Ordering::Relaxed);
+                            }
+                            return Err(err);
+                        }
+                    };
+                    Ok::<_, VexClientError>((index, bytes, entry_count, header_entries))
+                },
+            ))
+            .buffered(concurrency.max(1));
+        let mut chunks_since_save = 0_usize;
+        while let Some(result) = fetched.next().await {
+            let (index, chunk_bytes, entry_count, header_entries) = result?;
+            if let Some(header_entries) = header_entries {
+                *expected_entries = Some(header_entries);
+            }
+            *decoded_entries += entry_count;
+            let stats = vex_client_stats();
+            stats.pack_chunks_fetched.fetch_add(1, Ordering::Relaxed);
+            let bytes_counter = if snapshot {
+                &stats.snapshot_pack_bytes
+            } else {
+                &stats.pack_bytes_fetched
+            };
+            bytes_counter.fetch_add(chunk_bytes.len() as u64, Ordering::Relaxed);
+            partial_file.write_all(&chunk_bytes)?;
+            state.next_chunk_index = index + 1;
+            chunks_since_save += 1;
+            if chunks_since_save >= TRANSFER_STATE_SAVE_INTERVAL {
+                self.save_pack_transfer_state(&pack.content_id, state)?;
+                chunks_since_save = 0;
+            }
+        }
+        Ok(())
     }
 
     /// Fetch `chunks[state.next_chunk_index..]` and append them to the pack's
@@ -4820,8 +5130,8 @@ mod tests {
     use jj_backend_api::PresignedGet;
     use jj_backend_types::{
         ClonePackScope, ObjectPack, PackChunkDescriptor, PackDescriptor, encode_object_pack,
+        encode_object_pack_chunked,
     };
-    use std::io::Read;
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
 
@@ -5042,6 +5352,7 @@ mod tests {
             content_id: ContentId::hash_bytes(b"pack"),
             size_bytes: 30,
             scope: ClonePackScope::Full,
+            chunk_frames: false,
             chunks: vec![
                 PackChunkDescriptor {
                     content_id: ContentId::hash_bytes(b"c2"),
@@ -5080,6 +5391,7 @@ mod tests {
             content_id: ContentId::hash_bytes(b"pack"),
             size_bytes: 30,
             scope: ClonePackScope::Full,
+            chunk_frames: false,
             chunks: vec![
                 PackChunkDescriptor {
                     content_id: ContentId::hash_bytes(b"c0"),
@@ -5260,6 +5572,7 @@ mod tests {
                 content_id: ContentId::hash_bytes(&[commit.as_bytes()[0], index as u8]),
                 size_bytes: 10,
                 scope: ClonePackScope::Full,
+                chunk_frames: false,
                 chunks: vec![],
                 objects: vec![],
             })
@@ -5455,6 +5768,7 @@ mod tests {
             // must match what the server serves.
             size_bytes: 10,
             scope: ClonePackScope::Full,
+            chunk_frames: false,
             chunks: vec![],
             objects: vec![],
         };
@@ -5658,6 +5972,14 @@ mod tests {
     }
 
     fn chunked_pack_fixture(object_count: usize, chunk_size: usize) -> ChunkedPackFixture {
+        chunked_pack_fixture_with_frames(object_count, chunk_size, false)
+    }
+
+    fn chunked_pack_fixture_with_frames(
+        object_count: usize,
+        chunk_size: usize,
+        chunk_frames: bool,
+    ) -> ChunkedPackFixture {
         // Cheap deterministic LCG data zstd cannot squash, so the encoded
         // payload really spans many chunks.
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
@@ -5678,21 +6000,41 @@ mod tests {
                 }
             })
             .collect();
-        let encoded = encode_object_pack(&ObjectPack {
+        let object_pack = ObjectPack {
             objects: objects.clone(),
-        });
-        let chunk_count = encoded.len().div_ceil(chunk_size) as u32;
+        };
+        let (encoded, boundaries) = if chunk_frames {
+            encode_object_pack_chunked(&object_pack, 3, chunk_size)
+        } else {
+            (encode_object_pack(&object_pack), Vec::new())
+        };
+        let chunk_count = if chunk_frames {
+            boundaries.len() as u32
+        } else {
+            encoded.len().div_ceil(chunk_size) as u32
+        };
         assert!(chunk_count > 1, "fixture must produce a multi-chunk pack");
-        let pieces: Vec<(PackChunkDescriptor, Vec<u8>)> = encoded
-            .chunks(chunk_size)
+        let legacy_boundaries: Vec<usize> = (0..encoded.len()).step_by(chunk_size).collect();
+        let chunk_boundaries = if chunk_frames {
+            boundaries
+        } else {
+            legacy_boundaries
+        };
+        let pieces: Vec<(PackChunkDescriptor, Vec<u8>)> = chunk_boundaries
+            .iter()
             .enumerate()
-            .map(|(index, piece)| {
+            .map(|(index, start)| {
+                let end = chunk_boundaries
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(encoded.len());
+                let piece = &encoded[*start..end];
                 (
                     PackChunkDescriptor {
                         content_id: ContentId::hash_bytes(piece),
                         chunk_index: index as u32,
                         chunk_count,
-                        offset_bytes: (index * chunk_size) as u64,
+                        offset_bytes: *start as u64,
                         size_bytes: piece.len() as u64,
                     },
                     piece.to_vec(),
@@ -5717,6 +6059,7 @@ mod tests {
             content_id: ContentId::hash_bytes(&encoded),
             size_bytes: encoded.len() as u64,
             scope: ClonePackScope::Full,
+            chunk_frames,
             chunks: pieces
                 .into_iter()
                 .map(|(descriptor, _)| descriptor)
@@ -5808,6 +6151,211 @@ mod tests {
         for (entry, bytes) in fixture.objects.iter().zip(&concurrent) {
             assert_eq!(&entry.data, bytes);
         }
+    }
+
+    #[test]
+    fn chunk_framed_prefetch_streams_independent_frames_and_counts_presigned() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture_with_frames(24, 256, true);
+        let before = vex_client_stats_snapshot();
+        let unpacked = run_chunked_prefetch(&fixture, 4);
+        let after = vex_client_stats_snapshot();
+        let chunk_count = fixture.pack.chunks.len() as u64;
+        assert_eq!(
+            after.presigned_fetches - before.presigned_fetches,
+            chunk_count
+        );
+        assert_eq!(
+            after.presigned_bytes - before.presigned_bytes,
+            fixture.encoded.len() as u64
+        );
+        assert_eq!(
+            after.pack_chunks_fetched - before.pack_chunks_fetched,
+            chunk_count
+        );
+        for (entry, bytes) in fixture.objects.iter().zip(unpacked) {
+            assert_eq!(entry.data, bytes);
+        }
+    }
+
+    #[test]
+    fn chunk_framed_prefetch_decodes_recorded_resume_prefix() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture_with_frames(24, 256, true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let recorded = 2_usize;
+        client
+            .save_pack_transfer_state(
+                &fixture.pack.content_id,
+                &PackTransferState {
+                    pack_content_id: fixture.pack.content_id.to_string(),
+                    chunk_count: fixture.pack.chunks.len(),
+                    next_chunk_index: recorded,
+                },
+            )
+            .unwrap();
+        let prefix_bytes: usize = fixture.pack.chunks[..recorded]
+            .iter()
+            .map(|chunk| chunk.size_bytes as usize)
+            .sum();
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        fs::write(&partial_path, &fixture.encoded[..prefix_bytes]).unwrap();
+
+        let counter = AtomicU64::new(0);
+        assert!(
+            futures::executor::block_on(client.prefetch_pack_via_chunks(
+                &fixture.pack,
+                &fixture.hints,
+                false,
+                &counter,
+            ))
+            .unwrap()
+        );
+        let requested = fixture.server.requested_paths();
+        for chunk in &fixture.pack.chunks[..recorded] {
+            assert!(
+                !requested
+                    .iter()
+                    .any(|path| path.ends_with(&chunk.content_id.to_string())),
+                "recorded frame must be decoded from .part, not fetched again"
+            );
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            fixture.objects.len() as u64
+        );
+        for entry in &fixture.objects {
+            assert_eq!(
+                client
+                    .read_cached_object(entry.kind, &entry.content_id)
+                    .unwrap(),
+                entry.data
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_framed_prefetch_hash_failure_keeps_verified_prefix_for_resume() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture_with_frames(24, 256, true);
+        let corrupt_server = ChunkServer::start(
+            fixture
+                .pack
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let start = chunk.offset_bytes as usize;
+                    let end = start + chunk.size_bytes as usize;
+                    let mut bytes = fixture.encoded[start..end].to_vec();
+                    if index == 1 {
+                        bytes[0] ^= 0xff;
+                    }
+                    (chunk.content_id.to_string(), bytes)
+                })
+                .collect(),
+        );
+        let corrupt_hints: Vec<PresignedGet> = fixture
+            .pack
+            .chunks
+            .iter()
+            .map(|chunk| PresignedGet {
+                object_key: format!("packs/chunks/sha256/{}", chunk.content_id),
+                url: corrupt_server.url_for(&chunk.content_id),
+                headers: Default::default(),
+            })
+            .collect();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let counter = AtomicU64::new(0);
+        futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &corrupt_hints,
+            false,
+            &counter,
+        ))
+        .unwrap_err();
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        let first_chunk_len = fixture.pack.chunks[0].size_bytes as usize;
+        assert_eq!(
+            fs::read(&partial_path).unwrap(),
+            fixture.encoded[..first_chunk_len]
+        );
+        assert_eq!(
+            client
+                .load_pack_transfer_state(&fixture.pack.content_id)
+                .unwrap()
+                .unwrap()
+                .next_chunk_index,
+            1
+        );
+
+        assert!(
+            futures::executor::block_on(client.prefetch_pack_via_chunks(
+                &fixture.pack,
+                &fixture.hints,
+                false,
+                &counter,
+            ))
+            .unwrap()
+        );
+        assert!(
+            !fixture
+                .server
+                .requested_paths()
+                .iter()
+                .any(|path| { path.ends_with(&fixture.pack.chunks[0].content_id.to_string()) }),
+            "the verified frame prefix must not be refetched"
+        );
+    }
+
+    #[test]
+    fn chunk_framed_prefetch_rejects_header_entry_count_mismatch() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = chunked_pack_fixture_with_frames(24, 256, true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        client
+            .save_pack_transfer_state(
+                &fixture.pack.content_id,
+                &PackTransferState {
+                    pack_content_id: fixture.pack.content_id.to_string(),
+                    chunk_count: fixture.pack.chunks.len(),
+                    next_chunk_index: fixture.pack.chunks.len(),
+                },
+            )
+            .unwrap();
+        let mut incomplete_header = fixture.encoded.clone();
+        incomplete_header[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let partial_path = client
+            .transfer_partial_path(&fixture.pack.content_id)
+            .unwrap();
+        fs::write(&partial_path, incomplete_header).unwrap();
+
+        let counter = AtomicU64::new(0);
+        let err = futures::executor::block_on(client.prefetch_pack_via_chunks(
+            &fixture.pack,
+            &fixture.hints,
+            false,
+            &counter,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, VexClientError::PackDecode(_)), "{err}");
+        assert!(
+            client
+                .load_pack_transfer_state(&fixture.pack.content_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!partial_path.exists());
     }
 
     /// A `.part` file LONGER than the recorded state (a kill between an append
@@ -6206,6 +6754,7 @@ mod tests {
             content_id,
             size_bytes: 4,
             scope: ClonePackScope::Full,
+            chunk_frames: false,
             chunks: vec![],
             objects: vec![],
         };
