@@ -4407,6 +4407,15 @@ impl VexClient {
         );
         let max_wait =
             std::time::Duration::from_secs(env_secs("VEX_CLONE_MANIFEST_MAX_WAIT_SECS", 1_800));
+        // Transient errors (edge 502/503, backend restart) retry on a short
+        // exponential backoff instead of the build-poll interval: a warm
+        // manifest serves in well under a second, so waiting a flat 3 s after
+        // one edge blip quantized the whole manifest phase to ~3+ s
+        // (measured 2.7-5.7 s outliers vs a ~0.8 s healthy floor).
+        let transient_backoff_floor = std::time::Duration::from_millis(
+            env_secs("VEX_CLONE_MANIFEST_RETRY_MS", 250).max(50),
+        );
+        let mut transient_backoff = transient_backoff_floor;
         let started = std::time::Instant::now();
         loop {
             if started.elapsed() >= max_wait {
@@ -4454,6 +4463,7 @@ impl VexClient {
             });
             match attempt {
                 Ok(response) if response.building => {
+                    transient_backoff = transient_backoff_floor;
                     if let Some(progress) = progress {
                         progress(CloneProgress::ManifestBuilding {
                             waited_secs: started.elapsed().as_secs(),
@@ -4478,7 +4488,8 @@ impl VexClient {
                             message: err.to_string(),
                         });
                     }
-                    std::thread::sleep(poll);
+                    std::thread::sleep(transient_backoff);
+                    transient_backoff = (transient_backoff * 2).min(poll);
                     continue;
                 }
                 Err(err) => return Err(err),
