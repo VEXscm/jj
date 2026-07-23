@@ -411,6 +411,56 @@ fn test_index_commits_previous_operations() -> TestResult {
     Ok(())
 }
 
+/// The clone bootstrap build (roadmap 069) indexes only commits reachable
+/// from the head operation's own view — commits visible only in historical
+/// operations are left for lazy indexing — and the saved segment serves as
+/// the base for subsequent incremental builds.
+#[test]
+fn test_index_bootstrap_from_head_view() -> TestResult {
+    let settings = testutils::user_settings();
+    let test_repo = TestRepo::init();
+    let test_env = &test_repo.env;
+    let repo = &test_repo.repo;
+
+    // A commit visible only in the first operation's view.
+    let mut tx = repo.start_transaction();
+    let hidden_commit = write_random_commit(tx.repo_mut());
+    let repo = tx.commit("test").block_on()?;
+
+    // The head operation hides it and creates the visible chain A-B-C.
+    let mut tx = repo.start_transaction();
+    tx.repo_mut().remove_head(hidden_commit.id());
+    let commit_a = write_random_commit(tx.repo_mut());
+    let commit_b = write_random_commit_with_parents(tx.repo_mut(), &[&commit_a]);
+    let commit_c = write_random_commit_with_parents(tx.repo_mut(), &[&commit_b]);
+    let repo = tx.commit("test").block_on()?;
+
+    let default_index_store: &DefaultIndexStore = repo.index_store().downcast_ref().unwrap();
+    default_index_store.reinit()?;
+    let index = default_index_store
+        .build_bootstrap_index_at_operation(repo.operation(), repo.store())
+        .block_on()?;
+    assert!(index.has_id(commit_a.id()).unwrap());
+    assert!(index.has_id(commit_b.id()).unwrap());
+    assert!(index.has_id(commit_c.id()).unwrap());
+    assert!(
+        !index.has_id(hidden_commit.id()).unwrap(),
+        "commit hidden before the head op must not be bootstrap-indexed"
+    );
+
+    // The bootstrap segment is linked to the head op: reloading must reuse it
+    // without a rebuild, and a following operation indexes incrementally on
+    // top of it.
+    let repo = test_env.load_repo_at_head(&settings, test_repo.repo_path());
+    assert!(!index_has_id(repo.index(), hidden_commit.id()));
+    let mut tx = repo.start_transaction();
+    let commit_d = write_random_commit_with_parents(tx.repo_mut(), &[&commit_c]);
+    let repo = tx.commit("test").block_on()?;
+    assert!(index_has_id(repo.index(), commit_d.id()));
+    assert!(!index_has_id(repo.index(), hidden_commit.id()));
+    Ok(())
+}
+
 #[test]
 fn test_index_commits_hidden_but_referenced() -> TestResult {
     // Test that hidden-but-referenced commits are indexed.

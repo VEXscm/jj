@@ -783,6 +783,39 @@ impl RepoLoader {
             .await
     }
 
+    /// Like [`Self::load_at_head_with_before_index`], but bootstraps the
+    /// default commit index from the head operation's own view instead of
+    /// walking the full historical operation log (roadmap 069 clone fast
+    /// path). Only used for fresh clones, where the op log is the server's
+    /// entire history and every historical op/view read is a network round
+    /// trip. Non-default index stores fall back to their regular build.
+    pub(crate) async fn load_at_head_with_bootstrap_index(
+        &self,
+        before_index: impl FnOnce(),
+    ) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
+        let op = op_heads_store::resolve_op_heads(
+            self.op_heads_store.as_ref(),
+            &self.op_store,
+            async |op_heads| self.resolve_op_heads(op_heads).await,
+        )
+        .await?;
+        let view = op.view().await?;
+        before_index();
+        if let Some(index_store) = self
+            .index_store
+            .as_ref()
+            .downcast_ref::<DefaultIndexStore>()
+        {
+            index_store
+                .build_bootstrap_index_at_operation(&op, &self.store)
+                .await
+                .map_err(|err| IndexStoreError::Read(err.into()))?;
+        }
+        // The bootstrap build saved and linked a segment for `op`, so this
+        // resolves without another build.
+        self.finish_load(op, view).await
+    }
+
     #[instrument(skip(self))]
     pub async fn load_at(&self, op: &Operation) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
         let view = op.view().await?;

@@ -70,6 +70,12 @@ use crate::vex_backend::VexBackend;
 // BLAKE2b-512 hash length in hex string
 const SEGMENT_FILE_NAME_LENGTH: usize = 64 * 2;
 
+/// Concurrent historical-view reads during an index build. Views are
+/// content-addressed and independent; on a network-backed op store each read
+/// is one RPC round trip, so sequential fetching makes cold index builds
+/// RTT-bound.
+const MAX_CONCURRENT_VIEW_READS: usize = 16;
+
 /// Error that may occur during `DefaultIndexStore` initialization.
 #[derive(Debug, Error)]
 #[error("Failed to initialize index store")]
@@ -235,10 +241,6 @@ impl DefaultIndexStore {
     ) -> Result<DefaultReadonlyIndex, DefaultIndexStoreError> {
         tracing::info!("scanning operations to index");
         let op_links_dir = self.op_links_dir();
-        let field_lengths = FieldLengths {
-            commit_id: store.commit_id_length(),
-            change_id: store.change_id_length(),
-        };
         // Pick the latest existing ancestor operation as the parent segment.
         let mut unindexed_ops = Vec::new();
         let mut parent_op = None;
@@ -265,17 +267,94 @@ impl DefaultIndexStore {
             ops_count = ops_to_visit.len(),
             "collecting head commits to index"
         );
+        // Views are independent objects: fetch them concurrently. On a
+        // network-backed op store (Vex) each view is otherwise one sequential
+        // RPC round trip, which dominated cold index builds (roadmap 069
+        // profiling: 3.7 s of a 7.9 s clone indexing phase for 89 views).
+        let views: Vec<_> = futures::stream::iter(ops_to_visit.iter().map(|op| op.view()))
+            .buffered(MAX_CONCURRENT_VIEW_READS)
+            .try_collect()
+            .await?;
         let mut historical_heads: HashMap<CommitId, OperationId> = HashMap::new();
-        for op in &ops_to_visit {
+        for (op, view) in std::iter::zip(&ops_to_visit, &views) {
             for commit_id in itertools::chain(
                 op.all_referenced_commit_ids(),
-                op.view().await?.all_referenced_commit_ids(),
+                view.all_referenced_commit_ids(),
             ) {
                 if !historical_heads.contains_key(commit_id) {
                     historical_heads.insert(commit_id.clone(), op.id().clone());
                 }
             }
         }
+        let keep_legacy_predecessors = ops_to_visit
+            .iter()
+            .any(|op| !op.stores_commit_predecessors());
+        self.index_heads_and_save(
+            operation,
+            parent_op.as_ref(),
+            historical_heads,
+            keep_legacy_predecessors,
+            store,
+        )
+        .await
+    }
+
+    /// Builds and saves an index for `operation` containing only commits
+    /// referenced by the operation itself and its own view — no historical
+    /// operation walk.
+    ///
+    /// This is the clone bootstrap path (roadmap 069): a fresh clone inherits
+    /// the server's full operation log, and the default full build fetches
+    /// every historical op and view over the network one round trip at a time
+    /// before indexing anything. Bootstrapping from the head view alone
+    /// matches upstream jj's clone semantics (a `git clone`-initialized repo
+    /// has exactly one op) while keeping historical completeness lazy: loading
+    /// the repo at an older operation still triggers the regular
+    /// [`Self::build_index_at_operation`] rebuild for that operation.
+    ///
+    /// The saved segment is linked to `operation`, so subsequent incremental
+    /// builds walk back only as far as this operation.
+    #[tracing::instrument(skip(self, store))]
+    pub async fn build_bootstrap_index_at_operation(
+        &self,
+        operation: &Operation,
+        store: &Arc<Store>,
+    ) -> Result<DefaultReadonlyIndex, DefaultIndexStoreError> {
+        let mut heads: HashMap<CommitId, OperationId> = HashMap::new();
+        let view = operation.view().await?;
+        for commit_id in itertools::chain(
+            operation.all_referenced_commit_ids(),
+            view.all_referenced_commit_ids(),
+        ) {
+            if !heads.contains_key(commit_id) {
+                heads.insert(commit_id.clone(), operation.id().clone());
+            }
+        }
+        self.index_heads_and_save(
+            operation,
+            None,
+            heads,
+            !operation.stores_commit_predecessors(),
+            store,
+        )
+        .await
+    }
+
+    /// Shared tail of an index build: walk commits reachable from
+    /// `historical_heads`, index them on top of `parent_op`'s segment (if
+    /// any), and save the result linked to `operation`.
+    async fn index_heads_and_save(
+        &self,
+        operation: &Operation,
+        parent_op: Option<&Operation>,
+        historical_heads: HashMap<CommitId, OperationId>,
+        keep_legacy_predecessors: bool,
+        store: &Arc<Store>,
+    ) -> Result<DefaultReadonlyIndex, DefaultIndexStoreError> {
+        let field_lengths = FieldLengths {
+            commit_id: store.commit_id_length(),
+            change_id: store.change_id_length(),
+        };
         let mut mutable_index;
         let maybe_parent_index;
         match &parent_op {
@@ -342,10 +421,7 @@ impl DefaultIndexStore {
         // commands (e.g. squash into grandparent) may leave transitive
         // predecessors, which aren't visible to any views.
         // TODO: delete this workaround with commit.predecessors.
-        let commits_to_keep_immediate_predecessors = if ops_to_visit
-            .iter()
-            .any(|op| !op.stores_commit_predecessors())
-        {
+        let commits_to_keep_immediate_predecessors = if keep_legacy_predecessors {
             let mut ancestors = HashSet::new();
             let mut work = historical_heads.keys().cloned().collect_vec();
             while let Some(commit_id) = work.pop() {

@@ -812,14 +812,29 @@ impl Workspace {
             let repo_loader =
                 RepoLoader::init_from_file_system(user_settings, &repo_dir, &store_factories)
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-            let repo = repo_loader
-                .load_at_head_with_before_index(|| {
-                    if let Some(progress) = progress {
-                        progress(crate::vex::CloneProgress::Indexing);
-                    }
-                })
-                .await
-                .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+            // Bootstrap the commit index from the head view only (roadmap
+            // 069): a fresh clone inherits the server's full op log, and the
+            // full build fetches every historical op/view one RPC at a time
+            // (~7.3 s of the fixture clone's 7.9 s indexing phase). Historical
+            // ops remain lazily indexable. `VEX_CLONE_FULL_INDEX=1` restores
+            // the exhaustive build.
+            let full_index = std::env::var("VEX_CLONE_FULL_INDEX")
+                .is_ok_and(|value| !value.is_empty() && value != "0");
+            let before_index = || {
+                if let Some(progress) = progress {
+                    progress(crate::vex::CloneProgress::Indexing);
+                }
+            };
+            let repo = if full_index {
+                repo_loader
+                    .load_at_head_with_before_index(before_index)
+                    .await
+            } else {
+                repo_loader
+                    .load_at_head_with_bootstrap_index(before_index)
+                    .await
+            }
+            .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
             let (start_commit, resolved_trunk) =
                 clone_vex_checkout_target(&repo, target_commit, server_trunk).await?;
