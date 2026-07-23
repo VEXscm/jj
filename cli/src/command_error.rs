@@ -464,8 +464,9 @@ impl From<TransactionCommitError> for CommandError {
                 err,
             )
             .hinted(
-                "Rerun the command. If it keeps failing, run `vex status` to check for a stale \
-                 working copy.",
+                "This is usually transient contention with another writer, such as a background \
+                 snapshot. Rerun the command. Repeated failures may mean the working copy is \
+                 stale; run `vex status` to check.",
             )
         } else {
             internal_error(err)
@@ -1186,11 +1187,10 @@ mod tests {
 
     #[test]
     fn test_op_heads_cas_conflict_is_a_guided_user_error() {
-        let transaction_error =
-            TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
-                new_op_id: OperationId::new(vec![7; 32]),
-                source: Box::new(std::io::Error::other("CAS conflict on op heads")),
-            });
+        let transaction_error = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
+            new_op_id: OperationId::new(vec![7; 32]),
+            source: Box::new(std::io::Error::other("CAS conflict on op heads")),
+        });
 
         let error = CommandError::from(transaction_error);
 
@@ -1203,8 +1203,9 @@ mod tests {
         assert!(matches!(
             error.hints.as_slice(),
             [ErrorHint::PlainText(hint)]
-                if hint == "Rerun the command. If it keeps failing, run `vex status` to check for \
-                    a stale working copy."
+                if hint == "This is usually transient contention with another writer, such as a \
+                    background snapshot. Rerun the command. Repeated failures may mean the \
+                    working copy is stale; run `vex status` to check."
         ));
         let mut source = error.error.source();
         let mut found_cas_detail = false;
