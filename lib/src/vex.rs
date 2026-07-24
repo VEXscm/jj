@@ -67,6 +67,7 @@ use crate::repo::StoreFactories;
 use crate::vex_backend::VexBackend;
 use crate::vex_op_heads_store::VexOpHeadsStore;
 use crate::vex_op_store::VexOpStore;
+use crate::vex_publish::VexDurability;
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
 
@@ -348,6 +349,28 @@ pub struct VexClientStats {
     /// Wall-clock milliseconds spent in the serial per-object `GetObject`
     /// loop that tails the clone-manifest prefetch.
     pub pack_loose_object_ms: AtomicU64,
+    /// `GetOpHeads` RPCs issued, including budgeted freshness refreshes
+    /// (roadmap/088). Zero on the hot path of a converged local-first repo.
+    pub op_head_rpcs: AtomicU64,
+    /// Op-head resolutions served from the local marker files with no RPC.
+    pub op_head_local_serves: AtomicU64,
+    /// Budgeted freshness refreshes attempted.
+    pub refresh_attempts: AtomicU64,
+    /// Freshness refreshes that exceeded their budget (or failed) and
+    /// silently degraded to the local heads.
+    pub refresh_timeouts: AtomicU64,
+    /// Operations sitting in the pending-publish chain at the last publisher
+    /// run (a level, not a total).
+    pub pending_ops: AtomicU64,
+    /// Op-head CAS attempts rejected because the server head had moved.
+    pub publish_cas_conflicts: AtomicU64,
+    /// Pending chains republished onto a newer server head after a conflict.
+    pub publish_folds: AtomicU64,
+    /// Local operations published as part of a coalesced chain instead of
+    /// their own CAS.
+    pub coalesced_ops: AtomicU64,
+    /// Wall-clock milliseconds of the last publisher drain.
+    pub publish_lag_ms: AtomicU64,
 }
 
 macro_rules! for_each_vex_client_stat {
@@ -395,7 +418,16 @@ macro_rules! for_each_vex_client_stat {
             pack_http_wait_ms,
             pack_download_ms,
             pack_unpack_ms,
-            pack_loose_object_ms
+            pack_loose_object_ms,
+            op_head_rpcs,
+            op_head_local_serves,
+            refresh_attempts,
+            refresh_timeouts,
+            pending_ops,
+            publish_cas_conflicts,
+            publish_folds,
+            coalesced_ops,
+            publish_lag_ms
         )
     };
 }
@@ -446,6 +478,15 @@ pub struct VexClientStatsSnapshot {
     pub pack_download_ms: u64,
     pub pack_unpack_ms: u64,
     pub pack_loose_object_ms: u64,
+    pub op_head_rpcs: u64,
+    pub op_head_local_serves: u64,
+    pub refresh_attempts: u64,
+    pub refresh_timeouts: u64,
+    pub pending_ops: u64,
+    pub publish_cas_conflicts: u64,
+    pub publish_folds: u64,
+    pub coalesced_ops: u64,
+    pub publish_lag_ms: u64,
 }
 
 impl VexClientStats {
@@ -747,6 +788,13 @@ pub struct VexRepoConfig {
     /// continue to persist to the backend.
     #[serde(default)]
     pub local_writes: bool,
+    /// When the op-head CAS runs relative to the command that produced the
+    /// operation (see [`VexDurability`]). Defaults to
+    /// [`VexDurability::Sync`] — today's inline publish — and is overridden
+    /// per invocation by `VEX_DURABILITY`. Distinct from
+    /// [`Self::local_writes`], which never publishes at all.
+    #[serde(default, skip_serializing_if = "VexDurability::is_sync")]
+    pub durability: VexDurability,
     /// Object decode policy for backend reads (see [`VexObjectReadMode`]).
     /// Never serialized: a normal clone's `vex.json` carries no mode field and
     /// old files without one deserialize to [`VexObjectReadMode::NativeOnly`],
@@ -1028,6 +1076,17 @@ struct PendingUploads {
     objects: HashMap<(ObjectKind, ContentId), Vec<u8>>,
     bytes: usize,
 }
+
+/// Objects [`VexClient::stage_pending_uploads`] wrote to the on-disk cache
+/// *without* uploading them, keyed like [`PENDING_UPLOADS`]. Deferred-publish
+/// durability modes (roadmap/088) break the "cached ⟹ uploaded" invariant on
+/// purpose: an operation's objects must survive process exit before its
+/// op-head CAS has run, and the cache is the only crash-durable place for
+/// them. The debt is repaid by recording every staged id in the operation's
+/// `vex-pending-publish` entry, which the publisher uploads unconditionally
+/// (`put_objects` is create-if-missing, so re-uploading is free).
+static STAGED_OBJECTS: OnceLock<Mutex<HashMap<String, Vec<(ObjectKind, ContentId)>>>> =
+    OnceLock::new();
 
 /// Process-wide pack-resident indexes, keyed by cache root. Process-global for
 /// the same reason as [`PENDING_UPLOADS`]: the three Vex stores of one repo —
@@ -1368,6 +1427,17 @@ impl VexClient {
     /// [`crate::vex_op_heads_store::VexOpHeadsStore`].
     pub fn local_writes(&self) -> bool {
         self.local_writes
+    }
+
+    /// The effective durability mode: the repo's configured mode unless
+    /// `VEX_DURABILITY` overrides it. `local_writes` repos never publish, so
+    /// they always report [`VexDurability::Sync`] — the deferred-publish
+    /// machinery must stay out of their way.
+    pub fn durability(&self) -> VexDurability {
+        if self.local_writes {
+            return VexDurability::Sync;
+        }
+        VexDurability::resolve(self.config.durability)
     }
 
     /// Whether this client uses the pack-resident metadata cache
@@ -1967,16 +2037,34 @@ impl VexClient {
     /// on first use. tonic `Channel`s are cheap to clone and multiplex requests
     /// over a single connection, so reusing them avoids a fresh TCP+TLS+HTTP/2
     /// handshake on every object — the dominant cost when uploading thousands.
-    fn cached_channel(endpoint_url: &str) -> Result<Channel, VexClientError> {
+    fn channel_cache() -> &'static Mutex<HashMap<String, Channel>> {
         static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
-        let channels = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(channel) = channels.lock().unwrap().get(endpoint_url) {
+        CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn cached_channel(endpoint_url: &str) -> Result<Channel, VexClientError> {
+        if let Some(channel) = Self::channel_cache().lock().unwrap().get(endpoint_url) {
             return Ok(channel.clone());
         }
         let endpoint = Self::endpoint(endpoint_url)?;
         let channel =
             Self::shared_grpc_runtime().block_on(async move { endpoint.connect().await })?;
-        channels
+        Self::channel_cache()
+            .lock()
+            .unwrap()
+            .insert(endpoint_url.to_string(), channel.clone());
+        Ok(channel)
+    }
+
+    /// [`Self::cached_channel`] for callers already inside the shared runtime,
+    /// so the connect handshake can be wrapped in a timeout instead of
+    /// blocking a thread for however long the network takes.
+    async fn cached_channel_async(endpoint_url: &str) -> Result<Channel, VexClientError> {
+        if let Some(channel) = Self::channel_cache().lock().unwrap().get(endpoint_url) {
+            return Ok(channel.clone());
+        }
+        let channel = Self::endpoint(endpoint_url)?.connect().await?;
+        Self::channel_cache()
             .lock()
             .unwrap()
             .insert(endpoint_url.to_string(), channel.clone());
@@ -3420,6 +3508,7 @@ impl VexClient {
             virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
+            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
     }
@@ -3456,6 +3545,7 @@ impl VexClient {
             virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
+            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
     }
@@ -3609,6 +3699,53 @@ impl VexClient {
         Ok(())
     }
 
+    /// Deferred-publish counterpart of [`Self::flush_pending_uploads`]: write
+    /// every buffered object straight to the on-disk cache and remember its id
+    /// instead of uploading it. The operation that triggered this claims the
+    /// ids through [`Self::take_staged_objects`] and records them in its
+    /// pending-publish entry, so the publisher can upload exactly this set
+    /// later — including from a later process, since the bytes are on disk.
+    ///
+    /// Deliberately skips the cache prune pass: staged objects are the only
+    /// copy of unpublished work, and evicting one would strand the operation
+    /// that references it.
+    pub fn stage_pending_uploads(&self) -> Result<(), VexClientError> {
+        let drained: Vec<(ObjectKind, ContentId, Vec<u8>)> = {
+            let Some(map) = PENDING_UPLOADS.get() else {
+                return Ok(());
+            };
+            let mut guard = map.lock().unwrap();
+            match guard.get_mut(&self.pending_key()) {
+                Some(pending) if !pending.objects.is_empty() => {
+                    pending.bytes = 0;
+                    pending
+                        .objects
+                        .drain()
+                        .map(|((kind, id), data)| (kind, id, data))
+                        .collect()
+                }
+                _ => return Ok(()),
+            }
+        };
+        for (kind, id, data) in &drained {
+            self.write_cached_object_no_prune(*kind, id, data)?;
+        }
+        let map = STAGED_OBJECTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap();
+        let staged = guard.entry(self.pending_key()).or_default();
+        staged.extend(drained.into_iter().map(|(kind, id, _)| (kind, id)));
+        Ok(())
+    }
+
+    /// Take the ids staged for this repo since the last call. Returned in
+    /// staging order; the caller owns publishing them.
+    pub fn take_staged_objects(&self) -> Vec<(ObjectKind, ContentId)> {
+        STAGED_OBJECTS
+            .get()
+            .and_then(|map| map.lock().unwrap().remove(&self.pending_key()))
+            .unwrap_or_default()
+    }
+
     pub async fn put_object(
         &self,
         kind: ObjectKind,
@@ -3642,7 +3779,13 @@ impl VexClient {
             if !self.has_pending_object(kind, content_id) {
                 let over_cap = self.buffer_pending_object(kind, content_id, data);
                 if over_cap {
-                    self.flush_pending_uploads()?;
+                    // A deferred-publish repo must not touch the network here:
+                    // spill to the local cache and let the publisher upload.
+                    if self.durability().defers_publish() {
+                        self.stage_pending_uploads()?;
+                    } else {
+                        self.flush_pending_uploads()?;
+                    }
                 }
             }
             return Ok(());
@@ -4176,6 +4319,7 @@ impl VexClient {
         // working copy is left pinned to an orphan op, diverging from the backend
         // head (a "sibling operation" that blocks all further commands).
         let _t = RpcTimer::start(|| "get_op_heads".to_string());
+        vex_client_stats().op_head_rpcs.fetch_add(1, Ordering::Relaxed);
         let response =
             Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
                 client
@@ -4199,6 +4343,51 @@ impl VexClient {
             })
             .collect::<Result<Vec<_>, tonic::Status>>()?;
         Ok(ids)
+    }
+
+    /// Read the server op heads under a hard wall-clock budget covering the
+    /// connect handshake as well as the request, with no retries. Returns
+    /// `Ok(None)` when the budget expires — the caller keeps serving local
+    /// heads. Used by the opportunistic freshness refresh (roadmap/088), which
+    /// must never lengthen a read command.
+    pub fn get_op_heads_within(
+        &self,
+        budget: Duration,
+    ) -> Result<Option<Vec<ContentId>>, VexClientError> {
+        let _t = RpcTimer::start(|| "get_op_heads/budgeted".to_string());
+        vex_client_stats().op_head_rpcs.fetch_add(1, Ordering::Relaxed);
+        let endpoint = self.config.endpoint.clone();
+        let request = jj_backend_api::GetOpHeadsRequest {
+            tenant_id: self.config.tenant_id.clone(),
+            repo_id: self.config.repo_id.clone(),
+        };
+        let token = self.config.access_token.clone();
+        let response = Self::shared_grpc_runtime().block_on(async move {
+            let attempt = async move {
+                let channel = Self::cached_channel_async(&endpoint).await?;
+                JjBackendClient::new(channel)
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .get_op_heads(Self::auth_request(request, token.as_deref())?)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(VexClientError::from)
+            };
+            tokio::time::timeout(budget, attempt).await
+        });
+        let response = match response {
+            Err(_elapsed) => return Ok(None),
+            Ok(result) => result?,
+        };
+        let ids = response
+            .op_content_ids
+            .into_iter()
+            .map(|id| {
+                ContentId::from_hex(&id).map_err(|err| {
+                    tonic::Status::internal(format!("invalid op head from server: {err}"))
+                })
+            })
+            .collect::<Result<Vec<_>, tonic::Status>>()?;
+        Ok(Some(ids))
     }
 
     pub async fn commit_op_heads(
@@ -5122,7 +5311,7 @@ pub fn kind_to_str(kind: ObjectKind) -> &'static str {
 
 /// Inverse of [`kind_to_str`]; `None` for unknown kind strings (e.g. from a
 /// newer server).
-fn kind_from_str(kind: &str) -> Option<ObjectKind> {
+pub(crate) fn kind_from_str(kind: &str) -> Option<ObjectKind> {
     match kind {
         "blob" => Some(ObjectKind::Blob),
         "tree" => Some(ObjectKind::Tree),
@@ -5171,6 +5360,7 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
+            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
         .unwrap()

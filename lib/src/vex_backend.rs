@@ -806,6 +806,7 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
+            durability: crate::vex_publish::VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         }
     }

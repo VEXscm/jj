@@ -21,6 +21,7 @@ fn sample_config() -> VexRepoConfig {
         virtual_mounts: Vec::new(),
         access_token: None,
         local_writes: false,
+        durability: jj_lib::vex_publish::VexDurability::Sync,
         object_read_mode: VexObjectReadMode::NativeOnly,
     }
 }

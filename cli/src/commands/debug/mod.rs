@@ -19,6 +19,7 @@ mod index_changed_paths;
 mod init_simple;
 mod local_working_copy;
 mod object;
+mod publish;
 mod reindex;
 mod revset;
 mod snapshot;
@@ -46,6 +47,8 @@ use self::local_working_copy::DebugLocalWorkingCopyArgs;
 use self::local_working_copy::cmd_debug_local_working_copy;
 use self::object::DebugObjectArgs;
 use self::object::cmd_debug_object;
+use self::publish::DebugPublishArgs;
+use self::publish::cmd_debug_publish;
 use self::reindex::DebugReindexArgs;
 use self::reindex::cmd_debug_reindex;
 use self::revset::DebugRevsetArgs;
@@ -79,6 +82,7 @@ pub enum DebugCommand {
     LocalWorkingCopy(DebugLocalWorkingCopyArgs),
     #[command(subcommand)]
     Object(DebugObjectArgs),
+    Publish(DebugPublishArgs),
     Reindex(DebugReindexArgs),
     Revset(DebugRevsetArgs),
     Snapshot(DebugSnapshotArgs),
@@ -107,6 +111,7 @@ pub async fn cmd_debug(
             cmd_debug_local_working_copy(ui, command, args).await
         }
         DebugCommand::Object(args) => cmd_debug_object(ui, command, args).await,
+        DebugCommand::Publish(args) => cmd_debug_publish(ui, command, args).await,
         DebugCommand::Reindex(args) => cmd_debug_reindex(ui, command, args).await,
         DebugCommand::Revset(args) => cmd_debug_revset(ui, command, args).await,
         DebugCommand::Snapshot(args) => cmd_debug_snapshot(ui, command, args).await,
