@@ -145,7 +145,14 @@ const PIPELINED_PUT_RETRY_CAP_MS: u64 = 10_000;
 /// published op head. That makes the exact maintenance rejection safe to
 /// retry, but it can last much longer than a transport blip while a shadow GC
 /// pass walks a large Git mirror.
-const COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS: usize = 24;
+/// Attempts for the inline op-head publication. Deliberately small: this runs
+/// on the synchronous publish path while the working-copy lock is held, so a
+/// backend that accepts connections but does not answer must surface quickly
+/// as a re-runnable failure rather than freeze the repository. Operators can
+/// raise it (never lower it) with
+/// `VEX_COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS` to ride out a long
+/// maintenance window, which is also the rollback for this bound.
+const COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS: usize = 2;
 const COMMIT_OPERATION_MAINTENANCE_RETRY_BASE_MS: u64 = 1_000;
 const COMMIT_OPERATION_MAINTENANCE_RETRY_CAP_MS: u64 = 15_000;
 
@@ -156,6 +163,46 @@ fn env_secs(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+/// Per-attempt deadline for the two RPCs on the synchronous publish path
+/// (`PutObjects` flushed before the CAS, and `CommitOperation` itself).
+///
+/// The channel-wide `VEX_GRPC_REQUEST_TIMEOUT_SECS` default of 300 s exists
+/// for bulk reads; applied to a publish it means a backend that accepts the
+/// connection and never answers holds the working-copy lock — and therefore
+/// every other session on the machine — for minutes per attempt. These two
+/// calls take the same env var with a much shorter default, so raising the
+/// variable still restores the old behavior for everything at once.
+fn publish_request_timeout() -> Duration {
+    Duration::from_secs(env_secs("VEX_GRPC_REQUEST_TIMEOUT_SECS", 30).max(1))
+}
+
+/// The message appended when a publish exhausts its bounded budget. The
+/// working copy is untouched by a failed publication — the operation simply
+/// was not recorded on the server — so the actionable advice is to re-run.
+const PUBLISH_TIMEOUT_HINT: &str = "your files are untouched; re-run the command to publish again";
+
+/// Run one publish RPC attempt under `budget`, turning "never answered" into
+/// `DeadlineExceeded`. The existing retry classification already treats that
+/// as transient, so a wedged attempt is retried once and then surfaces as an
+/// ordinary failed publication — no new error plumbing, just a bounded wait
+/// and an actionable message.
+async fn publish_attempt_within<T, Fut>(
+    budget: Duration,
+    rpc: &str,
+    call: Fut,
+) -> Result<T, tonic::Status>
+where
+    Fut: Future<Output = Result<T, tonic::Status>>,
+{
+    match tokio::time::timeout(budget, call).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(tonic::Status::deadline_exceeded(format!(
+            "the backend did not answer {rpc} within {}s; {PUBLISH_TIMEOUT_HINT}",
+            budget.as_secs()
+        ))),
+    }
 }
 
 /// Process-wide HTTP/2 `:authority` override for every Vex gRPC channel.
@@ -2273,12 +2320,15 @@ impl VexClient {
             COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS as u64,
         )
         .max(COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS as u64) as usize;
+        let per_attempt = publish_request_timeout();
         Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
             for attempt in 1..=attempts {
                 let client = JjBackendClient::new(channel.clone())
                     .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                     .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
-                match f(client).await {
+                let result =
+                    publish_attempt_within(per_attempt, "CommitOperation", f(client)).await;
+                match result {
                     Ok(value) => return Ok(value),
                     Err(status)
                         if Self::is_retryable_commit_operation_status(&status)
@@ -3670,6 +3720,10 @@ impl VexClient {
         let channel = Self::cached_channel(&self.config.endpoint)?;
         let repo_id = self.config.repo_id.clone();
         let token = self.config.access_token.clone();
+        // This flush is the first half of the synchronous publish, so it takes
+        // the same per-attempt deadline as the CAS that follows it: a wedged
+        // upload must not hold the working-copy lock indefinitely.
+        let per_batch = publish_request_timeout();
         Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
             use futures::stream::TryStreamExt as _;
             futures::stream::iter(batches.into_iter().map(Ok::<_, VexClientError>))
@@ -3678,14 +3732,19 @@ impl VexClient {
                     let repo_id = repo_id.clone();
                     let token = token.clone();
                     async move {
-                        JjBackendClient::new(channel)
+                        let request = Self::auth_request(
+                            PutObjectsRequest { repo_id, objects },
+                            token.as_deref(),
+                        )?;
+                        let mut client = JjBackendClient::new(channel)
                             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                            .put_objects(Self::auth_request(
-                                PutObjectsRequest { repo_id, objects },
-                                token.as_deref(),
-                            )?)
-                            .await?;
+                            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+                        publish_attempt_within(
+                            per_batch,
+                            "PutObjects",
+                            client.put_objects(request),
+                        )
+                        .await?;
                         Ok(())
                     }
                 })
@@ -4319,7 +4378,9 @@ impl VexClient {
         // working copy is left pinned to an orphan op, diverging from the backend
         // head (a "sibling operation" that blocks all further commands).
         let _t = RpcTimer::start(|| "get_op_heads".to_string());
-        vex_client_stats().op_head_rpcs.fetch_add(1, Ordering::Relaxed);
+        vex_client_stats()
+            .op_head_rpcs
+            .fetch_add(1, Ordering::Relaxed);
         let response =
             Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
                 client
@@ -4355,7 +4416,9 @@ impl VexClient {
         budget: Duration,
     ) -> Result<Option<Vec<ContentId>>, VexClientError> {
         let _t = RpcTimer::start(|| "get_op_heads/budgeted".to_string());
-        vex_client_stats().op_head_rpcs.fetch_add(1, Ordering::Relaxed);
+        vex_client_stats()
+            .op_head_rpcs
+            .fetch_add(1, Ordering::Relaxed);
         let endpoint = self.config.endpoint.clone();
         let request = jj_backend_api::GetOpHeadsRequest {
             tenant_id: self.config.tenant_id.clone(),
@@ -4388,6 +4451,101 @@ impl VexClient {
             })
             .collect::<Result<Vec<_>, tonic::Status>>()?;
         Ok(Some(ids))
+    }
+
+    /// Upload one batch of already-addressed objects under a hard wall-clock
+    /// deadline covering the connect handshake, with no retries. `Ok(false)`
+    /// means the deadline expired. The publisher (roadmap/088) uses this
+    /// instead of [`Self::put_object_batches_pipelined`] so a wedged
+    /// connection can never hold the working-copy lock indefinitely; a
+    /// deadline is safe to surface because `put_objects` is content-addressed
+    /// create-if-missing and the whole batch is re-sent on the next drain.
+    pub fn put_objects_within(
+        &self,
+        objects: Vec<(ObjectKind, ContentId, Vec<u8>)>,
+        budget: Duration,
+    ) -> Result<bool, VexClientError> {
+        if objects.is_empty() {
+            return Ok(true);
+        }
+        let _t = RpcTimer::start(|| format!("put_objects/budgeted[{}]", objects.len()));
+        let inline: Vec<InlineObject> = objects
+            .into_iter()
+            .map(|(kind, content_id, data)| InlineObject {
+                object: Some(ObjectId {
+                    kind: kind_to_str(kind).to_string(),
+                    content_id: content_id.to_string(),
+                }),
+                data,
+            })
+            .collect();
+        let endpoint = self.config.endpoint.clone();
+        let repo_id = self.config.repo_id.clone();
+        let token = self.config.access_token.clone();
+        let outcome = Self::shared_grpc_runtime().block_on(async move {
+            let attempt = async move {
+                let channel = Self::cached_channel_async(&endpoint).await?;
+                JjBackendClient::new(channel)
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .put_objects(Self::auth_request(
+                        PutObjectsRequest {
+                            repo_id,
+                            objects: inline,
+                        },
+                        token.as_deref(),
+                    )?)
+                    .await
+                    .map(|_| ())
+                    .map_err(VexClientError::from)
+            };
+            tokio::time::timeout(budget, attempt).await
+        });
+        match outcome {
+            Err(_elapsed) => Ok(false),
+            Ok(result) => result.map(|()| true),
+        }
+    }
+
+    /// [`Self::commit_op_heads`] under a hard wall-clock deadline, with none of
+    /// the maintenance-retry looping. `Ok(None)` means the deadline expired
+    /// with the CAS outcome unknown; the caller must leave its queue intact and
+    /// re-derive on the next drain, which the replay check on the server makes
+    /// safe. Buffered objects are NOT flushed here — the publisher has already
+    /// uploaded everything the new operation references.
+    pub fn commit_op_heads_within(
+        &self,
+        expected: &[ContentId],
+        new_head: &ContentId,
+        new_view: &ContentId,
+        budget: Duration,
+    ) -> Result<Option<jj_backend_api::CommitOperationResponse>, VexClientError> {
+        let _t = RpcTimer::start(|| "commit_op_heads/budgeted".to_string());
+        let endpoint = self.config.endpoint.clone();
+        let request = jj_backend_api::CommitOperationRequest {
+            tenant_id: self.config.tenant_id.clone(),
+            repo_id: self.config.repo_id.clone(),
+            expected_op_head_ids: expected.iter().map(ToString::to_string).collect(),
+            new_op_content_id: new_head.to_string(),
+            new_view_content_id: new_view.to_string(),
+        };
+        let token = self.config.access_token.clone();
+        let outcome = Self::shared_grpc_runtime().block_on(async move {
+            let attempt = async move {
+                let channel = Self::cached_channel_async(&endpoint).await?;
+                JjBackendClient::new(channel)
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .commit_operation(Self::auth_request(request, token.as_deref())?)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(VexClientError::from)
+            };
+            tokio::time::timeout(budget, attempt).await
+        });
+        match outcome {
+            Err(_elapsed) => Ok(None),
+            Ok(result) => result.map(Some),
+        }
     }
 
     pub async fn commit_op_heads(
@@ -7246,6 +7404,38 @@ mod tests {
                 .is_none()
         );
         assert!(!idx_path.exists(), "truncated payload must drop the pack");
+    }
+
+    /// A backend that accepts the call and never answers must not hold the
+    /// synchronous publish (and the working-copy lock with it) open: the
+    /// attempt fails within its budget, as a status the retry classification
+    /// already knows, carrying advice the user can act on.
+    #[test]
+    fn an_unanswered_publish_attempt_fails_within_its_budget() {
+        let budget = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let status = VexClient::shared_grpc_runtime()
+            .block_on(publish_attempt_within::<(), _>(
+                budget,
+                "CommitOperation",
+                std::future::pending(),
+            ))
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(status.message().contains(PUBLISH_TIMEOUT_HINT), "{status}");
+        assert!(
+            VexClient::is_retryable_commit_operation_status(&status),
+            "an unanswered attempt must stay retryable inside the budget"
+        );
+    }
+
+    /// The synchronous publish must not inherit the 300 s bulk-read default.
+    #[test]
+    fn the_publish_request_timeout_is_short_by_default() {
+        assert_eq!(publish_request_timeout(), Duration::from_secs(30));
+        assert_eq!(COMMIT_OPERATION_MAINTENANCE_RETRY_ATTEMPTS, 2);
     }
 
     /// The "cached ⟹ uploaded" short circuit in `put_object` must include

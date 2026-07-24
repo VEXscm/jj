@@ -42,6 +42,7 @@ use crate::vex::VexClient;
 use crate::vex::VexRepoConfig;
 use crate::vex_freshness::known_divergence;
 use crate::vex_freshness::refresh_once;
+use crate::vex_publish::LOCAL_HEADS_FILE;
 use crate::vex_publish::MarkerError;
 use crate::vex_publish::PendingPublishMarker;
 use crate::vex_publish::PublishError;
@@ -50,7 +51,6 @@ use crate::vex_publish::ServerHeadsMarker;
 use crate::vex_publish::VexClientTransport;
 use crate::vex_publish::VexDurability;
 use crate::vex_publish::VexPublisher;
-use crate::vex_publish::LOCAL_HEADS_FILE;
 use crate::vex_publish::content_id_from_op_id;
 use crate::vex_publish::op_id_from_content_id;
 
@@ -598,12 +598,10 @@ impl VexOpHeadsStore {
         new_id: &OperationId,
     ) -> Result<PendingPublishMarker, OpHeadsStoreError> {
         let base = match &state.server {
-            Some(server) => server
-                .head_ids()
-                .map_err(|err| OpHeadsStoreError::Write {
-                    new_op_id: new_id.clone(),
-                    source: Box::new(err),
-                })?,
+            Some(server) => server.head_ids().map_err(|err| OpHeadsStoreError::Write {
+                new_op_id: new_id.clone(),
+                source: Box::new(err),
+            })?,
             None => expected.to_vec(),
         };
         let mut chain = PendingPublishMarker::new(&base);
@@ -670,7 +668,10 @@ impl VexOpHeadsStore {
         if let Some(heads) = known {
             return Ok(Some(heads.iter().map(op_id_from_content_id).collect()));
         }
-        if state.chain.as_ref().is_none_or(PendingPublishMarker::is_empty)
+        if state
+            .chain
+            .as_ref()
+            .is_none_or(PendingPublishMarker::is_empty)
             && let Some(heads) = refresh_once(
                 &self.store_dir,
                 &self.client,
@@ -683,6 +684,31 @@ impl VexOpHeadsStore {
             return Ok(Some(heads.iter().map(op_id_from_content_id).collect()));
         }
         Ok(Some(local))
+    }
+
+    /// Resolve this repo's op heads from the server once, and adopt them as
+    /// the local heads. Only reached before a deferred-publish repo has any
+    /// local state — there is nothing to serve without it, so the read has to
+    /// happen, but it runs under a deadline rather than the client's
+    /// five-attempt retry against a 300 s per-request transport timeout, which
+    /// can otherwise stall a command for many minutes while it holds the
+    /// working-copy lock.
+    fn bootstrap_local_heads(&self) -> Result<Vec<jj_backend_types::ContentId>, OpHeadsStoreError> {
+        let deadline = crate::vex_publish::publish_rpc_deadline();
+        let ids = self
+            .client
+            .get_op_heads_within(deadline)
+            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?
+            .ok_or_else(|| {
+                OpHeadsStoreError::Read(Box::new(std::io::Error::other(format!(
+                    "the backend did not return this repository's operation heads within {}s",
+                    deadline.as_secs_f32()
+                ))))
+            })?;
+        self.record_server_heads(&ids)?;
+        crate::vex_publish::write_local_heads(&self.store_dir, &ids)
+            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?;
+        Ok(ids)
     }
 
     fn record_server_heads(
@@ -822,18 +848,15 @@ impl OpHeadsStore for VexOpHeadsStore {
         // feeds is parented on whatever comes back, so the server must already
         // hold everything recorded locally.
         self.drain_queue_before_server_read().await?;
-        let ids = self
-            .client
-            .get_op_heads()
-            .await
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?;
-        if deferred.is_some() {
-            // Bootstrap the local-first markers from the first server read of
-            // this repo; from here on the local heads are authoritative.
-            self.record_server_heads(&ids)?;
-            crate::vex_publish::write_local_heads(&self.store_dir, &ids)
+        let Some(_state) = &deferred else {
+            let ids = self
+                .client
+                .get_op_heads()
+                .await
                 .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?;
-        }
+            return Ok(ids.iter().map(op_id_from_content_id).collect());
+        };
+        let ids = self.bootstrap_local_heads()?;
         Ok(ids.iter().map(op_id_from_content_id).collect())
     }
 
@@ -1183,9 +1206,11 @@ mod tests {
         // With no usable marker the mutation takes the inline CAS path, which
         // this unroutable endpoint cannot complete.
         assert!(block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).is_err());
-        assert!(crate::vex_publish::read_local_heads(temp.path())
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::vex_publish::read_local_heads(temp.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1197,12 +1222,16 @@ mod tests {
         assert!(block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).is_err());
         assert!(block_on(store.get_op_heads()).is_err());
         assert!(pending_chain(temp.path()).is_none());
-        assert!(crate::vex_publish::read_server_heads(temp.path())
-            .unwrap()
-            .is_none());
-        assert!(crate::vex_publish::read_local_heads(temp.path())
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::vex_publish::read_server_heads(temp.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::vex_publish::read_local_heads(temp.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

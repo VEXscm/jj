@@ -29,7 +29,6 @@
 
 #![expect(missing_docs)]
 
-
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Write as _;
@@ -37,6 +36,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -52,10 +52,10 @@ use sha2::Digest as _;
 use sha2::Sha256;
 use tempfile::NamedTempFile;
 
+use crate::object_id::ObjectId as _;
 use crate::op_store::Operation;
 use crate::op_store::OperationId;
 use crate::op_store::ViewId;
-use crate::object_id::ObjectId as _;
 use crate::simple_op_store::operation_from_proto;
 use crate::simple_op_store::operation_to_proto;
 use crate::vex::VexClient;
@@ -81,6 +81,19 @@ pub const MARKER_VERSION: u32 = 1;
 /// How many times the publisher re-derives its CAS base before giving up and
 /// leaving the chain queued.
 const MAX_PUBLISH_ATTEMPTS: usize = 3;
+
+/// Whether a burst publishes as one rewritten operation instead of one CAS per
+/// operation. Off unless `VEX_PUBLISH_COALESCE` is set to a true-ish value:
+/// the rewrite produces an operation that is a sibling of the local tip, which
+/// permanently diverges the repository. See [`VexPublisher::drain_coalesced`]
+/// for the full failure mode and what has to be built before this can default
+/// to on.
+fn coalescing_enabled() -> bool {
+    matches!(
+        std::env::var("VEX_PUBLISH_COALESCE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
 
 const ID_LENGTH: usize = 32;
 
@@ -170,14 +183,8 @@ impl VexDurability {
 #[derive(Debug)]
 pub enum MarkerError {
     Io(std::io::Error),
-    Corrupt {
-        file: &'static str,
-        message: String,
-    },
-    UnsupportedVersion {
-        file: &'static str,
-        version: u32,
-    },
+    Corrupt { file: &'static str, message: String },
+    UnsupportedVersion { file: &'static str, version: u32 },
 }
 
 impl fmt::Display for MarkerError {
@@ -504,8 +511,19 @@ pub trait PublishTransport: Send + Sync {
 pub enum PublishError {
     Marker(MarkerError),
     Transport(String),
-    MissingObject { kind: String, id: String },
+    MissingObject {
+        kind: String,
+        id: String,
+    },
     Corrupt(String),
+    /// A backend call did not answer within its deadline. Distinct from
+    /// [`Self::Transport`] because the CAS outcome is *unknown*, not failed:
+    /// the queue stays intact and the next drain re-derives it, which the
+    /// server's replay check makes safe.
+    Deadline {
+        rpc: &'static str,
+        budget: Duration,
+    },
 }
 
 impl fmt::Display for PublishError {
@@ -519,6 +537,12 @@ impl fmt::Display for PublishError {
                  local cache"
             ),
             Self::Corrupt(message) => write!(f, "{message}"),
+            Self::Deadline { rpc, budget } => write!(
+                f,
+                "backend call {rpc} did not answer within {}s; the operations stay queued and \
+                 publish on the next attempt",
+                budget.as_secs_f32()
+            ),
         }
     }
 }
@@ -570,11 +594,24 @@ impl PublishOutcome {
 pub struct VexPublisher<'a> {
     dir: &'a Path,
     transport: &'a dyn PublishTransport,
+    coalesce: bool,
 }
 
 impl<'a> VexPublisher<'a> {
     pub fn new(dir: &'a Path, transport: &'a dyn PublishTransport) -> Self {
-        Self { dir, transport }
+        Self {
+            dir,
+            transport,
+            coalesce: coalescing_enabled(),
+        }
+    }
+
+    /// Choose the drain strategy explicitly instead of reading the
+    /// environment. Only the rewrite-coalescing hazard documented on
+    /// [`Self::drain_coalesced`] makes this interesting.
+    pub fn with_coalescing(mut self, coalesce: bool) -> Self {
+        self.coalesce = coalesce;
+        self
     }
 
     /// Publish every queued operation: upload the objects they introduced,
@@ -585,7 +622,7 @@ impl<'a> VexPublisher<'a> {
     /// only be published as a rewrite carrying the tip's view.
     pub async fn drain(&self) -> Result<PublishOutcome, PublishError> {
         let start = Instant::now();
-        let Some(mut chain) = read_pending_publish(self.dir)? else {
+        let Some(chain) = read_pending_publish(self.dir)? else {
             return Ok(PublishOutcome::Idle);
         };
         if chain.is_empty() {
@@ -599,20 +636,140 @@ impl<'a> VexPublisher<'a> {
 
         self.upload_chain_objects(&chain).await?;
 
+        if self.coalesce {
+            return self.drain_coalesced(chain, start).await;
+        }
+        self.drain_sequentially(chain, start).await
+    }
+
+    /// Publish each queued operation under its own id, in order, with
+    /// `expected` set to that operation's real parents.
+    ///
+    /// This is the only strategy that cannot diverge. Operation ids are
+    /// preserved end to end, so the server head after a drain is literally the
+    /// operation the working copy is pinned to; every other client sees the
+    /// same history this repo has. It costs one CAS per operation instead of
+    /// one per burst, but all of them are off the interactive path.
+    async fn drain_sequentially(
+        &self,
+        mut chain: PendingPublishMarker,
+        start: Instant,
+    ) -> Result<PublishOutcome, PublishError> {
+        let stats = vex_client_stats();
+        let mut published = 0;
+        let mut head = None;
+        // Remembered before the drain consumes entries: a folded clone
+        // registration is only ever the chain's first operation.
+        let first_queued = chain.ops.first().map(|entry| entry.op.clone());
+        while let Some(entry) = chain.ops.first() {
+            let id = ContentId::from_hex(&entry.op)
+                .map_err(|err| PublishError::Corrupt(format!("invalid pending op id: {err}")))?;
+            let operation = self.read_operation(&id)?;
+            let view = content_id_from_view_id(&operation.view_id)
+                .ok_or_else(|| PublishError::Corrupt("invalid view id length".to_string()))?;
+            let expected = operation_parents(&operation);
+
+            let outcome = self
+                .transport
+                .commit_op_heads(&expected, &id, &view)
+                .await?;
+            if outcome.ok || outcome.current_heads == [id] {
+                chain.ops.remove(0);
+                self.commit_progress(&chain, &id, first_queued.as_deref())?;
+                published += 1;
+                head = Some(id);
+                continue;
+            }
+
+            stats.publish_cas_conflicts.fetch_add(1, Ordering::Relaxed);
+            let server_heads = self.transport.get_op_heads().await?;
+            // A previous drain may have published further down the chain than
+            // its marker update recorded. Resume from wherever the server got
+            // to rather than republishing.
+            if let Some(index) = chain.ops.iter().position(|queued| {
+                server_heads.len() == 1 && queued.op == server_heads[0].to_string()
+            }) {
+                chain.ops.drain(..=index);
+                self.commit_progress(&chain, &server_heads[0], first_queued.as_deref())?;
+                published += index + 1;
+                head = Some(server_heads[0]);
+                stats.publish_folds.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            self.record_server_heads_only(&server_heads)?;
+            tracing::warn!(
+                queued = chain.ops.len(),
+                server_heads = ?server_heads.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "server op head moved to unmerged state; keeping the pending chain queued"
+            );
+            return Ok(PublishOutcome::ServerHeadMoved { server_heads });
+        }
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        stats.pending_ops.store(0, Ordering::Relaxed);
+        stats.publish_lag_ms.store(elapsed_ms, Ordering::Relaxed);
+        match head {
+            Some(head) => Ok(PublishOutcome::Published {
+                ops: published,
+                coalesced: false,
+                head,
+                elapsed_ms,
+            }),
+            None => Ok(PublishOutcome::Idle),
+        }
+    }
+
+    /// Persist the drain's progress: the server is now at `head`, and only the
+    /// operations still in `chain` remain queued. Written after every CAS so a
+    /// crash mid-drain resumes instead of replaying.
+    fn commit_progress(
+        &self,
+        chain: &PendingPublishMarker,
+        head: &ContentId,
+        first_queued: Option<&str>,
+    ) -> Result<(), PublishError> {
+        write_server_heads(self.dir, &ServerHeadsMarker::new(vec![*head], None))?;
+        if chain.is_empty() {
+            remove_marker(self.dir, PENDING_PUBLISH_FILE)?;
+            self.clear_folded_registration(first_queued)?;
+        } else {
+            let mut remaining = chain.clone();
+            remaining.base_heads = vec![head.to_string()];
+            write_pending_publish(self.dir, &remaining)?;
+        }
+        Ok(())
+    }
+
+    /// Publish a whole burst as one rewritten operation carrying the tip's
+    /// view.
+    ///
+    /// DISABLED BY DEFAULT — see [`coalescing_enabled`]. The rewrite's parents
+    /// are the chain's base, so whenever the burst holds more than one
+    /// operation the published operation is a genuine *sibling* of the local
+    /// tip rather than a descendant. The working copy stays pinned to the
+    /// local operation, so any reader that resolves heads from the server (a
+    /// `sync`-mode command, another clone) loads a sibling of the working
+    /// copy's operation and jj refuses to proceed — and it cannot self-heal,
+    /// because publishing a merge of the two requires `expected` to equal the
+    /// server head set while the merge's parents would include the unpublished
+    /// local operation. Before this can be turned on, the publisher must also
+    /// move the working copy's operation pointer to the rewrite (or record it
+    /// as a successor so jj can integrate it).
+    async fn drain_coalesced(
+        &self,
+        mut chain: PendingPublishMarker,
+        start: Instant,
+    ) -> Result<PublishOutcome, PublishError> {
+        let stats = vex_client_stats();
         let mut base = chain.base_ids()?;
         for attempt in 0..MAX_PUBLISH_ATTEMPTS {
             let tip = self.chain_tip(&chain)?;
             let (head, view, coalesced) = self.head_to_publish(&tip, &base).await?;
-            let outcome = self
-                .transport
-                .commit_op_heads(&base, &head, &view)
-                .await?;
+            let outcome = self.transport.commit_op_heads(&base, &head, &view).await?;
             if outcome.ok || outcome.current_heads == [head] {
                 return self.record_published(&chain, &tip.id, &head, coalesced, start);
             }
-            stats
-                .publish_cas_conflicts
-                .fetch_add(1, Ordering::Relaxed);
+            stats.publish_cas_conflicts.fetch_add(1, Ordering::Relaxed);
             let server_heads = self.transport.get_op_heads().await?;
             if server_heads == [head] {
                 return self.record_published(&chain, &tip.id, &head, coalesced, start);
@@ -718,7 +875,11 @@ impl<'a> VexPublisher<'a> {
         let [head] = server_heads else {
             return Ok(None);
         };
-        if let Some(index) = chain.ops.iter().position(|entry| entry.op == head.to_string()) {
+        if let Some(index) = chain
+            .ops
+            .iter()
+            .position(|entry| entry.op == head.to_string())
+        {
             chain.ops.drain(..=index);
             if chain.is_empty() {
                 return Ok(None);
@@ -737,12 +898,13 @@ impl<'a> VexPublisher<'a> {
     }
 
     fn read_operation(&self, id: &ContentId) -> Result<Operation, PublishError> {
-        let data = self.transport.read_object(ObjectKind::Op, id).ok_or_else(|| {
-            PublishError::MissingObject {
+        let data = self
+            .transport
+            .read_object(ObjectKind::Op, id)
+            .ok_or_else(|| PublishError::MissingObject {
                 kind: kind_to_str(ObjectKind::Op).to_string(),
                 id: id.to_string(),
-            }
-        })?;
+            })?;
         let proto = crate::protos::simple_op_store::Operation::decode(&*data)
             .map_err(|err| PublishError::Corrupt(format!("undecodable operation {id}: {err}")))?;
         operation_from_proto(proto)
@@ -763,9 +925,7 @@ impl<'a> VexPublisher<'a> {
             &ServerHeadsMarker::new(vec![*head], published_local_head),
         )?;
         remove_marker(self.dir, PENDING_PUBLISH_FILE)?;
-        // The clone's deferred registration, if any, is the chain's first
-        // entry; it is published now and its marker must not outlive it.
-        remove_marker(self.dir, crate::vex_op_heads_store::PENDING_REGISTRATION_FILE)?;
+        self.clear_folded_registration(chain.ops.first().map(|entry| entry.op.as_str()))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let stats = vex_client_stats();
         stats.pending_ops.store(0, Ordering::Relaxed);
@@ -790,10 +950,38 @@ impl<'a> VexPublisher<'a> {
         })
     }
 
+    /// A clone's deferred registration (roadmap/076) enters the queue as its
+    /// first entry; once that entry is published the marker must not outlive
+    /// it, or the read path would keep serving heads on its behalf. A marker
+    /// naming any other operation belongs to a clone still in flight and is
+    /// left alone.
+    fn clear_folded_registration(&self, first_queued: Option<&str>) -> Result<(), PublishError> {
+        let path = self
+            .dir
+            .join(crate::vex_op_heads_store::PENDING_REGISTRATION_FILE);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let folded = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|marker| marker.get("pending_op_id")?.as_str().map(str::to_owned))
+            .is_some_and(|pending| first_queued == Some(pending.as_str()));
+        if folded {
+            remove_marker(
+                self.dir,
+                crate::vex_op_heads_store::PENDING_REGISTRATION_FILE,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Record where the server actually is without claiming anything about the
     /// local chain, so the next repo load serves both heads and lets jj merge.
     fn record_server_heads_only(&self, server_heads: &[ContentId]) -> Result<(), PublishError> {
-        write_server_heads(self.dir, &ServerHeadsMarker::new(server_heads.to_vec(), None))?;
+        write_server_heads(
+            self.dir,
+            &ServerHeadsMarker::new(server_heads.to_vec(), None),
+        )?;
         Ok(())
     }
 }
@@ -812,21 +1000,54 @@ fn operation_parents(operation: &Operation) -> Vec<ContentId> {
 }
 
 /// [`PublishTransport`] backed by a live [`VexClient`].
+///
+/// Every call carries a hard deadline. The publisher runs while the
+/// working-copy lock is held, and a backend that accepts a connection but
+/// never answers would otherwise freeze every other session on the machine —
+/// observed in production against the synchronous publish path. Missing the
+/// deadline is always recoverable: objects are content-addressed
+/// create-if-missing, and an unanswered CAS leaves the queue intact for the
+/// next drain, which the server's replay check resolves.
 pub struct VexClientTransport<'a> {
     client: &'a VexClient,
+    deadline: Duration,
 }
 
 impl<'a> VexClientTransport<'a> {
     pub fn new(client: &'a VexClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            deadline: publish_rpc_deadline(),
+        }
+    }
+
+    /// Override the per-RPC deadline (tests, and callers with their own
+    /// budget).
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
+/// Per-RPC deadline for the publisher, from `VEX_PUBLISH_RPC_TIMEOUT_MS`.
+/// Generous by design — a large first publish legitimately moves real bytes —
+/// but finite.
+pub fn publish_rpc_deadline() -> Duration {
+    let millis = std::env::var("VEX_PUBLISH_RPC_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(DEFAULT_PUBLISH_RPC_TIMEOUT_MS);
+    Duration::from_millis(millis)
+}
+
+/// Default per-RPC publisher deadline.
+pub const DEFAULT_PUBLISH_RPC_TIMEOUT_MS: u64 = 30_000;
+
 /// Objects per `put_objects` batch. Matches the snapshot flush caps in
-/// `vex.rs`; the batches pipeline over the one cached connection.
+/// `vex.rs`; each batch is one deadline-bounded request.
 const PUBLISH_BATCH_OBJECTS: usize = 256;
 const PUBLISH_BATCH_BYTES: usize = 32 * 1024 * 1024;
-const PUBLISH_BATCH_CONCURRENCY: usize = 16;
 
 #[async_trait]
 impl PublishTransport for VexClientTransport<'_> {
@@ -841,24 +1062,17 @@ impl PublishTransport for VexClientTransport<'_> {
         if objects.is_empty() {
             return Ok(());
         }
-        let mut batches = Vec::new();
-        let mut current = Vec::new();
-        let mut current_bytes = 0;
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
         for object in objects {
-            current_bytes += object.2.len();
-            current.push(object);
-            if current.len() >= PUBLISH_BATCH_OBJECTS || current_bytes >= PUBLISH_BATCH_BYTES {
-                batches.push(std::mem::take(&mut current));
-                current_bytes = 0;
+            batch_bytes += object.2.len();
+            batch.push(object);
+            if batch.len() >= PUBLISH_BATCH_OBJECTS || batch_bytes >= PUBLISH_BATCH_BYTES {
+                self.put_batch(std::mem::take(&mut batch))?;
+                batch_bytes = 0;
             }
         }
-        if !current.is_empty() {
-            batches.push(current);
-        }
-        self.client
-            .put_object_batches_pipelined(batches, PUBLISH_BATCH_CONCURRENCY)
-            .await?;
-        Ok(())
+        self.put_batch(batch)
     }
 
     async fn commit_op_heads(
@@ -869,8 +1083,11 @@ impl PublishTransport for VexClientTransport<'_> {
     ) -> Result<CasOutcome, PublishError> {
         let response = self
             .client
-            .commit_op_heads(expected, new_head, new_view)
-            .await?;
+            .commit_op_heads_within(expected, new_head, new_view, self.deadline)?
+            .ok_or(PublishError::Deadline {
+                rpc: "CommitOperation",
+                budget: self.deadline,
+            })?;
         let current_heads = response
             .current_op_head_ids
             .iter()
@@ -887,7 +1104,25 @@ impl PublishTransport for VexClientTransport<'_> {
     }
 
     async fn get_op_heads(&self) -> Result<Vec<ContentId>, PublishError> {
-        Ok(self.client.get_op_heads().await?)
+        self.client
+            .get_op_heads_within(self.deadline)?
+            .ok_or(PublishError::Deadline {
+                rpc: "GetOpHeads",
+                budget: self.deadline,
+            })
+    }
+}
+
+impl VexClientTransport<'_> {
+    fn put_batch(&self, batch: Vec<(ObjectKind, ContentId, Vec<u8>)>) -> Result<(), PublishError> {
+        if self.client.put_objects_within(batch, self.deadline)? {
+            Ok(())
+        } else {
+            Err(PublishError::Deadline {
+                rpc: "PutObjects",
+                budget: self.deadline,
+            })
+        }
     }
 }
 
@@ -901,8 +1136,8 @@ pub fn ensure_published_at(dir: &Path) -> Result<PublishOutcome, PublishError> {
         Ok(Some(_)) => {}
         Err(err) => return Err(err.into()),
     }
-    let client = VexClient::from_store_path(dir)
-        .map_err(|err| PublishError::Transport(err.to_string()))?;
+    let client =
+        VexClient::from_store_path(dir).map_err(|err| PublishError::Transport(err.to_string()))?;
     let transport = VexClientTransport::new(&client);
     pollster::block_on(VexPublisher::new(dir, &transport).drain())
 }
@@ -975,6 +1210,9 @@ mod tests {
         /// Head sets the next CAS attempts observe instead of `heads`, popped
         /// in order — used to simulate a head that moved under us.
         cas_conflicts: Vec<Vec<ContentId>>,
+        /// 1-based CAS call number that simulates a backend accepting the
+        /// call and never answering within its deadline.
+        deadline_on_call: Option<usize>,
     }
 
     #[derive(Default)]
@@ -1016,7 +1254,12 @@ mod tests {
     #[async_trait]
     impl PublishTransport for FakeTransport {
         fn read_object(&self, kind: ObjectKind, id: &ContentId) -> Option<Vec<u8>> {
-            self.state.lock().unwrap().objects.get(&(kind, *id)).cloned()
+            self.state
+                .lock()
+                .unwrap()
+                .objects
+                .get(&(kind, *id))
+                .cloned()
         }
 
         async fn put_objects(
@@ -1039,6 +1282,12 @@ mod tests {
         ) -> Result<CasOutcome, PublishError> {
             let mut state = self.state.lock().unwrap();
             state.cas_calls += 1;
+            if state.deadline_on_call == Some(state.cas_calls) {
+                return Err(PublishError::Deadline {
+                    rpc: "CommitOperation",
+                    budget: Duration::from_secs(30),
+                });
+            }
             if let Some(conflict) = state.cas_conflicts.pop() {
                 state.heads = conflict.clone();
                 return Ok(CasOutcome {
@@ -1072,7 +1321,12 @@ mod tests {
 
     /// Builds a chain of `count` operations on `base` in the fake's object
     /// store and writes the matching marker. Returns the operation ids.
-    fn queue_chain(dir: &Path, fake: &FakeTransport, base: ContentId, count: usize) -> Vec<ContentId> {
+    fn queue_chain(
+        dir: &Path,
+        fake: &FakeTransport,
+        base: ContentId,
+        count: usize,
+    ) -> Vec<ContentId> {
         let mut marker = PendingPublishMarker::new(&[base]);
         let mut parent = base;
         let mut ids = Vec::new();
@@ -1183,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_local_operations_coalesce_into_one_cas() {
+    fn ten_local_operations_publish_under_their_own_ids() {
         let temp = tempfile::tempdir().unwrap();
         let fake = FakeTransport::default();
         fake.set_heads(vec![id(1)]);
@@ -1196,25 +1450,113 @@ mod tests {
         assert!(matches!(
             outcome,
             PublishOutcome::Published {
-                coalesced: true,
+                coalesced: false,
                 ..
             }
         ));
-        assert_eq!(fake.cas_calls(), 1);
-        let server = read_server_heads(temp.path()).unwrap().unwrap();
         assert_eq!(
-            server.published_local_head,
-            Some(ids[9].to_string()),
-            "a coalesced publish must record which local head the server head stands for"
+            fake.cas_calls(),
+            10,
+            "one CAS per operation is the price of never rewriting an id"
         );
-        // The published operation carries the tip's view and the base's parents.
+        assert_eq!(
+            fake.heads(),
+            vec![ids[9]],
+            "the server head must be the local tip itself"
+        );
+        let server = read_server_heads(temp.path()).unwrap().unwrap();
+        assert_eq!(server.published_local_head, None);
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// The reproducer from the 088 AFTER benchmark
+    /// (`/tmp/rm088-bench/after/RESULTS.md`): a burst of local operations, a
+    /// drain that dies partway through against a slow backend, then a later
+    /// drain. The published head must end up being the working copy's own
+    /// operation — the coalescing rewrite made it a *sibling* instead, which
+    /// jj cannot load and cannot repair.
+    #[test]
+    fn a_drain_interrupted_midway_still_leaves_the_server_on_the_local_tip() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        fake.set_heads(vec![id(1)]);
+        let ids = queue_chain(temp.path(), &fake, id(1), 3);
+        // The second CAS never answers, exactly as the degraded backend did.
+        fake.state.lock().unwrap().deadline_on_call = Some(2);
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        assert!(matches!(
+            block_on(publisher.drain()),
+            Err(PublishError::Deadline { .. })
+        ));
+
+        // Progress is durable and the rest stays queued.
+        assert_eq!(fake.heads(), vec![ids[0]]);
+        let queued = read_pending_publish(temp.path()).unwrap().unwrap();
+        assert_eq!(queued.ops.len(), 2);
+        assert_eq!(
+            read_server_heads(temp.path())
+                .unwrap()
+                .unwrap()
+                .published_local_head,
+            None,
+            "no rewrite may be recorded, at any point in the drain"
+        );
+
+        // The backend recovers; the rest of the burst publishes.
+        fake.state.lock().unwrap().deadline_on_call = None;
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+        assert_eq!(outcome.published_ops(), 2);
+
+        // The invariant the sibling bug violated: the server head IS the
+        // operation the working copy is pinned to, so loading the repo at the
+        // server head can never produce a sibling of the working copy's
+        // operation.
+        let local_tip = ids[2];
+        assert_eq!(fake.heads(), vec![local_tip]);
+        let server = read_server_heads(temp.path()).unwrap().unwrap();
+        assert_eq!(server.heads, vec![local_tip.to_string()]);
+        assert_eq!(server.published_local_head, None);
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// Coalescing is off by default precisely because it publishes an
+    /// operation that is a sibling of the local tip. Pinned here so the hazard
+    /// cannot be re-enabled by accident.
+    #[test]
+    fn coalescing_is_opt_in_and_publishes_a_sibling_of_the_local_tip() {
+        assert!(!coalescing_enabled(), "coalescing must default to off");
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        fake.set_heads(vec![id(1)]);
+        let ids = queue_chain(temp.path(), &fake, id(1), 3);
+
+        let publisher = VexPublisher::new(temp.path(), &fake).with_coalescing(true);
+        let outcome = block_on(publisher.drain()).unwrap();
+
+        assert_eq!(outcome.published_ops(), 3);
+        assert_eq!(fake.cas_calls(), 1);
         let published = fake.heads();
-        assert_eq!(published.len(), 1);
-        assert_ne!(published[0], ids[9]);
+        assert_ne!(
+            published[0], ids[2],
+            "the coalesced head is a rewrite, not the local tip — this is the \
+             divergence that keeps the strategy opt-in"
+        );
+        let rewritten = fake.read_object(ObjectKind::Op, &published[0]).unwrap();
+        let rewritten = operation_from_proto(
+            crate::protos::simple_op_store::Operation::decode(&*rewritten).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            operation_parents(&rewritten),
+            vec![id(1)],
+            "the rewrite is parented on the base, making it a sibling of the local tip"
+        );
     }
 
     #[test]
-    fn stale_base_refolds_onto_the_real_server_head_and_retries() {
+    fn a_stale_recorded_base_no_longer_costs_a_rejected_cas() {
         let temp = tempfile::tempdir().unwrap();
         let fake = FakeTransport::default();
         // The chain is parented on id(2) but its marker recorded id(1).
@@ -1230,7 +1572,12 @@ mod tests {
 
         assert_eq!(outcome.published_ops(), 1);
         assert_eq!(fake.heads(), vec![op_id]);
-        assert_eq!(fake.cas_calls(), 2, "one rejected CAS, then the refolded one");
+        assert_eq!(
+            fake.cas_calls(),
+            1,
+            "sequential publication CASes against the operation's real parents, so a stale \
+             recorded base is simply unused"
+        );
         assert!(read_pending_publish(temp.path()).unwrap().is_none());
     }
 
@@ -1246,7 +1593,9 @@ mod tests {
         let publisher = VexPublisher::new(temp.path(), &fake);
         let outcome = block_on(publisher.drain()).unwrap();
 
-        assert_eq!(outcome.published_ops(), 1);
+        // Both entries leave the queue: the first was recognized as already
+        // published, the second was CASed now.
+        assert_eq!(outcome.published_ops(), 2);
         assert_eq!(fake.heads(), vec![ids[1]]);
         assert!(read_pending_publish(temp.path()).unwrap().is_none());
     }
@@ -1299,6 +1648,36 @@ mod tests {
     }
 
     #[test]
+    fn a_cas_that_misses_its_deadline_keeps_the_chain_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        fake.set_heads(vec![id(1)]);
+        let ids = queue_chain(temp.path(), &fake, id(1), 2);
+        fake.state.lock().unwrap().deadline_on_call = Some(1);
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        let err = block_on(publisher.drain()).unwrap_err();
+
+        assert!(matches!(err, PublishError::Deadline { .. }));
+        assert!(
+            err.to_string().contains("stay queued"),
+            "the deadline error must say the work is not lost: {err}"
+        );
+        let chain = read_pending_publish(temp.path()).unwrap().unwrap();
+        assert_eq!(chain.ops.len(), 2);
+        assert_eq!(chain.ops.last().unwrap().op, ids[1].to_string());
+        assert_eq!(fake.heads(), vec![id(1)], "the server head is untouched");
+    }
+
+    #[test]
+    fn the_publisher_deadline_is_finite_and_env_tunable() {
+        assert_eq!(
+            publish_rpc_deadline(),
+            Duration::from_millis(DEFAULT_PUBLISH_RPC_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
     fn missing_staged_object_fails_loudly() {
         let temp = tempfile::tempdir().unwrap();
         let fake = FakeTransport::default();
@@ -1339,6 +1718,56 @@ mod tests {
         );
 
         assert!(find_op_heads_dir(temp.path()).is_none());
+    }
+
+    #[test]
+    fn publishing_a_folded_clone_registration_clears_its_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let registration = operation(60, &[id(1)]);
+        let registration_id = fake.stage_operation(&registration);
+        let mut marker = PendingPublishMarker::new(&[id(1)]);
+        marker.push(&registration_id, &[]);
+        let follow_up = operation(61, &[registration_id]);
+        let follow_up_id = fake.stage_operation(&follow_up);
+        marker.push(&follow_up_id, &[(ObjectKind::Op, follow_up_id)]);
+        write_pending_publish(temp.path(), &marker).unwrap();
+        let registration_path = temp
+            .path()
+            .join(crate::vex_op_heads_store::PENDING_REGISTRATION_FILE);
+        std::fs::write(
+            &registration_path,
+            format!(
+                r#"{{"workspace_name":"vex-clone-1","pending_op_id":"{registration_id}","server_head_ids":["{}"]}}"#,
+                id(1)
+            ),
+        )
+        .unwrap();
+        fake.set_heads(vec![id(1)]);
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        assert_eq!(block_on(publisher.drain()).unwrap().published_ops(), 2);
+        assert!(!registration_path.exists());
+    }
+
+    #[test]
+    fn an_unrelated_registration_marker_survives_a_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        fake.set_heads(vec![id(1)]);
+        queue_chain(temp.path(), &fake, id(1), 1);
+        let registration_path = temp
+            .path()
+            .join(crate::vex_op_heads_store::PENDING_REGISTRATION_FILE);
+        std::fs::write(
+            &registration_path,
+            r#"{"workspace_name":"vex-clone-2","pending_op_id":null,"server_head_ids":[]}"#,
+        )
+        .unwrap();
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        assert_eq!(block_on(publisher.drain()).unwrap().published_ops(), 1);
+        assert!(registration_path.exists());
     }
 
     #[test]

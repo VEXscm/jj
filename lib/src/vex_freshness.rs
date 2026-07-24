@@ -14,11 +14,15 @@
 
 //! Read-path freshness for local-first repos (roadmap/088).
 //!
-//! Local op heads are authoritative for the session. Freshness is
-//! opportunistic: at most one budgeted `GetOpHeads` per process per repo,
-//! whose failure or timeout is invisible — the command keeps serving local
-//! heads. A refresh never rewrites history; it either fast-forwards a local
-//! head that is literally the server's, or hands both heads to jj, whose
+//! Local op heads are authoritative for the session, and a read never waits
+//! for the network to confirm them. Freshness happens *after* the command:
+//! [`refresh_markers`] runs one budgeted `GetOpHeads` at the end of the
+//! process, alongside the publisher drain, so the next command starts from a
+//! current server head having paid nothing for it. Setting
+//! `VEX_REFRESH_BUDGET_MS` opts back into a blocking check on the read path.
+//!
+//! A refresh never rewrites history; it either fast-forwards a local head that
+//! is literally the server's own operation, or hands both heads to jj, whose
 //! op-head resolution drops ancestors and merges anything genuinely divergent.
 
 use std::collections::HashSet;
@@ -55,16 +59,29 @@ pub enum RefreshDecision {
     Merge(Vec<ContentId>),
 }
 
-/// Refresh budget from `VEX_REFRESH_BUDGET_MS`; `0` disables the refresh.
+/// Budget for a *blocking* refresh on the read path. `None` — the default —
+/// means the read never waits for the network at all.
+///
+/// An opportunistic refresh that blocks is not opportunistic: any budget at or
+/// above the link's round trip time is spent in full on nearly every command,
+/// because the request usually completes just inside it. Measured on the
+/// reference laptop, a 100 ms budget against a ~90-110 ms RTT produced status
+/// medians identical to synchronous mode, while forcing the budget below the
+/// RTT dropped them from 0.16 s to 0.06 s. So the default is to serve local
+/// heads immediately and let [`refresh_markers`] update the markers at the end
+/// of the command, for the *next* one to use. Setting
+/// `VEX_REFRESH_BUDGET_MS` opts back into blocking freshness.
 pub fn refresh_budget() -> Option<Duration> {
-    let millis = match std::env::var("VEX_REFRESH_BUDGET_MS") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(millis) => millis,
-            Err(_) => DEFAULT_REFRESH_BUDGET_MS,
-        },
-        Err(_) => DEFAULT_REFRESH_BUDGET_MS,
-    };
+    let raw = std::env::var("VEX_REFRESH_BUDGET_MS").ok()?;
+    let millis = raw.trim().parse::<u64>().ok()?;
     (millis > 0).then(|| Duration::from_millis(millis))
+}
+
+/// Budget for the end-of-command refresh, from `VEX_REFRESH_BUDGET_MS` or
+/// [`DEFAULT_REFRESH_BUDGET_MS`]. This one runs after the command's output is
+/// done, so spending it costs the user nothing.
+pub fn background_refresh_budget() -> Duration {
+    refresh_budget().unwrap_or(Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS))
 }
 
 /// Decide what the freshly read server heads mean for this repo.
@@ -156,7 +173,10 @@ pub fn refresh_once(
         Ok(Some(fetched)) => fetched,
         Ok(None) => {
             stats.refresh_timeouts.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(?budget, "op-head refresh exceeded its budget; serving local heads");
+            tracing::debug!(
+                ?budget,
+                "op-head refresh exceeded its budget; serving local heads"
+            );
             return None;
         }
         Err(err) => {
@@ -168,7 +188,8 @@ pub fn refresh_once(
     match plan_refresh(local, chain, server, &fetched) {
         RefreshDecision::Unchanged => None,
         RefreshDecision::FastForward(heads) => {
-            if let Err(err) = write_server_heads(dir, &ServerHeadsMarker::new(heads.clone(), None)) {
+            if let Err(err) = write_server_heads(dir, &ServerHeadsMarker::new(heads.clone(), None))
+            {
                 tracing::debug!(error = %err, "could not record refreshed server heads");
                 return None;
             }
@@ -185,6 +206,40 @@ pub fn refresh_once(
             Some(heads)
         }
     }
+}
+
+/// Update this repo's freshness markers after the command has finished, so the
+/// *next* command starts from a current server head without any command ever
+/// having waited for the network to read one.
+///
+/// Only ever advances bookkeeping: it records the server heads it saw, and
+/// fast-forwards the local heads solely when they are the server's own
+/// operation and nothing is queued. Divergence is left for the read path to
+/// surface as a second head, which jj merges.
+pub fn refresh_markers(dir: &Path, client: &VexClient) {
+    let Ok(Some(chain)) = crate::vex_publish::read_pending_publish(dir) else {
+        return refresh_with(dir, client, None);
+    };
+    refresh_with(dir, client, Some(&chain));
+}
+
+fn refresh_with(dir: &Path, client: &VexClient, chain: Option<&PendingPublishMarker>) {
+    let Ok(Some(local)) = crate::vex_publish::read_local_heads(dir) else {
+        return;
+    };
+    let local: Vec<ContentId> = local
+        .iter()
+        .filter_map(crate::vex_publish::content_id_from_op_id)
+        .collect();
+    let server = crate::vex_publish::read_server_heads(dir).ok().flatten();
+    refresh_once(
+        dir,
+        client,
+        Some(background_refresh_budget()),
+        &local,
+        chain,
+        server.as_ref(),
+    );
 }
 
 /// One refresh per repo per process. Keyed by directory rather than a plain
@@ -287,10 +342,16 @@ mod tests {
     }
 
     #[test]
-    fn refresh_budget_reads_the_environment() {
+    fn the_read_path_does_not_block_on_refresh_by_default() {
+        // Unset by default: a read serves local heads and never waits for the
+        // network. Only an explicit VEX_REFRESH_BUDGET_MS opts back into a
+        // blocking freshness check.
+        assert_eq!(refresh_budget(), None);
+        // The end-of-command refresh still has a budget, because spending it
+        // costs the user nothing.
         assert_eq!(
-            refresh_budget(),
-            Some(Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS))
+            background_refresh_budget(),
+            Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS)
         );
     }
 

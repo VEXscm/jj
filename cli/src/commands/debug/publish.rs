@@ -39,8 +39,12 @@ pub async fn cmd_debug_publish(
     command: &CommandHelper,
     args: &DebugPublishArgs,
 ) -> Result<(), CommandError> {
-    let Some(dir) = find_op_heads_dir(command.cwd()) else {
-        return Err(user_error("no repository found for the current directory"));
+    // Resolve through the workspace loader so a top-level `-R <path>` selects
+    // the repository exactly as it does for every other command; the cwd walk
+    // is only the fallback for an invocation that has no loadable workspace.
+    let dir = match command.workspace_loader() {
+        Ok(loader) => loader.repo_path().join("op_heads"),
+        Err(err) => find_op_heads_dir(command.cwd()).ok_or(err)?,
     };
     let queued = read_pending_publish(&dir)
         .map_err(|err| user_error_with_message("cannot read the publish queue", err))?;
@@ -49,7 +53,12 @@ pub async fn cmd_debug_publish(
     if let Some(chain) = &queued {
         writeln!(ui.stdout(), "base:  {}", chain.base_heads.join(", "))?;
         for entry in &chain.ops {
-            writeln!(ui.stdout(), "  op {} ({} objects)", entry.op, entry.objects.len())?;
+            writeln!(
+                ui.stdout(),
+                "  op {} ({} objects)",
+                entry.op,
+                entry.objects.len()
+            )?;
         }
     }
     if let Some(server) = read_server_heads(&dir)
@@ -64,9 +73,7 @@ pub async fn cmd_debug_publish(
         return Ok(());
     }
 
-    match ensure_published_at(&dir)
-        .map_err(|err| user_error_with_message("publish failed", err))?
-    {
+    match ensure_published_at(&dir).map_err(|err| user_error_with_message("publish failed", err))? {
         PublishOutcome::Idle => writeln!(ui.stdout(), "nothing to publish")?,
         PublishOutcome::Published {
             ops,
