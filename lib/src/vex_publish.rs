@@ -83,6 +83,13 @@ pub const MARKER_VERSION: u32 = 1;
 /// a whole backlog in one request does not.
 const UPLOAD_BATCH_OBJECTS: usize = 64;
 
+/// How many objects one operation's publish will re-supply to a server that
+/// reports them missing. Generous: a repository that lost a directory's worth
+/// of trees should still recover in one drain, and each round costs one small
+/// upload. It exists only so a server that names objects we cannot supply
+/// cannot spin forever.
+const MAX_MISSING_OBJECT_REPAIRS: usize = 5_000;
+
 /// How many times the publisher re-derives its CAS base before giving up and
 /// leaving the chain queued.
 const MAX_PUBLISH_ATTEMPTS: usize = 3;
@@ -646,6 +653,29 @@ pub enum PublishOutcome {
     ServerHeadMoved { server_heads: Vec<ContentId> },
 }
 
+
+/// The object a server rejection names as missing, if it names one.
+///
+/// The server refuses a publish whose closure reaches an object it does not
+/// hold, and says which one. That is a repairable condition, not a dead end:
+/// the client is publishing from a repository that has the object, so it can
+/// supply it. Parsing the message is deliberate — the alternative is a queue
+/// that is permanently unpublishable because one object went missing on the
+/// server side, which is exactly what happened to a production repository.
+fn missing_object_from_rejection(message: &str) -> Option<(ObjectKind, ContentId)> {
+    let rest = message.split("missing ").nth(1)?;
+    let (kind, rest) = rest.split_once(' ')?;
+    let kind = kind_from_str(&kind.to_ascii_lowercase())?;
+    let hex: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.len() != 64 {
+        return None;
+    }
+    ContentId::from_hex(&hex).ok().map(|id| (kind, id))
+}
+
 impl PublishOutcome {
     pub fn published_ops(&self) -> usize {
         match self {
@@ -734,10 +764,7 @@ impl<'a> VexPublisher<'a> {
                 .ok_or_else(|| PublishError::Corrupt("invalid view id length".to_string()))?;
             let expected = operation_parents(&operation);
 
-            let outcome = self
-                .transport
-                .commit_op_heads(&expected, &id, &view)
-                .await?;
+            let outcome = self.commit_repairing_missing_objects(&expected, &id, &view).await?;
             if outcome.ok || outcome.current_heads == [id] {
                 chain.ops.remove(0);
                 self.commit_progress(&chain, &id, first_queued.as_deref())?;
@@ -883,6 +910,64 @@ impl<'a> VexPublisher<'a> {
         let server_heads = self.transport.get_op_heads().await?;
         self.record_server_heads_only(&server_heads)?;
         Ok(PublishOutcome::ServerHeadMoved { server_heads })
+    }
+
+    /// Commit one operation, supplying any object the server reports missing.
+    ///
+    /// The server names one missing object per rejection, so a repository that
+    /// lost several needs several rounds. Each round uploads exactly the named
+    /// object, so the work is bounded by what is actually missing rather than
+    /// by re-sending history; the attempt cap only stops an unbounded loop if
+    /// the server keeps naming objects this repository cannot supply.
+    async fn commit_repairing_missing_objects(
+        &self,
+        expected: &[ContentId],
+        id: &ContentId,
+        view: &ContentId,
+    ) -> Result<CasOutcome, PublishError> {
+        let mut repaired = 0usize;
+        loop {
+            let error = match self.transport.commit_op_heads(expected, id, view).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => error,
+            };
+            if repaired >= MAX_MISSING_OBJECT_REPAIRS {
+                tracing::warn!(
+                    repaired,
+                    "giving up re-supplying objects the server is missing"
+                );
+                return Err(error);
+            }
+            let Some((kind, missing)) = missing_object_from_rejection(&error.to_string()) else {
+                return Err(error);
+            };
+            if !self.supply_missing_object(kind, &missing).await? {
+                return Err(error);
+            }
+            repaired += 1;
+        }
+    }
+
+    /// Upload one object the server says it is missing.
+    ///
+    /// Returns whether the object could be supplied: if this repository does
+    /// not have it either, the bytes are genuinely gone and the caller must
+    /// surface the original rejection rather than retry into the same wall.
+    async fn supply_missing_object(
+        &self,
+        kind: ObjectKind,
+        id: &ContentId,
+    ) -> Result<bool, PublishError> {
+        let Some(data) = self.transport.read_object(kind, id) else {
+            return Ok(false);
+        };
+        tracing::warn!(
+            object = %id,
+            kind = ?kind,
+            "server is missing an object this publish needs; re-uploading it from the local store"
+        );
+        self.transport.put_objects(vec![(kind, *id, data)]).await?;
+        Ok(true)
     }
 
     /// Every object the queued operations introduced, re-uploaded
@@ -2143,6 +2228,39 @@ mod tests {
             publish_rpc_deadline(),
             Duration::from_millis(DEFAULT_PUBLISH_RPC_TIMEOUT_MS)
         );
+    }
+
+    /// The server names the object it is missing; the client has to be able to
+    /// find it in that message, or a queue stays stuck forever on bytes the
+    /// client could simply have re-sent.
+    #[test]
+    fn missing_object_is_parsed_from_a_server_rejection() {
+        let message = "cannot publish root: missing Tree \
+                       a0c8c9966c754154910234ac584f8ef6f6a84e7bbca83f5f24d5375137981c1f: \
+                       object_store: Object at location 6/repos/4/jj/objects/trees/sha256/a0c8 \
+                       not found: Client error with status 404 Not Found";
+        let (kind, id) = super::missing_object_from_rejection(message).expect("parsed");
+        assert_eq!(kind, ObjectKind::Tree);
+        assert_eq!(
+            id.to_string(),
+            "a0c8c9966c754154910234ac584f8ef6f6a84e7bbca83f5f24d5375137981c1f"
+        );
+    }
+
+    /// Unrelated failures must not be mistaken for a repairable one, or the
+    /// publisher retries into the same wall and hides the real error.
+    #[test]
+    fn unrelated_rejections_are_not_treated_as_missing_objects() {
+        for message in [
+            "upstream request timeout",
+            "missing approval before landing",
+            "missing Tree deadbeef",
+        ] {
+            assert!(
+                super::missing_object_from_rejection(message).is_none(),
+                "{message:?} must not parse as a missing object"
+            );
+        }
     }
 
     #[test]
