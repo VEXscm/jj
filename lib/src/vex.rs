@@ -253,22 +253,42 @@ fn rpc_timing_enabled() -> bool {
 /// Vex client blocks on each call) to stderr on drop when `VEX_RPC_TIMING` is
 /// set. Returns `None` (zero overhead) otherwise; the label closure only runs
 /// when enabled.
+/// Guard held for the duration of one server RPC.
+///
+/// Every RPC constructs one, so this is the single place that knows a command
+/// blocked on the server. It does three things: counts the call (always, so
+/// durability modes can be checked by a number rather than by inspection),
+/// and prints a line when `rpc_timing_enabled()`.
+///
+/// It deliberately does NOT hold a tracing span: an `EnteredSpan` kept across an
+/// await makes the enclosing future `!Send`. Span coverage of the round trip
+/// comes from `#[tracing::instrument]` on the RPC methods themselves, which
+/// wraps the future rather than entering a guard.
 struct RpcTimer {
     label: String,
     start: std::time::Instant,
+    print: bool,
 }
 
 impl RpcTimer {
-    fn start(label: impl FnOnce() -> String) -> Option<Self> {
-        rpc_timing_enabled().then(|| Self {
-            label: label(),
+    fn start(label: impl FnOnce() -> String) -> Self {
+        let label = label();
+        vex_client_stats()
+            .blocking_rpcs
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            label,
             start: std::time::Instant::now(),
-        })
+            print: rpc_timing_enabled(),
+        }
     }
 }
 
 impl Drop for RpcTimer {
     fn drop(&mut self) {
+        if !self.print {
+            return;
+        }
         eprintln!(
             "[vex-rpc] {:>8.1}ms  {}",
             self.start.elapsed().as_secs_f64() * 1000.0,
@@ -285,6 +305,14 @@ impl Drop for RpcTimer {
 /// per process, many `VexClient` instances per repo.
 #[derive(Debug, Default)]
 pub struct VexClientStats {
+    /// Server RPCs issued on the calling command's critical path — every call
+    /// the command blocked on, whatever its kind.
+    ///
+    /// This is the number that answers "did a deferred durability mode actually
+    /// defer anything". A `VEX_DURABILITY=local-first` commit that still
+    /// reports a non-zero count here has not taken the server off the critical
+    /// path, however its op-head publication is scheduled.
+    pub blocking_rpcs: AtomicU64,
     /// `GetObject` RPCs issued for blob objects.
     pub get_object_rpcs_blob: AtomicU64,
     /// `GetObject` RPCs issued for tree objects.
@@ -423,6 +451,7 @@ pub struct VexClientStats {
 macro_rules! for_each_vex_client_stat {
     ($macro:ident) => {
         $macro!(
+            blocking_rpcs,
             get_object_rpcs_blob,
             get_object_rpcs_tree,
             get_object_rpcs_commit,
@@ -482,6 +511,7 @@ macro_rules! for_each_vex_client_stat {
 /// Plain-value copy of [`VexClientStats`] taken at one point in time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct VexClientStatsSnapshot {
+    pub blocking_rpcs: u64,
     pub get_object_rpcs_blob: u64,
     pub get_object_rpcs_tree: u64,
     pub get_object_rpcs_commit: u64,
@@ -3887,6 +3917,7 @@ impl VexClient {
     /// is responsible for chunking so each call stays under the server's gRPC
     /// message size limit. Skips the local object cache (intended for bulk
     /// import where the objects are not needed locally afterwards).
+    #[tracing::instrument(skip_all)]
     pub async fn put_objects(
         &self,
         objects: Vec<(ObjectKind, ContentId, Vec<u8>)>,
@@ -4372,6 +4403,7 @@ impl VexClient {
         .await
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn get_op_heads(&self) -> Result<Vec<ContentId>, VexClientError> {
         // Always read op heads live from the server. A client-side cache is
         // unsafe here: jj records the working-copy operation locally *before* the
@@ -4550,6 +4582,7 @@ impl VexClient {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn commit_op_heads(
         &self,
         expected: &[ContentId],

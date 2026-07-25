@@ -424,6 +424,7 @@ impl CommandHelper {
         !self.global_args().no_integrate_operation
     }
 
+    #[instrument(skip_all)]
     async fn maybe_commit_transaction(
         &self,
         tx: Transaction,
@@ -2347,6 +2348,7 @@ to the current parents may contain changes from multiple commits.
         }
     }
 
+    #[instrument(skip_all)]
     async fn finish_transaction(
         &mut self,
         ui: &Ui,
@@ -2354,7 +2356,10 @@ to the current parents may contain changes from multiple commits.
         description: impl Into<String>,
         _git_import_export_lock: &GitImportExportLock,
     ) -> Result<(), CommandError> {
-        let num_rebased = tx.repo_mut().rebase_descendants().await?;
+        let num_rebased = {
+            let _span = tracing::info_span!("rebase_descendants").entered();
+            tx.repo_mut().rebase_descendants().await?
+        };
         if num_rebased > 0 {
             writeln!(ui.status(), "Rebased {num_rebased} descendant commits")?;
         }
@@ -2517,6 +2522,7 @@ to the current parents may contain changes from multiple commits.
 
     /// Inform the user about important changes to the repo since the previous
     /// operation (when `old_repo` was loaded).
+    #[instrument(skip_all)]
     async fn report_repo_changes(
         &self,
         ui: &Ui,

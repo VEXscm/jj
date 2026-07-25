@@ -142,6 +142,7 @@ impl Transaction {
     /// Writes the transaction to the operation store, but does not publish it.
     /// That means that a repo can be loaded at the operation, but the
     /// operation will not be seen when loading the repo at head.
+    #[tracing::instrument(skip_all)]
     pub async fn write(
         mut self,
         description: impl Into<String>,
@@ -234,6 +235,7 @@ impl UnpublishedOperation {
         self.repo.operation()
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn publish(self) -> Result<Arc<ReadonlyRepo>, TransactionCommitError> {
         let _lock = self.op_heads_store.lock().await?;
         self.op_heads_store
