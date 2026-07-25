@@ -837,10 +837,12 @@ pub struct VexRepoConfig {
     pub local_writes: bool,
     /// When the op-head CAS runs relative to the command that produced the
     /// operation (see [`VexDurability`]). Defaults to
-    /// [`VexDurability::Sync`] — today's inline publish — and is overridden
-    /// per invocation by `VEX_DURABILITY`. Distinct from
+    /// [`VexDurability::LocalFirst`] — the operation is durable on local disk
+    /// when the command returns and a background publisher moves it to the
+    /// server, with `push`/`pull`/`submit`/`land` flushing first — and is
+    /// overridden per invocation by `VEX_DURABILITY`. Distinct from
     /// [`Self::local_writes`], which never publishes at all.
-    #[serde(default, skip_serializing_if = "VexDurability::is_sync")]
+    #[serde(default, skip_serializing_if = "VexDurability::is_serialized_default")]
     pub durability: VexDurability,
     /// Object decode policy for backend reads (see [`VexObjectReadMode`]).
     /// Never serialized: a normal clone's `vex.json` carries no mode field and

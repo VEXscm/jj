@@ -107,21 +107,31 @@ const ID_LENGTH: usize = 32;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VexDurability {
-    /// Today's behavior: objects flush and the op head CASes before the
-    /// command returns.
-    #[default]
+    /// Objects flush and the op head CASes before the command returns. No
+    /// longer the default: it is the mode to choose when a command's return
+    /// must mean "the server has it", independent of any later barrier.
     Sync,
     /// Operations are recorded locally and drained before the process exits.
     FlushOnExit,
     /// Operations are recorded locally; the publisher drains best-effort at
     /// the end of the command and, failing that, at the next command or sync
-    /// barrier.
+    /// barrier. The default for interactive use: a command returns once the
+    /// operation is durable on local disk, and `push`/`pull`/`submit`/`land`
+    /// still flush and confirm before their own server work.
+    #[default]
     LocalFirst,
 }
 
 impl VexDurability {
     pub fn is_sync(&self) -> bool {
         matches!(self, Self::Sync)
+    }
+
+    /// Whether this is the serialized default. `vex.json` omits the field at
+    /// the default so a clone written by a newer CLI stays readable by an
+    /// older one; any non-default mode is written explicitly.
+    pub fn is_serialized_default(&self) -> bool {
+        matches!(self, Self::LocalFirst)
     }
 
     /// Whether operations are recorded locally and published out of band.
@@ -154,7 +164,39 @@ impl VexDurability {
     /// `VEX_DURABILITY` overrides the repo's configured mode. An unrecognized
     /// value keeps the configured mode and warns once — a typo must not
     /// silently change durability.
+    /// Whether this process looks like a disposable CI machine. Vex's own
+    /// runners export `CI=true`, as does every mainstream CI system. Such a
+    /// machine can be destroyed the moment its job ends, so a queue that has
+    /// not drained is lost work rather than merely deferred work.
+    fn ephemeral_environment() -> bool {
+        Self::is_ephemeral_marker(std::env::var("CI").ok().as_deref())
+    }
+
+    /// Pure form of the `CI` check, so the policy is testable without mutating
+    /// process environment.
+    fn is_ephemeral_marker(value: Option<&str>) -> bool {
+        let Some(value) = value else {
+            return false;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        !value.is_empty() && value != "0" && value != "false"
+    }
+
+    /// Pure form of the CI adjustment applied inside [`Self::resolve`].
+    fn for_environment(configured: Self, ephemeral: bool) -> Self {
+        if configured == Self::LocalFirst && ephemeral {
+            Self::FlushOnExit
+        } else {
+            configured
+        }
+    }
+
     pub fn resolve(configured: Self) -> Self {
+        // An explicit `VEX_DURABILITY` always wins, including over the CI
+        // adjustment below, so a runner can still opt into any mode.
+        // Same deferred fast path on CI, but the process may not exit until
+        // the queue is on the server.
+        let configured = Self::for_environment(configured, Self::ephemeral_environment());
         let Ok(raw) = std::env::var("VEX_DURABILITY") else {
             return configured;
         };
@@ -1470,11 +1512,47 @@ mod tests {
             Some(VexDurability::FlushOnExit)
         );
         assert_eq!(VexDurability::parse("nonsense"), None);
-        assert!(VexDurability::default().is_sync());
+        // Local-first is the default: a command returns once the operation is
+        // durable locally, and the sync barriers still confirm the server.
+        assert_eq!(VexDurability::default(), VexDurability::LocalFirst);
+        assert!(VexDurability::default().is_serialized_default());
         assert!(!VexDurability::Sync.defers_publish());
         assert!(VexDurability::LocalFirst.defers_publish());
         assert!(VexDurability::FlushOnExit.blocks_on_exit());
         assert!(!VexDurability::LocalFirst.blocks_on_exit());
+    }
+
+    /// A disposable CI machine can be destroyed the instant its job ends, so
+    /// the default deferred mode must not let it exit with an undrained queue.
+    #[test]
+    fn ci_environments_default_to_flushing_before_exit() {
+        assert!(!VexDurability::is_ephemeral_marker(None));
+        assert!(!VexDurability::is_ephemeral_marker(Some("")));
+        assert!(!VexDurability::is_ephemeral_marker(Some("0")));
+        assert!(!VexDurability::is_ephemeral_marker(Some("false")));
+        assert!(!VexDurability::is_ephemeral_marker(Some(" FALSE ")));
+        assert!(VexDurability::is_ephemeral_marker(Some("true")));
+        assert!(VexDurability::is_ephemeral_marker(Some("1")));
+
+        // A developer machine keeps the non-blocking default; an ephemeral
+        // runner must drain before the process exits.
+        assert_eq!(
+            VexDurability::for_environment(VexDurability::LocalFirst, false),
+            VexDurability::LocalFirst
+        );
+        assert_eq!(
+            VexDurability::for_environment(VexDurability::LocalFirst, true),
+            VexDurability::FlushOnExit
+        );
+        // Explicit modes are left exactly as configured.
+        assert_eq!(
+            VexDurability::for_environment(VexDurability::Sync, true),
+            VexDurability::Sync
+        );
+        assert_eq!(
+            VexDurability::for_environment(VexDurability::FlushOnExit, false),
+            VexDurability::FlushOnExit
+        );
     }
 
     #[test]
