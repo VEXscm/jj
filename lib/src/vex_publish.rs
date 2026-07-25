@@ -280,9 +280,14 @@ pub struct PendingObject {
 }
 
 /// The ordered chain of unpublished operations, plus the server head set the
-/// chain was built on. `base_heads` is the only `expected` the chain can ever
-/// be published with: the backend validates that a committed operation's
-/// parents equal the CAS `expected` set exactly.
+/// chain was built on.
+///
+/// `base_heads` is bookkeeping for the read path — it is what
+/// [`crate::vex_freshness::known_divergence`] compares the recorded server
+/// heads against — not an input to publication. The sequential drain CASes
+/// each operation against its own recorded parents, and the backend requires a
+/// published operation's parents to *cover* the CAS `expected` set, so a stale
+/// base costs nothing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PendingPublishMarker {
     pub v: u32,
@@ -615,11 +620,11 @@ impl<'a> VexPublisher<'a> {
     }
 
     /// Publish every queued operation: upload the objects they introduced,
-    /// then run a single op-head CAS that advances the server from the chain's
-    /// base to its tip. Intermediate operations are coalesced into that one
-    /// CAS — the backend requires a published operation's parents to equal the
-    /// CAS `expected` set exactly, so a chain of more than one operation can
-    /// only be published as a rewrite carrying the tip's view.
+    /// then advance the server head. The default strategy is one CAS per
+    /// queued operation under its own id ([`Self::drain_sequentially`]); the
+    /// opt-in coalescing strategy rewrites the burst into a single operation
+    /// parented on the chain's base and is documented — with its hazard — on
+    /// [`Self::drain_coalesced`].
     pub async fn drain(&self) -> Result<PublishOutcome, PublishError> {
         let start = Instant::now();
         let Some(chain) = read_pending_publish(self.dir)? else {
@@ -696,6 +701,30 @@ impl<'a> VexPublisher<'a> {
                 stats.publish_folds.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            // The server moved to work this repo has *already merged*: jj
+            // resolved the divergent op heads into a merge operation, which is
+            // queued like any other. That merge is the one operation in the
+            // chain that can be CASed against the moved head, so publish it
+            // directly instead of dead-ending.
+            if let Some((index, merge)) = self.merge_forward_target(&chain, &server_heads)? {
+                let outcome = self
+                    .transport
+                    .commit_op_heads(&server_heads, &merge.id, &merge.view)
+                    .await?;
+                if outcome.ok || outcome.current_heads == [merge.id] {
+                    chain.ops.drain(..=index);
+                    self.commit_progress(&chain, &merge.id, first_queued.as_deref())?;
+                    published += index + 1;
+                    head = Some(merge.id);
+                    stats.publish_folds.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                tracing::debug!(
+                    merge = %merge.id,
+                    error = outcome.error_message,
+                    "publishing the merge of the moved server head lost its own CAS race"
+                );
+            }
             self.record_server_heads_only(&server_heads)?;
             tracing::warn!(
                 queued = chain.ops.len(),
@@ -749,12 +778,13 @@ impl<'a> VexPublisher<'a> {
     /// tip rather than a descendant. The working copy stays pinned to the
     /// local operation, so any reader that resolves heads from the server (a
     /// `sync`-mode command, another clone) loads a sibling of the working
-    /// copy's operation and jj refuses to proceed — and it cannot self-heal,
-    /// because publishing a merge of the two requires `expected` to equal the
-    /// server head set while the merge's parents would include the unpublished
-    /// local operation. Before this can be turned on, the publisher must also
-    /// move the working copy's operation pointer to the rewrite (or record it
-    /// as a successor so jj can integrate it).
+    /// copy's operation and jj refuses to proceed. Publishing a merge of the
+    /// two is now permitted by the backend's parent rule, but it does not fix
+    /// this: the rewrite's id is not the local tip's, so the working copy is
+    /// still pinned to an operation no reader resolves to. Before this can be
+    /// turned on, the publisher must also move the working copy's operation
+    /// pointer to the rewrite (or record it as a successor so jj can integrate
+    /// it).
     async fn drain_coalesced(
         &self,
         mut chain: PendingPublishMarker,
@@ -861,11 +891,67 @@ impl<'a> VexPublisher<'a> {
         Ok((id, view, true))
     }
 
+    /// The earliest queued operation whose parents *cover* `server_heads`, and
+    /// which can therefore be CASed straight onto the moved server head.
+    ///
+    /// This is how a divergent repository converges. When the server head
+    /// moves under a queued chain the read path serves both heads (see
+    /// [`crate::vex_freshness::known_divergence`]), jj's own op-head
+    /// resolution merges their views, and the resulting merge operation —
+    /// whose parents are exactly the two heads — is queued like any other
+    /// local operation. Publishing it advances the server from its current
+    /// head to a descendant of *both* sides.
+    ///
+    /// Nothing queued ahead of the merge is dropped: those operations are the
+    /// merge's own local parent and that parent's ancestors, so publishing the
+    /// merge makes every one of them an ancestor of the new server head. Their
+    /// objects have already been uploaded by
+    /// [`Self::upload_chain_objects`], and the backend's presence proof
+    /// re-checks every parent operation on each publish, so a merge whose
+    /// ancestry did not reach the server is rejected rather than accepted with
+    /// a hole.
+    ///
+    /// Operations *after* the merge stay queued and publish normally on the
+    /// following iterations, because their parent is then the server head.
+    fn merge_forward_target(
+        &self,
+        chain: &PendingPublishMarker,
+        server_heads: &[ContentId],
+    ) -> Result<Option<(usize, MergeTarget)>, PublishError> {
+        // An empty expectation is the initial-publication contract, not a
+        // merge: the backend deliberately keeps it strict, so there is nothing
+        // to fold onto here.
+        if server_heads.is_empty() {
+            return Ok(None);
+        }
+        let wanted = id_set(server_heads);
+        for (index, entry) in chain.ops.iter().enumerate() {
+            let id = ContentId::from_hex(&entry.op)
+                .map_err(|err| PublishError::Corrupt(format!("invalid pending op id: {err}")))?;
+            let operation = self.read_operation(&id)?;
+            let parents = id_set(&operation_parents(&operation));
+            if !wanted.is_subset(&parents) {
+                continue;
+            }
+            let view = content_id_from_view_id(&operation.view_id)
+                .ok_or_else(|| PublishError::Corrupt("invalid view id length".to_string()))?;
+            return Ok(Some((index, MergeTarget { id, view })));
+        }
+        Ok(None)
+    }
+
     /// A CAS conflict this repo can resolve without merging: the server head
     /// is one of our own queued operations (a previous drain got further than
     /// its marker update), or it is exactly what the chain is parented on and
     /// only the recorded base was stale. Anything else means the server holds
     /// work this repo has not seen, which only a jj op merge can reconcile.
+    ///
+    /// Only the (default-off) coalescing drain uses this; the sequential drain
+    /// recovers the same two shapes inline, plus the merge convergence in
+    /// [`Self::merge_forward_target`], which deliberately does not apply to a
+    /// rewrite-coalescing publish: a coalesced head is a sibling of the local
+    /// tip, so folding a merge onto it would compound the divergence rather
+    /// than resolve it.
     fn refold(
         &self,
         chain: &mut PendingPublishMarker,
@@ -988,6 +1074,12 @@ impl<'a> VexPublisher<'a> {
 
 struct ChainTip {
     id: ContentId,
+}
+
+/// A queued operation that can be published straight onto a moved server head.
+struct MergeTarget {
+    id: ContentId,
+    view: ContentId,
 }
 
 fn operation_parents(operation: &Operation) -> Vec<ContentId> {
@@ -1287,6 +1379,31 @@ mod tests {
                     rpc: "CommitOperation",
                     budget: Duration::from_secs(30),
                 });
+            }
+            // The backend's parent contract, mirrored so the client tests are
+            // held to the same rule the service enforces
+            // (`ensure_operation_matches_expected_heads`): the new
+            // operation's parents must *cover* the CAS expectation. Extra
+            // parents — which is what a merge operation has — are allowed;
+            // dropping an expected head is not. A violation is a validation
+            // error, not a CAS conflict, exactly as in `commit_operation`.
+            if let Some(bytes) = state.objects.get(&(ObjectKind::Op, *new_head)).cloned()
+                && let Ok(proto) = crate::protos::simple_op_store::Operation::decode(&*bytes)
+                && let Ok(operation) = operation_from_proto(proto)
+            {
+                let parents = id_set(&operation_parents(&operation));
+                let expected_set = id_set(expected);
+                let covered = if expected_set.is_empty() {
+                    parents.is_empty()
+                } else {
+                    expected_set.is_subset(&parents)
+                };
+                if !covered {
+                    return Err(PublishError::Transport(format!(
+                        "operation parent set {parents:?} does not cover expected operation heads \
+                         {expected_set:?}"
+                    )));
+                }
             }
             if let Some(conflict) = state.cas_conflicts.pop() {
                 state.heads = conflict.clone();
@@ -1628,6 +1745,221 @@ mod tests {
         // Every object still reached the server: only the head pointer is
         // unresolved.
         assert!(fake.uploaded() >= 3);
+    }
+
+    /// Queue the merge jj produces when the read path serves both the local
+    /// and the moved server head, exactly as
+    /// `VexOpHeadsStore::record_pending_operation` would: the chain is rebased
+    /// onto the recorded server heads and the merge is appended.
+    fn queue_merge(
+        dir: &Path,
+        fake: &FakeTransport,
+        server_heads: &[ContentId],
+        local_tip: ContentId,
+    ) -> ContentId {
+        let mut chain = read_pending_publish(dir).unwrap().unwrap();
+        let mut parents = vec![local_tip];
+        parents.extend_from_slice(server_heads);
+        let merge = operation(200, &parents);
+        let merge_id = fake.stage_operation(&merge);
+        chain.base_heads = server_heads.iter().map(ToString::to_string).collect();
+        chain.push(&merge_id, &[(ObjectKind::Op, merge_id)]);
+        write_pending_publish(dir, &chain).unwrap();
+        merge_id
+    }
+
+    fn published_operation(fake: &FakeTransport, id: &ContentId) -> Operation {
+        let bytes = fake.read_object(ObjectKind::Op, id).unwrap();
+        operation_from_proto(crate::protos::simple_op_store::Operation::decode(&*bytes).unwrap())
+            .unwrap()
+    }
+
+    /// The roadmap/088 divergence dead end: another session moved the server
+    /// head while a chain was queued. The first drain cannot advance, but it
+    /// records where the server is; jj then merges the two heads and the merge
+    /// enters the queue; the next drain publishes it. Nothing is dropped and
+    /// the final server head descends from both sides.
+    #[test]
+    fn a_moved_server_head_converges_once_jj_merges_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let ids = queue_chain(temp.path(), &fake, id(1), 3);
+        let remote = fake.stage_operation(&operation(90, &[id(1)]));
+        fake.set_heads(vec![remote]);
+
+        // Phase one: no queued operation can be CASed onto the moved head yet.
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+        assert_eq!(
+            outcome,
+            PublishOutcome::ServerHeadMoved {
+                server_heads: vec![remote]
+            }
+        );
+        assert_eq!(
+            read_pending_publish(temp.path()).unwrap().unwrap().ops.len(),
+            3,
+            "no queued operation may be dropped while divergence is unresolved"
+        );
+        assert_eq!(
+            read_server_heads(temp.path()).unwrap().unwrap().heads,
+            vec![remote.to_string()],
+            "the moved head is recorded so the next repo load serves both heads"
+        );
+
+        // Phase two: jj merged the two heads; the merge is queued like any
+        // other local operation.
+        let merge = queue_merge(temp.path(), &fake, &[remote], ids[2]);
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+
+        assert_eq!(outcome.published_ops(), 4, "the whole queue is drained");
+        assert!(matches!(
+            outcome,
+            PublishOutcome::Published {
+                coalesced: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            fake.heads(),
+            vec![merge],
+            "the server head is the merge itself, under its own id"
+        );
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+        let server = read_server_heads(temp.path()).unwrap().unwrap();
+        assert_eq!(server.heads, vec![merge.to_string()]);
+        assert_eq!(
+            server.published_local_head, None,
+            "no rewrite: the published head is the local operation itself"
+        );
+
+        // The new head descends from both sides, so nothing either session did
+        // was lost — the local tip and the remote head are both its parents.
+        let parents = operation_parents(&published_operation(&fake, &merge));
+        assert!(parents.contains(&ids[2]), "the local tip must be a parent");
+        assert!(parents.contains(&remote), "the remote head must be a parent");
+        // Every queued operation reached the server as an object, so the whole
+        // local op log is readable from the new head.
+        for op in &ids {
+            assert!(fake.read_object(ObjectKind::Op, op).is_some());
+        }
+    }
+
+    /// The state a stuck workspace was actually found in: the chain's recorded
+    /// base is neither the server head nor an ancestor of it, and the tip's
+    /// parents are not the server head either. Before the merge was
+    /// publishable this returned `ServerHeadMoved` forever and only deleting
+    /// the marker files could recover it.
+    #[test]
+    fn a_chain_whose_base_is_unrelated_to_the_server_head_still_converges() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let ids = queue_chain(temp.path(), &fake, id(1), 2);
+        let remote = fake.stage_operation(&operation(90, &[id(1)]));
+        fake.set_heads(vec![remote]);
+        let merge = queue_merge(temp.path(), &fake, &[remote], ids[1]);
+
+        // Corrupt the recorded base into something unrelated to both sides:
+        // the drain must not depend on it at all.
+        let mut chain = read_pending_publish(temp.path()).unwrap().unwrap();
+        chain.base_heads = vec![id(200).to_string()];
+        write_pending_publish(temp.path(), &chain).unwrap();
+
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+
+        assert_eq!(outcome.published_ops(), 3);
+        assert_eq!(fake.heads(), vec![merge]);
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// Operations recorded *after* the merge are still published one by one
+    /// under their own ids, so the final server head is the working copy's own
+    /// operation rather than the merge.
+    #[test]
+    fn operations_queued_after_the_merge_publish_under_their_own_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let ids = queue_chain(temp.path(), &fake, id(1), 2);
+        let remote = fake.stage_operation(&operation(90, &[id(1)]));
+        fake.set_heads(vec![remote]);
+        let merge = queue_merge(temp.path(), &fake, &[remote], ids[1]);
+
+        let mut chain = read_pending_publish(temp.path()).unwrap().unwrap();
+        let follow_up = operation(210, &[merge]);
+        let follow_up_id = fake.stage_operation(&follow_up);
+        chain.push(&follow_up_id, &[(ObjectKind::Op, follow_up_id)]);
+        write_pending_publish(temp.path(), &chain).unwrap();
+
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+
+        assert_eq!(outcome.published_ops(), 4);
+        assert_eq!(
+            fake.heads(),
+            vec![follow_up_id],
+            "the local tip, not the merge, is where the server ends up"
+        );
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// A drain that dies after publishing the merge resumes from the merge
+    /// rather than replaying it or dead-ending again.
+    #[test]
+    fn a_drain_interrupted_after_the_merge_resumes_correctly() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let ids = queue_chain(temp.path(), &fake, id(1), 2);
+        let remote = fake.stage_operation(&operation(90, &[id(1)]));
+        fake.set_heads(vec![remote]);
+        let merge = queue_merge(temp.path(), &fake, &[remote], ids[1]);
+        let mut chain = read_pending_publish(temp.path()).unwrap().unwrap();
+        let follow_up_id = fake.stage_operation(&operation(210, &[merge]));
+        chain.push(&follow_up_id, &[(ObjectKind::Op, follow_up_id)]);
+        write_pending_publish(temp.path(), &chain).unwrap();
+
+        // Call 1 is the doomed CAS of the chain's head, call 2 is the merge;
+        // the follow-up's CAS never answers.
+        fake.state.lock().unwrap().deadline_on_call = Some(3);
+        assert!(matches!(
+            block_on(VexPublisher::new(temp.path(), &fake).drain()),
+            Err(PublishError::Deadline { .. })
+        ));
+        assert_eq!(fake.heads(), vec![merge], "the merge is durably published");
+        let queued = read_pending_publish(temp.path()).unwrap().unwrap();
+        assert_eq!(queued.ops.len(), 1);
+        assert_eq!(queued.ops[0].op, follow_up_id.to_string());
+        assert_eq!(queued.base_heads, vec![merge.to_string()]);
+
+        fake.state.lock().unwrap().deadline_on_call = None;
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+        assert_eq!(outcome.published_ops(), 1);
+        assert_eq!(fake.heads(), vec![follow_up_id]);
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// An operation that merely *claims* to be publishable is not enough: the
+    /// backend rejects a parent set that drops the current head, and the
+    /// publisher leaves the queue intact rather than losing it.
+    #[test]
+    fn a_queued_operation_that_drops_the_server_head_is_not_folded_onto_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        queue_chain(temp.path(), &fake, id(1), 2);
+        let remote = fake.stage_operation(&operation(90, &[id(1)]));
+        fake.set_heads(vec![remote]);
+
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+
+        assert_eq!(
+            outcome,
+            PublishOutcome::ServerHeadMoved {
+                server_heads: vec![remote]
+            },
+            "no queued operation covers the server head, so none may be CASed onto it"
+        );
+        assert_eq!(fake.heads(), vec![remote], "the server head is untouched");
+        assert_eq!(
+            read_pending_publish(temp.path()).unwrap().unwrap().ops.len(),
+            2
+        );
     }
 
     #[test]

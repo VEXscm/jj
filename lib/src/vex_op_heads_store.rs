@@ -115,8 +115,9 @@ struct PendingRegistration {
     pending_op_id: Option<String>,
     /// Hex content ids of the server op heads the pending operation was built
     /// on (its non-root parents). The server validates that a committed
-    /// operation's parents equal the CAS `expected` set exactly, so this is
-    /// the only `expected` the pending operation can ever be published with.
+    /// operation's parents cover the CAS `expected` set, and this operation
+    /// has exactly those parents, so this is the only `expected` the pending
+    /// operation can ever be published with.
     #[serde(default)]
     server_head_ids: Vec<String>,
 }
@@ -1140,6 +1141,83 @@ mod tests {
         assert_eq!(chain.base_heads, vec![content_id(7).to_string()]);
         assert_eq!(chain.ops.len(), 2);
         assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![op_id(3)]);
+    }
+
+    /// The read half of the divergence fix: while a chain is queued and the
+    /// recorded server heads are off its base, both heads are served so jj's
+    /// own op-head resolution merges them. Serving only the local head is what
+    /// left the queue with nothing that could ever be CASed onto the moved
+    /// server head.
+    #[test]
+    fn a_queued_chain_serves_the_union_of_local_and_server_heads() {
+        let _guard = crate::vex::test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
+        crate::vex_publish::write_server_heads(
+            temp.path(),
+            &ServerHeadsMarker::new(vec![content_id(1)], None),
+        )
+        .unwrap();
+        let mut parent = op_id(1);
+        for byte in 2..5 {
+            let next = op_id(byte);
+            block_on(store.update_op_heads(std::slice::from_ref(&parent), &next)).unwrap();
+            parent = next;
+        }
+        assert_eq!(
+            block_on(store.get_op_heads()).unwrap(),
+            vec![op_id(4)],
+            "a chain still parented on the recorded server head is not divergent"
+        );
+
+        // The publisher hit the moved head and recorded it.
+        crate::vex_publish::write_server_heads(
+            temp.path(),
+            &ServerHeadsMarker::new(vec![content_id(9)], None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            block_on(store.get_op_heads()).unwrap(),
+            vec![op_id(4), op_id(9)],
+            "both heads are served so jj merges them into a publishable operation"
+        );
+
+        // jj's merge lands as the chain's next entry, and the chain is rebased
+        // onto the head it merged in.
+        block_on(store.update_op_heads(&[op_id(4), op_id(9)], &op_id(10))).unwrap();
+        let chain = pending_chain(temp.path()).unwrap();
+        assert_eq!(chain.base_heads, vec![content_id(9).to_string()]);
+        assert_eq!(chain.ops.len(), 4);
+        assert_eq!(chain.ops.last().unwrap().op, content_id(10).to_string());
+        assert_eq!(
+            block_on(store.get_op_heads()).unwrap(),
+            vec![op_id(10)],
+            "once the merge is queued the repo is no longer divergent"
+        );
+    }
+
+    /// `local_writes` (the READ_ONLY CI runner) never publishes and never
+    /// merges: its local heads stay authoritative even with deferred-publish
+    /// markers sitting beside them.
+    #[test]
+    fn local_writes_ignores_divergent_publish_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_at(temp.path(), true);
+        block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).unwrap();
+        crate::vex_publish::write_server_heads(
+            temp.path(),
+            &ServerHeadsMarker::new(vec![content_id(9)], None),
+        )
+        .unwrap();
+        let mut chain = PendingPublishMarker::new(&[content_id(1)]);
+        chain.push(&content_id(2), &[]);
+        crate::vex_publish::write_pending_publish(temp.path(), &chain).unwrap();
+
+        assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![op_id(2)]);
+        assert!(pending_chain(temp.path()).is_some(), "the queue is untouched");
     }
 
     /// The configured endpoint is unroutable, so a resolution that returned
