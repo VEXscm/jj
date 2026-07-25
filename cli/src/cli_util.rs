@@ -1183,7 +1183,28 @@ enum SnapshotWorkingCopyError {
     StaleWorkingCopy(CommandError),
 }
 
-const MAX_OP_HEAD_SNAPSHOT_ATTEMPTS: u32 = 3;
+const MAX_OP_HEAD_SNAPSHOT_ATTEMPTS: u32 = 16;
+
+/// Back-off before retrying a lost op-head CAS.
+///
+/// Every writer that loses the race retries, so retrying immediately just
+/// reproduces the same collision: with N concurrent clients the herd stays in
+/// lockstep and most of them exhaust their attempts. Spreading the retries out,
+/// with jitter so they do not re-synchronise, is what lets concurrent commits
+/// all land. The wait is bounded and only paid when a conflict actually happened.
+fn op_head_retry_backoff(attempt: u32) -> std::time::Duration {
+    // The retry window has to outlast the queue of writers ahead of us: each
+    // one holds the head for roughly a publish, so N contending clients need a
+    // window on the order of N publishes. Capping the ceiling too low is what
+    // makes the tail of a large herd fail.
+    let ceiling_ms = 20_u64 << attempt.min(7);
+    let jitter_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::from(since.subsec_nanos()))
+        .unwrap_or(0)
+        % ceiling_ms.max(1);
+    std::time::Duration::from_millis(ceiling_ms / 2 + jitter_ms / 2)
+}
 
 impl SnapshotWorkingCopyError {
     fn into_command_error(self) -> CommandError {
@@ -2206,6 +2227,7 @@ to the current parents may contain changes from multiple commits.
                              working-copy snapshot."
                         )
                         .map_err(snapshot_command_error)?;
+                        std::thread::sleep(op_head_retry_backoff(attempt));
                         let repo = self
                             .user_repo
                             .repo

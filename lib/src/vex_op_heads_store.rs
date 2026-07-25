@@ -89,6 +89,12 @@ impl OpHeadsStoreLock for VexNoopLock {}
 
 /// Name of the marker file (inside the op_heads store dir) recording a
 /// deferred workspace registration. See [`PendingRegistration`].
+/// How many times a clone rebuilds its deferred registration on a moved server
+/// head before giving up. Concurrent clones all fold against the same head, so
+/// every one but the winner has to rebuild; a single attempt makes a majority
+/// of concurrent first-commits fail.
+const REGISTRATION_FOLD_ATTEMPTS: usize = 5;
+
 pub(crate) const PENDING_REGISTRATION_FILE: &str = "vex-pending-registration";
 
 /// Persistent record of a clone whose workspace registration was deferred: the
@@ -632,8 +638,46 @@ impl VexOpHeadsStore {
         if current_heads == [pending_op] {
             return self.clear_deferred_registration(new_id);
         }
-        self.rebuild_pending_registration(marker, &pending_op, &current_heads, new_id)
-            .await?;
+        // Losing this race is ordinary contention, not a failure: several
+        // clones folding their registrations at once all target the same head,
+        // so all but one lose. Rebuilding on whatever the server holds now and
+        // retrying is exactly what the error used to ask the user to do by
+        // hand, and with N concurrent clients the hand-retry turns into a
+        // majority of commits failing.
+        let mut heads = current_heads;
+        let mut last_error = None;
+        for attempt in 0..REGISTRATION_FOLD_ATTEMPTS {
+            match self
+                .rebuild_pending_registration(marker, &pending_op, &heads, new_id)
+                .await
+            {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 == REGISTRATION_FOLD_ATTEMPTS {
+                        break;
+                    }
+                    // Re-read the head the next rebuild must target. Without a
+                    // fresh read the retry rebuilds on the same stale head and
+                    // loses the same race again.
+                    match self.client.get_op_heads().await {
+                        Ok(current) => {
+                            if current.is_empty() {
+                                break;
+                            }
+                            heads = current;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
         self.clear_deferred_registration(new_id)?;
         Err(write_err(
             "CAS conflict on op heads: the deferred workspace registration was republished on \
