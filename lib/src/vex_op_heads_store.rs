@@ -835,6 +835,22 @@ impl OpHeadsStore for VexOpHeadsStore {
             if marker.pending_op_id.is_some()
                 && let Some(local) = self.read_local_heads()?
             {
+                // A clone whose registration is still pending is normally
+                // authoritative for its own heads. It stops being so once the
+                // server has demonstrably moved off what this repo's queue is
+                // parented on: serving only the local head there would hide the
+                // divergence from jj, so the queue could never merge and would
+                // stay stuck forever. Serve both heads so jj's own op-head
+                // resolution merges them into a publishable merge operation.
+                let local_ids: Vec<_> = local.iter().filter_map(content_id_from_op_id).collect();
+                let state = self.deferred_state();
+                if let Some(state) = &state
+                    && let Some(heads) =
+                        known_divergence(&local_ids, state.chain.as_ref(), state.server.as_ref())
+                            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?
+                {
+                    return Ok(heads.iter().map(op_id_from_content_id).collect());
+                }
                 return Ok(local);
             }
         }
