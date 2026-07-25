@@ -851,27 +851,18 @@ impl OpHeadsStore for VexOpHeadsStore {
                 {
                     return Ok(heads.iter().map(op_id_from_content_id).collect());
                 }
-                // A clone keeps its registration pending until its first
-                // mutation folds it. Serving only the local head for that whole
-                // window freezes the repository's view: someone who clones and
-                // then only reads never sees a teammate's or an agent's work,
-                // no matter how long they wait. Ask the server once, under a
-                // budget, and hand jj both heads so it merges them — the local
-                // registration operation is preserved either way.
-                let (chain, server) = state
-                    .as_ref()
-                    .map(|state| (state.chain.as_ref(), state.server.as_ref()))
-                    .unwrap_or((None, None));
-                if let Some(heads) = refresh_once(
-                    &self.store_dir,
-                    &self.client,
-                    Some(crate::vex_freshness::unfolded_clone_refresh_budget()),
-                    &local_ids,
-                    chain,
-                    server,
-                ) {
-                    return Ok(heads.iter().map(op_id_from_content_id).collect());
-                }
+                // NOTE: this is where a registration-pending clone still
+                // fails to notice that the server moved, so a repository that
+                // is cloned and then only read shows a frozen view (reported by
+                // a user watching an agent work in another workspace). Serving
+                // the union of local and server heads here does make jj merge,
+                // but the merge is a sibling of the working copy's own
+                // operation, and the next command dies with "the repo was
+                // loaded at operation X, which seems to be a sibling of the
+                // working copy's operation Y" — strictly worse than staleness.
+                // The fix is to FOLD the registration onto the moved head (the
+                // 076 rebuild_pending_registration path that a first mutation
+                // already performs) rather than to merge on the read path.
                 return Ok(local);
             }
         }

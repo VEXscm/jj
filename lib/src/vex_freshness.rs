@@ -25,6 +25,7 @@
 //! is literally the server's own operation, or hands both heads to jj, whose
 //! op-head resolution drops ancestors and merges anything genuinely divergent.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -175,8 +176,8 @@ pub fn refresh_once(
     server: Option<&ServerHeadsMarker>,
 ) -> Option<Vec<ContentId>> {
     let budget = budget?;
-    if !claim_refresh(dir) {
-        return None;
+    if let Err(previous) = claim_refresh(dir) {
+        return previous;
     }
     let stats = vex_client_stats();
     stats.refresh_attempts.fetch_add(1, Ordering::Relaxed);
@@ -188,33 +189,33 @@ pub fn refresh_once(
                 ?budget,
                 "op-head refresh exceeded its budget; serving local heads"
             );
-            return None;
+            return record_refresh(dir, None);
         }
         Err(err) => {
             stats.refresh_timeouts.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(error = %err, "op-head refresh failed; serving local heads");
-            return None;
+            return record_refresh(dir, None);
         }
     };
     match plan_refresh(local, chain, server, &fetched) {
-        RefreshDecision::Unchanged => None,
+        RefreshDecision::Unchanged => record_refresh(dir, None),
         RefreshDecision::FastForward(heads) => {
             if let Err(err) = write_server_heads(dir, &ServerHeadsMarker::new(heads.clone(), None))
             {
                 tracing::debug!(error = %err, "could not record refreshed server heads");
-                return None;
+                return record_refresh(dir, None);
             }
             if let Err(err) = crate::vex_publish::write_local_heads(dir, &heads) {
                 tracing::debug!(error = %err, "could not fast-forward local heads");
-                return None;
+                return record_refresh(dir, None);
             }
-            Some(heads)
+            record_refresh(dir, Some(heads))
         }
         RefreshDecision::Merge(heads) => {
             if let Err(err) = write_server_heads(dir, &ServerHeadsMarker::new(fetched, None)) {
                 tracing::debug!(error = %err, "could not record refreshed server heads");
             }
-            Some(heads)
+            record_refresh(dir, Some(heads))
         }
     }
 }
@@ -255,13 +256,36 @@ fn refresh_with(dir: &Path, client: &VexClient, chain: Option<&PendingPublishMar
 
 /// One refresh per repo per process. Keyed by directory rather than a plain
 /// flag so tests (and any future multi-repo command) stay independent.
-fn claim_refresh(dir: &Path) -> bool {
-    static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    CLAIMED
-        .get_or_init(|| Mutex::new(HashSet::new()))
+/// Per-process memo of the refresh outcome for one repository.
+///
+/// The refresh must happen at most once per process, but every later
+/// `get_op_heads` in that process has to see the *same* answer. Returning the
+/// stale local head to the second caller is how a repository ends up loaded at
+/// its own head while the freshly fetched server head is silently dropped —
+/// the reader then never sees another workspace's work.
+type RefreshMemo = OnceLock<Mutex<HashMap<PathBuf, Option<Vec<ContentId>>>>>;
+static REFRESHED: RefreshMemo = OnceLock::new();
+
+fn refresh_memo() -> &'static Mutex<HashMap<PathBuf, Option<Vec<ContentId>>>> {
+    REFRESHED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `Ok(())` when this call owns the single refresh for `dir`; `Err(previous)`
+/// when another call already made it, carrying that call's outcome.
+fn claim_refresh(dir: &Path) -> Result<(), Option<Vec<ContentId>>> {
+    let memo = refresh_memo().lock().unwrap();
+    match memo.get(dir) {
+        Some(previous) => Err(previous.clone()),
+        None => Ok(()),
+    }
+}
+
+fn record_refresh(dir: &Path, outcome: Option<Vec<ContentId>>) -> Option<Vec<ContentId>> {
+    refresh_memo()
         .lock()
         .unwrap()
-        .insert(dir.to_path_buf())
+        .insert(dir.to_path_buf(), outcome.clone());
+    outcome
 }
 
 #[cfg(test)]
@@ -366,10 +390,28 @@ mod tests {
         );
     }
 
+    /// One refresh per process per repository, and — critically — every later
+    /// caller sees the same answer. Handing the second caller `None` is what
+    /// let a repository load at its own stale head after the first call had
+    /// already fetched the server's, so the reader never saw other work.
     #[test]
-    fn refresh_is_claimed_once_per_directory() {
+    fn refresh_is_claimed_once_and_replays_its_outcome() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(claim_refresh(temp.path()));
-        assert!(!claim_refresh(temp.path()));
+        let dir = temp.path();
+        assert!(claim_refresh(dir).is_ok(), "first caller owns the refresh");
+
+        let heads = vec![ContentId::from_bytes([7; 32])];
+        assert_eq!(record_refresh(dir, Some(heads.clone())), Some(heads.clone()));
+
+        // Every later caller in this process replays it rather than falling
+        // back to the local head.
+        assert_eq!(claim_refresh(dir), Err(Some(heads.clone())));
+        assert_eq!(claim_refresh(dir), Err(Some(heads)));
+
+        // A recorded miss replays as a miss, not as a fresh claim.
+        let other = tempfile::tempdir().unwrap();
+        assert!(claim_refresh(other.path()).is_ok());
+        assert_eq!(record_refresh(other.path(), None), None);
+        assert_eq!(claim_refresh(other.path()), Err(None));
     }
 }
