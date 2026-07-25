@@ -73,26 +73,52 @@ pub async fn cmd_debug_publish(
         return Ok(());
     }
 
-    match ensure_published_at(&dir).map_err(|err| user_error_with_message("publish failed", err))? {
-        PublishOutcome::Idle => writeln!(ui.stdout(), "nothing to publish")?,
-        PublishOutcome::Published {
-            ops,
-            coalesced,
-            head,
-            elapsed_ms,
-        } => writeln!(
-            ui.stdout(),
-            "published {ops} operation(s) as {head} in {elapsed_ms}ms{}",
-            if coalesced { " (coalesced)" } else { "" }
-        )?,
-        PublishOutcome::ServerHeadMoved { server_heads } => {
-            let heads: Vec<String> = server_heads.iter().map(ToString::to_string).collect();
-            return Err(user_error(format!(
-                "the server operation head moved to {}; reload the repository to merge it, then \
-                 publish again",
-                heads.join(", ")
-            )));
+    // A moved server head is the ordinary concurrent case, not a failure: the
+    // repository serves both heads, loading it makes jj's own op-head
+    // resolution merge them into a merge operation, and that merge publishes
+    // against the moved head. Do that here instead of asking the caller to
+    // reload and re-run.
+    const RELOAD_MERGE_ATTEMPTS: usize = 3;
+    let mut moved_to: Vec<String> = Vec::new();
+    for attempt in 0..RELOAD_MERGE_ATTEMPTS {
+        match ensure_published_at(&dir)
+            .map_err(|err| user_error_with_message("publish failed", err))?
+        {
+            PublishOutcome::Idle => {
+                writeln!(ui.stdout(), "nothing to publish")?;
+                return Ok(());
+            }
+            PublishOutcome::Published {
+                ops,
+                coalesced,
+                head,
+                elapsed_ms,
+            } => {
+                writeln!(
+                    ui.stdout(),
+                    "published {ops} operation(s) as {head} in {elapsed_ms}ms{}",
+                    if coalesced { " (coalesced)" } else { "" }
+                )?;
+                return Ok(());
+            }
+            PublishOutcome::ServerHeadMoved { server_heads } => {
+                moved_to = server_heads.iter().map(ToString::to_string).collect();
+            }
         }
+        if attempt + 1 == RELOAD_MERGE_ATTEMPTS {
+            break;
+        }
+        writeln!(
+            ui.status(),
+            "server operation head moved to {}; merging it and retrying",
+            moved_to.join(", ")
+        )?;
+        // `no_snapshot`: this is a publish barrier, not a working-copy mutation.
+        command.workspace_helper_no_snapshot(ui).await?;
     }
-    Ok(())
+    Err(user_error(format!(
+        "the server operation head keeps moving (now {}); another writer is publishing to this \
+         repository concurrently — run this command again once it settles",
+        moved_to.join(", ")
+    )))
 }
