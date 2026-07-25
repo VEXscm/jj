@@ -45,6 +45,9 @@ use crate::vex_publish::write_server_heads;
 /// Default wall-clock budget for the opportunistic refresh, covering the
 /// connect handshake as well as the request.
 pub const DEFAULT_REFRESH_BUDGET_MS: u64 = 100;
+/// Comfortably above a normal `GetOpHeads` round trip (measured 110-165 ms in
+/// production) so the read actually completes instead of timing out.
+pub const UNFOLDED_CLONE_REFRESH_BUDGET_MS: u64 = 3_000;
 
 /// What to do with the local heads once the server's have been read.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +83,14 @@ pub fn refresh_budget() -> Option<Duration> {
 /// Budget for the end-of-command refresh, from `VEX_REFRESH_BUDGET_MS` or
 /// [`DEFAULT_REFRESH_BUDGET_MS`]. This one runs after the command's output is
 /// done, so spending it costs the user nothing.
+/// Budget for the one server read a clone performs while its registration is
+/// still pending. It is on the read path, so it is bounded — but it must be
+/// larger than a typical round trip, or the repository silently keeps serving
+/// its clone-time head and never shows anyone else's work.
+pub fn unfolded_clone_refresh_budget() -> Duration {
+    refresh_budget().unwrap_or(Duration::from_millis(UNFOLDED_CLONE_REFRESH_BUDGET_MS))
+}
+
 pub fn background_refresh_budget() -> Duration {
     refresh_budget().unwrap_or(Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS))
 }

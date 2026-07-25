@@ -851,6 +851,27 @@ impl OpHeadsStore for VexOpHeadsStore {
                 {
                     return Ok(heads.iter().map(op_id_from_content_id).collect());
                 }
+                // A clone keeps its registration pending until its first
+                // mutation folds it. Serving only the local head for that whole
+                // window freezes the repository's view: someone who clones and
+                // then only reads never sees a teammate's or an agent's work,
+                // no matter how long they wait. Ask the server once, under a
+                // budget, and hand jj both heads so it merges them — the local
+                // registration operation is preserved either way.
+                let (chain, server) = state
+                    .as_ref()
+                    .map(|state| (state.chain.as_ref(), state.server.as_ref()))
+                    .unwrap_or((None, None));
+                if let Some(heads) = refresh_once(
+                    &self.store_dir,
+                    &self.client,
+                    Some(crate::vex_freshness::unfolded_clone_refresh_budget()),
+                    &local_ids,
+                    chain,
+                    server,
+                ) {
+                    return Ok(heads.iter().map(op_id_from_content_id).collect());
+                }
                 return Ok(local);
             }
         }
