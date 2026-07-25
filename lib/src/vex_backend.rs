@@ -100,6 +100,32 @@ pub fn serialize_commit(commit: &Commit) -> (CommitId, Vec<u8>) {
     (id, data)
 }
 
+/// Whether the stored commit `id` is native rather than raw Git bytes.
+///
+/// Reads the object through `client` and applies [`is_native_commit_bytes`].
+/// The root commit is synthesized rather than stored, so it is native by
+/// definition and never fetched.
+pub async fn commit_is_native(client: &VexClient, id: &CommitId) -> BackendResult<bool> {
+    let content_id = to_content_id(&id.to_bytes(), &id.object_type())?;
+    let data = client
+        .get_object(jj_backend_types::ObjectKind::Commit, &content_id)
+        .await
+        .map_err(|err| map_status_error(err, &id.object_type(), id.hex()))?;
+    Ok(is_native_commit_bytes(&data))
+}
+
+/// Whether `data` is a native Vex commit rather than raw Git commit bytes.
+///
+/// This is exactly the discriminator [`VexBackend::read_commit`] uses: native
+/// commits are `simple_store::Commit` protobufs, and a decode failure is what
+/// sends a read into the raw Git parser (or fails closed under
+/// [`VexObjectReadMode::NativeOnly`]). Callers that must refuse to build on
+/// Git-format history — native subtree materialization grafting onto a trunk
+/// tip, for example — should ask here rather than re-deriving the rule.
+pub fn is_native_commit_bytes(data: &[u8]) -> bool {
+    crate::protos::simple_store::Commit::decode(data).is_ok()
+}
+
 fn to_content_id(id: &[u8], object_type: &str) -> BackendResult<jj_backend_types::ContentId> {
     if id.len() != ID_LENGTH {
         return Err(BackendError::InvalidHashLength {
@@ -950,6 +976,39 @@ mod tests {
         let read_commit = backend.read_commit(&commit_id).block_on().unwrap();
         assert_eq!(read_commit.description, "native protobuf commit");
         assert_eq!(read_commit.root_tree, Merge::resolved(tree_id));
+    }
+
+    /// `is_native_commit_bytes` must agree with the discriminator
+    /// `read_commit` applies, so a caller refusing to build on Git-format
+    /// history classifies exactly the objects that would fail a native read.
+    #[test]
+    fn native_commit_classification_matches_the_read_path() {
+        let signature = Signature {
+            name: "Vex".to_string(),
+            email: "vex@example.com".to_string(),
+            timestamp: Timestamp {
+                timestamp: MillisSinceEpoch(0),
+                tz_offset: 0,
+            },
+        };
+        let commit = Commit {
+            parents: vec![CommitId::from_bytes(&[0; super::ID_LENGTH])],
+            predecessors: vec![],
+            root_tree: Merge::resolved(super::TreeId::new(vec![1; super::ID_LENGTH])),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::from_bytes(&[7; super::CHANGE_ID_LENGTH]),
+            description: "native protobuf commit".to_string(),
+            author: signature.clone(),
+            committer: signature,
+            secure_sig: None,
+        };
+        let (_, native_bytes) = super::serialize_commit(&commit);
+        assert!(super::is_native_commit_bytes(&native_bytes));
+
+        let git_bytes =
+            b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@example.com> 0 +0000\n\
+              \ncommitted through git subtree";
+        assert!(!super::is_native_commit_bytes(git_bytes));
     }
 
     /// Raw Git commit bytes are a typed native object-format error under
