@@ -78,16 +78,34 @@ pub const SERVER_HEADS_FILE: &str = "vex-server-heads";
 /// than misreading it.
 pub const MARKER_VERSION: u32 = 1;
 
+/// Objects per `put_objects` call while draining a queue. Sized so a batch
+/// completes well inside the public edge's request timeout even on a slow link;
+/// a whole backlog in one request does not.
+const UPLOAD_BATCH_OBJECTS: usize = 64;
+
 /// How many times the publisher re-derives its CAS base before giving up and
 /// leaving the chain queued.
 const MAX_PUBLISH_ATTEMPTS: usize = 3;
 
 /// Whether a burst publishes as one rewritten operation instead of one CAS per
-/// operation. Off unless `VEX_PUBLISH_COALESCE` is set to a true-ish value:
-/// the rewrite produces an operation that is a sibling of the local tip, which
-/// permanently diverges the repository. See [`VexPublisher::drain_coalesced`]
-/// for the full failure mode and what has to be built before this can default
-/// to on.
+/// operation.
+///
+/// Off by default; set `VEX_PUBLISH_COALESCE=1` to turn it on.
+///
+/// The reason to want it: a burst costs one op-head CAS per operation, so with
+/// several agents writing to one repository the queue can grow faster than it
+/// drains — every command adds an operation while the drain retires them one at
+/// a time.
+///
+/// The reason it is still not the default: the rewrite used to publish an
+/// operation that was a *sibling* of the local tip, which permanently diverged
+/// the repository. That specific defect is fixed — the rewrite now carries the
+/// tip as an extra parent (see [`VexPublisher::head_to_publish`]), leaving the
+/// working copy stale rather than divergent — but the convergence properties
+/// the sequential drain is tested for (an interrupted drain resuming, a moved
+/// server head converging, a stale recorded base costing no rejected CAS) are
+/// not yet proven for the coalesced path. Prove those, and measure the win,
+/// before flipping this.
 fn coalescing_enabled() -> bool {
     matches!(
         std::env::var("VEX_PUBLISH_COALESCE").ok().as_deref(),
@@ -891,7 +909,20 @@ impl<'a> VexPublisher<'a> {
                 objects.push((kind, id, data));
             }
         }
-        self.transport.put_objects(objects).await
+        // Upload in bounded batches rather than one call.
+        //
+        // A backlog is exactly when this matters: the whole queue's objects in a
+        // single request outgrows the edge's request timeout, the call is killed,
+        // and no progress is recorded — so a queue that grew large enough could
+        // never drain again, which is the terminal state of a queue that grows
+        // faster than it drains. Each batch is separately idempotent
+        // (content-addressed create-if-missing), so a failure part-way through
+        // still leaves everything it already uploaded on the server and the next
+        // attempt resumes from there.
+        for batch in objects.chunks(UPLOAD_BATCH_OBJECTS) {
+            self.transport.put_objects(batch.to_vec()).await?;
+        }
+        Ok(())
     }
 
     fn chain_tip(&self, chain: &PendingPublishMarker) -> Result<ChainTip, PublishError> {
@@ -919,9 +950,23 @@ impl<'a> VexPublisher<'a> {
         if id_set(&operation_parents(&operation)) == id_set(base) {
             return Ok((tip.id, view, false));
         }
+        // Carry the local tip as an extra parent, not just the CAS base.
+        //
+        // Rewriting onto the base alone is what made coalescing unsafe: the
+        // published operation was then a *sibling* of the operation the working
+        // copy is pinned to, and the next command died with an unrecoverable
+        // sibling-operation error. Keeping the tip as a parent makes the working
+        // copy merely stale, which jj recovers by itself, and the backend
+        // accepts it because a published operation's parents need only *cover*
+        // the CAS expectation. The view is still the tip's, so the whole burst
+        // publishes as one operation.
+        let mut parents: Vec<OperationId> = base.iter().map(op_id_from_content_id).collect();
+        if !base.contains(&tip.id) {
+            parents.push(op_id_from_content_id(&tip.id));
+        }
         let rewritten = Operation {
             view_id: operation.view_id.clone(),
-            parents: base.iter().map(op_id_from_content_id).collect(),
+            parents,
             metadata: operation.metadata.clone(),
             commit_predecessors: operation.commit_predecessors.clone(),
         };
@@ -1719,8 +1764,12 @@ mod tests {
     /// operation that is a sibling of the local tip. Pinned here so the hazard
     /// cannot be re-enabled by accident.
     #[test]
-    fn coalescing_is_opt_in_and_publishes_a_sibling_of_the_local_tip() {
-        assert!(!coalescing_enabled(), "coalescing must default to off");
+    fn coalescing_publishes_one_cas_and_keeps_the_tip_in_its_lineage() {
+        assert!(
+            !coalescing_enabled(),
+            "coalescing stays opt-in until the sequential drain's convergence \
+             properties are proven for it"
+        );
 
         let temp = tempfile::tempdir().unwrap();
         let fake = FakeTransport::default();
@@ -1730,23 +1779,32 @@ mod tests {
         let publisher = VexPublisher::new(temp.path(), &fake).with_coalescing(true);
         let outcome = block_on(publisher.drain()).unwrap();
 
+        // The point of coalescing: a burst of three operations costs one CAS.
         assert_eq!(outcome.published_ops(), 3);
         assert_eq!(fake.cas_calls(), 1);
+
         let published = fake.heads();
-        assert_ne!(
-            published[0], ids[2],
-            "the coalesced head is a rewrite, not the local tip — this is the \
-             divergence that keeps the strategy opt-in"
-        );
+        assert_ne!(published[0], ids[2], "the coalesced head is a rewrite");
         let rewritten = fake.read_object(ObjectKind::Op, &published[0]).unwrap();
         let rewritten = operation_from_proto(
             crate::protos::simple_op_store::Operation::decode(&*rewritten).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            operation_parents(&rewritten),
-            vec![id(1)],
-            "the rewrite is parented on the base, making it a sibling of the local tip"
+        let parents = operation_parents(&rewritten);
+        // The CAS base has to be covered, or the backend rejects the publish.
+        assert!(
+            parents.contains(&id(1)),
+            "the rewrite must cover the CAS base"
+        );
+        // And the local tip has to remain an ancestor. Without this the
+        // published operation is a *sibling* of the operation the working copy
+        // is pinned to, and the next command fails with an unrecoverable
+        // sibling-operation error. With it the working copy is merely stale,
+        // which jj recovers by itself.
+        assert!(
+            parents.contains(&ids[2]),
+            "the rewrite must keep the local tip as a parent so the working copy \
+             is left stale rather than divergent"
         );
     }
 
