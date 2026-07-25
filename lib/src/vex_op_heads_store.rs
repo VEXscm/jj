@@ -384,6 +384,120 @@ impl VexOpHeadsStore {
     /// The server head moved between clone and first publish, so the pending
     /// operation can never be accepted. Rebuild the registration as a fresh
     /// operation parented on the current server head.
+    /// Fold a still-pending clone registration onto a moved server head, from
+    /// the read path.
+    ///
+    /// A clone keeps its registration local until its first mutation folds it.
+    /// Until then the repository serves its clone-time head, so someone who
+    /// clones and only reads never sees a teammate's or an agent's work. This
+    /// republishes the registration on whatever the server holds now, which
+    /// rejoins the server's lineage and makes everything published since the
+    /// clone visible.
+    ///
+    /// The rebuilt operation is parented on BOTH the current server head and
+    /// the local registration operation. Parenting it on the server head alone
+    /// would leave the working copy's operation a *sibling* of the repository's,
+    /// which is unrecoverable ("the repo was loaded at operation X, which seems
+    /// to be a sibling of the working copy's operation Y"); keeping the local
+    /// operation as a parent makes the working copy merely stale, which jj
+    /// recovers on its own. The extra parent is publishable because the backend
+    /// requires a published operation's parents to *cover* the CAS expectation
+    /// rather than equal it.
+    ///
+    /// Returns the new head on success. Every failure returns `None` so the
+    /// caller falls back to serving local heads — a stale view is worse than
+    /// nothing, but it is much better than a failed command.
+    async fn fold_registration_onto_moved_head(
+        &self,
+        marker: &PendingRegistration,
+    ) -> Option<Vec<jj_backend_types::ContentId>> {
+        let pending_hex = marker.pending_op_id.as_deref()?;
+        let pending_op = jj_backend_types::ContentId::from_hex(pending_hex).ok()?;
+        let recorded: Vec<_> = marker
+            .server_head_ids
+            .iter()
+            .filter_map(|id| jj_backend_types::ContentId::from_hex(id).ok())
+            .collect();
+
+        let budget = crate::vex_freshness::unfolded_clone_refresh_budget();
+        let current = self.client.get_op_heads_within(budget).ok().flatten()?;
+        let [head] = current.as_slice() else {
+            return None;
+        };
+        if recorded.iter().collect::<std::collections::HashSet<_>>()
+            == current.iter().collect::<std::collections::HashSet<_>>()
+        {
+            // The server has not moved since the clone: nothing to fold, and the
+            // local registration head is already the freshest view available.
+            return None;
+        }
+
+        let dummy = OperationId::new(pending_op.as_bytes().to_vec());
+        let head_operation = self.read_operation_object(head, &dummy).await.ok()?;
+        let head_view = self
+            .read_view_object(&head_operation.view_id, &dummy)
+            .await
+            .ok()?;
+        let pending_operation = self.read_operation_object(&pending_op, &dummy).await.ok()?;
+        let pending_view = self
+            .read_view_object(&pending_operation.view_id, &dummy)
+            .await
+            .ok()?;
+        let new_view =
+            registration_view_on_head(head_view, &pending_view, &marker.workspace_name).ok()?;
+
+        let view_data = view_to_proto(&new_view).encode_to_vec();
+        let view_content_id = sha256_content_id(&view_data);
+        self.client
+            .put_object(
+                jj_backend_types::ObjectKind::View,
+                &view_content_id,
+                view_data,
+            )
+            .await
+            .ok()?;
+
+        let new_operation = Operation {
+            view_id: ViewId::new(view_content_id.as_bytes().to_vec()),
+            parents: vec![
+                OperationId::new(head.as_bytes().to_vec()),
+                OperationId::new(pending_op.as_bytes().to_vec()),
+            ],
+            metadata: pending_operation.metadata.clone(),
+            commit_predecessors: pending_operation.commit_predecessors.clone(),
+        };
+        let op_data = operation_to_proto(&new_operation).encode_to_vec();
+        let op_content_id = sha256_content_id(&op_data);
+        self.client
+            .put_object(jj_backend_types::ObjectKind::Op, &op_content_id, op_data)
+            .await
+            .ok()?;
+
+        let response = self
+            .client
+            .commit_op_heads(std::slice::from_ref(head), &op_content_id, &op_content_id)
+            .await
+            .ok()?;
+        if !response.ok {
+            tracing::debug!(
+                workspace = marker.workspace_name,
+                "lost the CAS folding the deferred registration; serving local heads"
+            );
+            return None;
+        }
+
+        let heads = vec![op_content_id];
+        crate::vex_publish::write_local_heads(&self.store_dir, &heads).ok()?;
+        let dummy_id = OperationId::new(op_content_id.as_bytes().to_vec());
+        let _ = self.clear_deferred_registration(&dummy_id);
+        tracing::info!(
+            workspace = marker.workspace_name,
+            folded_op = %op_content_id,
+            "folded the deferred workspace registration onto the current server head"
+        );
+        Some(heads)
+    }
+
     async fn rebuild_pending_registration(
         &self,
         marker: &PendingRegistration,
@@ -851,18 +965,15 @@ impl OpHeadsStore for VexOpHeadsStore {
                 {
                     return Ok(heads.iter().map(op_id_from_content_id).collect());
                 }
-                // NOTE: this is where a registration-pending clone still
-                // fails to notice that the server moved, so a repository that
-                // is cloned and then only read shows a frozen view (reported by
-                // a user watching an agent work in another workspace). Serving
-                // the union of local and server heads here does make jj merge,
-                // but the merge is a sibling of the working copy's own
-                // operation, and the next command dies with "the repo was
-                // loaded at operation X, which seems to be a sibling of the
-                // working copy's operation Y" — strictly worse than staleness.
-                // The fix is to FOLD the registration onto the moved head (the
-                // 076 rebuild_pending_registration path that a first mutation
-                // already performs) rather than to merge on the read path.
+                // A clone that is only ever read keeps its registration
+                // pending forever, and serving the clone-time head for that
+                // whole window hides every other workspace's work. Fold the
+                // registration onto whatever the server holds now, which
+                // rejoins its lineage; a lost race or an unreachable server
+                // just falls through to the local head, exactly as before.
+                if let Some(heads) = self.fold_registration_onto_moved_head(&marker).await {
+                    return Ok(heads.iter().map(op_id_from_content_id).collect());
+                }
                 return Ok(local);
             }
         }
