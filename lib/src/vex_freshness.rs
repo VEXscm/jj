@@ -136,24 +136,70 @@ pub fn plan_refresh(
     RefreshDecision::Merge(merged)
 }
 
-/// Divergence this repo can see without any RPC: the publisher recorded a
-/// server head that the queued chain is not parented on, so the chain cannot
-/// advance until jj merges that head in locally.
+/// Divergence this repo can see without any RPC, as an op-head set for jj to
+/// resolve. `None` means the markers describe a converged repo.
+///
+/// There are two ways the markers record divergence, and both have to be read,
+/// because a repo hits them in either order.
+///
+/// *With a chain queued*: the publisher recorded a server head that the queued
+/// chain is not parented on, so the chain cannot advance until jj merges that
+/// head in locally.
+///
+/// *With nothing queued*: the repo's own publish is what created the
+/// divergence. Under the delta contract a publish that lands beside a sibling
+/// head is accepted rather than refused, so the chain drains to empty and the
+/// recorded server heads come back holding a head this repo does not have.
+/// Nothing else will ever mention it — the CAS refusal that used to force the
+/// merge is precisely what the delta contract removes — so a reader that
+/// looked only at the queue would keep committing on its own head and silently
+/// stop seeing every other workspace's work. The recorded heads are a strict
+/// superset of the local ones exactly then, and only then: any weaker
+/// relationship (a coalesced publish, a server head this repo never observed)
+/// means the marker no longer describes where the local head sits, and that is
+/// the [`refresh_once`] path's business, not this one's.
+///
+/// Serving the union is self-limiting either way. jj's op-head resolution
+/// merges the heads into one operation, which is queued and published like any
+/// other; the drain then records the resulting single head, local and recorded
+/// heads agree again, and reads go straight back to the local fast path.
+///
+/// The head this returns may not be readable offline, and that is accepted
+/// rather than degraded. jj resolves the extra head by reading its operation
+/// object, which is on the server; while the backend is unreachable such a
+/// read fails, where serving the local head alone would have succeeded. The
+/// obvious guard — serve the union only when every head is already in the
+/// local object cache — is worse than the problem: a sibling head is learned
+/// from a CAS response or a head refresh, never by fetching its object, so it
+/// is *never* locally cached the first time it is served, and the guard would
+/// suppress this branch in exactly the case it exists for. Telling "offline"
+/// apart from "not fetched yet" needs a network probe, which is the one thing
+/// a local-first read must not do. The regression is bounded to the window
+/// between recording a sibling and merging it, is a plain read error rather
+/// than corruption, and one online command clears it for good — whereas
+/// hiding the sibling leaves the repository silently forked for as long as it
+/// stays hidden.
 pub fn known_divergence(
     local: &[ContentId],
     chain: Option<&PendingPublishMarker>,
     server: Option<&ServerHeadsMarker>,
 ) -> Result<Option<Vec<ContentId>>, MarkerError> {
-    let (Some(chain), Some(server)) = (chain, server) else {
+    let Some(server) = server else {
         return Ok(None);
     };
-    if chain.is_empty() {
-        return Ok(None);
-    }
-    let base = chain.base_ids()?;
     let heads = server.head_ids()?;
-    if heads.iter().collect::<HashSet<_>>() == base.iter().collect::<HashSet<_>>() {
-        return Ok(None);
+    match chain.filter(|chain| !chain.is_empty()) {
+        Some(chain) => {
+            let base = chain.base_ids()?;
+            if heads.iter().collect::<HashSet<_>>() == base.iter().collect::<HashSet<_>>() {
+                return Ok(None);
+            }
+        }
+        None => {
+            if !local.iter().all(|head| heads.contains(head)) {
+                return Ok(None);
+            }
+        }
     }
     let local_set: HashSet<&ContentId> = local.iter().collect();
     let mut merged = local.to_vec();
@@ -372,8 +418,60 @@ mod tests {
         let empty = PendingPublishMarker::new(&[id(1)]);
         assert_eq!(
             known_divergence(&[id(3)], Some(&empty), Some(&moved)).unwrap(),
+            None,
+            "with nothing queued a head the local one is not among is the \
+             refresh path's business"
+        );
+    }
+
+    /// A repo whose own publish landed beside a sibling drains to an empty
+    /// queue, so the queue can no longer be what makes the divergence visible.
+    /// The recorded server heads are a strict superset of the local ones
+    /// exactly in that case.
+    #[test]
+    fn a_drained_repo_still_sees_a_sibling_head_the_server_recorded() {
+        let diverged = ServerHeadsMarker::new(vec![id(1), id(2)], None);
+        assert_eq!(
+            known_divergence(&[id(2)], None, Some(&diverged)).unwrap(),
+            Some(vec![id(2), id(1)]),
+            "the local head first, then the sibling jj has to merge"
+        );
+        // An empty chain marker is the same state as no chain at all.
+        let empty = PendingPublishMarker::new(&[id(2)]);
+        assert_eq!(
+            known_divergence(&[id(2)], Some(&empty), Some(&diverged)).unwrap(),
+            Some(vec![id(2), id(1)])
+        );
+        // Once the merge is published the two agree again and the read goes
+        // back to the local fast path — no loop, no permanent extra work.
+        let converged = ServerHeadsMarker::new(vec![id(3)], None);
+        assert_eq!(
+            known_divergence(&[id(3)], None, Some(&converged)).unwrap(),
             None
         );
+    }
+
+    /// Anything short of a strict superset is left to [`refresh_once`]: the
+    /// marker no longer describes where the local head sits, so the union is
+    /// not something this function can derive offline.
+    #[test]
+    fn a_drained_repo_does_not_merge_heads_its_local_head_is_missing_from() {
+        // The server moved off the local head entirely — a fast-forward
+        // candidate, decided by `plan_refresh` against a fresh read.
+        let moved = ServerHeadsMarker::new(vec![id(9)], None);
+        assert_eq!(
+            known_divergence(&[id(3)], None, Some(&moved)).unwrap(),
+            None
+        );
+        // A coalesced publish: the server holds a rewrite of local id(5), so
+        // the local head is legitimately absent from the recorded set.
+        let coalesced = ServerHeadsMarker::new(vec![id(1), id(9)], Some(id(5)));
+        assert_eq!(
+            known_divergence(&[id(5)], None, Some(&coalesced)).unwrap(),
+            None
+        );
+        // No marker at all says nothing about divergence.
+        assert_eq!(known_divergence(&[id(3)], None, None).unwrap(), None);
     }
 
     #[test]
@@ -401,7 +499,10 @@ mod tests {
         assert!(claim_refresh(dir).is_ok(), "first caller owns the refresh");
 
         let heads = vec![ContentId::from_bytes([7; 32])];
-        assert_eq!(record_refresh(dir, Some(heads.clone())), Some(heads.clone()));
+        assert_eq!(
+            record_refresh(dir, Some(heads.clone())),
+            Some(heads.clone())
+        );
 
         // Every later caller in this process replays it rather than falling
         // back to the local head.

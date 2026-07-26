@@ -4562,6 +4562,8 @@ impl VexClient {
             expected_op_head_ids: expected.iter().map(ToString::to_string).collect(),
             new_op_content_id: new_head.to_string(),
             new_view_content_id: new_view.to_string(),
+            divergence_ok: crate::vex_op_head_delta::divergence_ok(),
+            max_op_heads: crate::vex_op_head_delta::max_op_heads(),
         };
         let token = self.config.access_token.clone();
         let outcome = Self::shared_grpc_runtime().block_on(async move {
@@ -4609,6 +4611,8 @@ impl VexClient {
                                 .collect(),
                             new_op_content_id: new_head.to_string(),
                             new_view_content_id: new_view.to_string(),
+                            divergence_ok: crate::vex_op_head_delta::divergence_ok(),
+                            max_op_heads: crate::vex_op_head_delta::max_op_heads(),
                         },
                         self.config.access_token.as_deref(),
                     )?)

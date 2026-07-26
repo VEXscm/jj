@@ -42,6 +42,8 @@ use crate::vex::VexClient;
 use crate::vex::VexRepoConfig;
 use crate::vex_freshness::known_divergence;
 use crate::vex_freshness::refresh_once;
+use crate::vex_op_head_delta::OpHeadRefusal;
+use crate::vex_op_head_delta::classify_refusal;
 use crate::vex_publish::LOCAL_HEADS_FILE;
 use crate::vex_publish::MarkerError;
 use crate::vex_publish::PendingPublishMarker;
@@ -74,6 +76,20 @@ fn to_content_id(id: &OperationId) -> Result<jj_backend_types::ContentId, OpHead
 
 fn is_root_operation_id(id: &OperationId) -> bool {
     id.to_bytes().iter().all(|byte| *byte == 0)
+}
+
+/// Turn a refused `CommitOperation` response into the write error the caller
+/// sees, with the refusal itself as a typed source: `transaction` classifies
+/// the retry from the reason rather than the message, and the heads the server
+/// reported travel along so nothing downstream has to read them back.
+fn refusal_error(
+    response: &jj_backend_api::CommitOperationResponse,
+    new_id: &OperationId,
+) -> OpHeadsStoreError {
+    OpHeadsStoreError::Write {
+        new_op_id: new_id.clone(),
+        source: Box::new(classify_refusal(response)),
+    }
 }
 
 fn sha256_content_id(data: &[u8]) -> jj_backend_types::ContentId {
@@ -410,12 +426,23 @@ impl VexOpHeadsStore {
     /// requires a published operation's parents to *cover* the CAS expectation
     /// rather than equal it.
     ///
-    /// Returns the new head on success. Every failure returns `None` so the
-    /// caller falls back to serving local heads — a stale view is worse than
-    /// nothing, but it is much better than a failed command.
+    /// Returns the heads to serve on success. Every failure returns `None` so
+    /// the caller falls back to serving local heads — a stale view is worse
+    /// than nothing, but it is much better than a failed command.
+    ///
+    /// A divergent server is served rather than folded. Building the
+    /// registration on one of several heads would publish an operation whose
+    /// view descends from that head alone, silently dropping what the others
+    /// carry; merging views is jj's job, not this function's. Reporting the
+    /// server's heads alongside the local one hands the merge to
+    /// `resolve_op_heads`, which is the same answer the deferred-publish path
+    /// gives for the same situation. Doing anything else would mean an unfolded
+    /// clone serves its clone-time head for as long as the repository is
+    /// divergent — and divergence is now an ordinary state, not a rare one.
     async fn fold_registration_onto_moved_head(
         &self,
         marker: &PendingRegistration,
+        local: &[jj_backend_types::ContentId],
     ) -> Option<Vec<jj_backend_types::ContentId>> {
         let pending_hex = marker.pending_op_id.as_deref()?;
         let pending_op = jj_backend_types::ContentId::from_hex(pending_hex).ok()?;
@@ -427,9 +454,9 @@ impl VexOpHeadsStore {
 
         let budget = crate::vex_freshness::unfolded_clone_refresh_budget();
         let current = self.client.get_op_heads_within(budget).ok().flatten()?;
-        let [head] = current.as_slice() else {
+        if current.is_empty() {
             return None;
-        };
+        }
         if recorded.iter().collect::<std::collections::HashSet<_>>()
             == current.iter().collect::<std::collections::HashSet<_>>()
         {
@@ -437,6 +464,15 @@ impl VexOpHeadsStore {
             // local registration head is already the freshest view available.
             return None;
         }
+        let [head] = current.as_slice() else {
+            let merged = crate::vex_op_head_delta::heads_with_local(local, &current);
+            tracing::debug!(
+                workspace = marker.workspace_name,
+                server_heads = current.len(),
+                "server is divergent; serving its heads with the local one so jj merges them"
+            );
+            return Some(merged);
+        };
 
         let dummy = OperationId::new(pending_op.as_bytes().to_vec());
         let head_operation = self.read_operation_object(head, &dummy).await.ok()?;
@@ -516,11 +552,14 @@ impl VexOpHeadsStore {
             source: Box::new(std::io::Error::other(message)),
         };
         let [head] = current_heads else {
-            return Err(write_err(format!(
-                "cannot republish deferred workspace registration: expected exactly one server \
-                 op head, got {}",
-                current_heads.len()
-            )));
+            // Rebuilding on one of several heads would publish a registration
+            // whose view descends from that head alone. Report the divergence
+            // as the retryable conflict it is instead: the reload the caller
+            // performs runs jj's own op-head resolution, which merges the heads
+            // back down to one and makes the rebuild well defined.
+            return Err(write_err(
+                crate::vex_op_head_delta::divergent_registration_conflict(current_heads.len()),
+            ));
         };
         let head_operation = self.read_operation_object(head, new_id).await?;
         let head_view = self
@@ -638,6 +677,23 @@ impl VexOpHeadsStore {
         if current_heads == [pending_op] {
             return self.clear_deferred_registration(new_id);
         }
+        let refusal = classify_refusal(&response);
+        if refusal.refusal() == OpHeadRefusal::HeadSetSaturated {
+            // Rebuilding the registration on the heads the server just reported
+            // would only ask for another head on a repository that has no room
+            // for one, so there is nothing to retry here and no reason to spend
+            // a second read learning heads we were already told. Surface the
+            // saturation; the reload the caller performs is what merges the
+            // divergence away.
+            return Err(refusal_error(&response, new_id));
+        }
+        if current_heads.len() > 1 {
+            // Every rebuild below needs a single head to build the registration
+            // view on, so a divergent repository would spend the whole retry
+            // budget re-learning the same thing. Surface the conflict now; the
+            // caller's reload merges the heads and the next fold has one.
+            return Err(refusal_error(&response, new_id));
+        }
         // Losing this race is ordinary contention, not a failure: several
         // clones folding their registrations at once all target the same head,
         // so all but one lose. Rebuilding on whatever the server holds now and
@@ -738,7 +794,7 @@ impl VexOpHeadsStore {
             Some(chain) if !chain.is_empty() => self.rebase_chain_base(chain, expected, state),
             _ => self.start_chain(expected, state, new_id)?,
         };
-        chain.push(&new_content_id, &objects);
+        chain.push_pruning(&new_content_id, expected, &objects);
         crate::vex_publish::write_pending_publish(&self.store_dir, &chain)
             .map_err(|err| write_err(Box::new(err)))?;
         self.write_local_heads(new_id)
@@ -772,7 +828,15 @@ impl VexOpHeadsStore {
             && let Ok(pending) = jj_backend_types::ContentId::from_hex(pending)
         {
             chain.base_heads = marker.server_head_ids.clone();
-            chain.push(&pending, &[]);
+            // The registration's parents are exactly the server heads it was
+            // built on, which is therefore the only removal set it can be
+            // published with.
+            let removes: Vec<_> = marker
+                .server_head_ids
+                .iter()
+                .filter_map(|id| jj_backend_types::ContentId::from_hex(id).ok())
+                .collect();
+            chain.push_pruning(&pending, &removes, &[]);
         }
         Ok(chain)
     }
@@ -920,10 +984,7 @@ impl VexOpHeadsStore {
         if response.ok {
             Ok(())
         } else {
-            Err(OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(std::io::Error::other(response.error_message)),
-            })
+            Err(refusal_error(&response, new_id))
         }
     }
 }
@@ -1015,7 +1076,10 @@ impl OpHeadsStore for VexOpHeadsStore {
                 // registration onto whatever the server holds now, which
                 // rejoins its lineage; a lost race or an unreachable server
                 // just falls through to the local head, exactly as before.
-                if let Some(heads) = self.fold_registration_onto_moved_head(&marker).await {
+                if let Some(heads) = self
+                    .fold_registration_onto_moved_head(&marker, &local_ids)
+                    .await
+                {
                     return Ok(heads.iter().map(op_id_from_content_id).collect());
                 }
                 return Ok(local);
@@ -1396,11 +1460,14 @@ mod tests {
         )
         .unwrap();
         let mut chain = PendingPublishMarker::new(&[content_id(1)]);
-        chain.push(&content_id(2), &[]);
+        chain.push_pruning(&content_id(2), &[content_id(1)], &[]);
         crate::vex_publish::write_pending_publish(temp.path(), &chain).unwrap();
 
         assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![op_id(2)]);
-        assert!(pending_chain(temp.path()).is_some(), "the queue is untouched");
+        assert!(
+            pending_chain(temp.path()).is_some(),
+            "the queue is untouched"
+        );
     }
 
     /// The configured endpoint is unroutable, so a resolution that returned
@@ -1548,5 +1615,92 @@ mod tests {
             wc_commit_ids: BTreeMap::new(),
         };
         assert!(registration_view_on_head(head_view, &pending_view, "unknown").is_err());
+    }
+
+    /// A refused `CommitOperation` response, as the server sends it.
+    fn refusal_response(
+        reason: jj_backend_api::CommitOperationFailureReason,
+        heads: &[jj_backend_types::ContentId],
+        limit: u32,
+    ) -> jj_backend_api::CommitOperationResponse {
+        jj_backend_api::CommitOperationResponse {
+            ok: false,
+            current_op_head_ids: heads.iter().map(ToString::to_string).collect(),
+            error_message: "CAS conflict on op heads".to_string(),
+            failure_reason: reason as i32,
+            effective_max_op_heads: limit,
+            divergence_applied: false,
+        }
+    }
+
+    fn conflict_source(error: &OpHeadsStoreError) -> &crate::vex_op_head_delta::OpHeadCasConflict {
+        let OpHeadsStoreError::Write { source, .. } = error else {
+            panic!("expected a write error, got {error:?}");
+        };
+        source
+            .downcast_ref::<crate::vex_op_head_delta::OpHeadCasConflict>()
+            .expect("the refusal should travel as a typed source")
+    }
+
+    #[test]
+    fn every_publish_asks_for_the_delta_semantics_by_default() {
+        // The process environment is untouched here, which is the fleet
+        // default; the opt-out values are covered in `vex_op_head_delta`.
+        assert!(crate::vex_op_head_delta::divergence_ok());
+        assert_eq!(crate::vex_op_head_delta::max_op_heads(), 0);
+    }
+
+    #[test]
+    fn a_precondition_refusal_is_the_same_conflict_as_before() {
+        let error = refusal_error(
+            &refusal_response(
+                jj_backend_api::CommitOperationFailureReason::PreconditionUnmet,
+                &[content_id(1)],
+                32,
+            ),
+            &op_id(2),
+        );
+        // The message every out-of-crate retry loop still matches on.
+        assert_eq!(
+            conflict_source(&error).to_string(),
+            "CAS conflict on op heads"
+        );
+        assert_eq!(
+            conflict_source(&error).refusal(),
+            crate::vex_op_head_delta::OpHeadRefusal::PreconditionUnmet
+        );
+        assert!(crate::transaction::is_op_heads_cas_conflict(
+            &crate::transaction::TransactionCommitError::OpHeadsStore(error)
+        ));
+    }
+
+    #[test]
+    fn a_saturation_refusal_names_itself_and_carries_the_heads_to_retry_from() {
+        let error = refusal_error(
+            &refusal_response(
+                jj_backend_api::CommitOperationFailureReason::HeadSetBoundExceeded,
+                &[content_id(1), content_id(2)],
+                2,
+            ),
+            &op_id(3),
+        );
+        let conflict = conflict_source(&error);
+        assert_eq!(
+            conflict.refusal(),
+            crate::vex_op_head_delta::OpHeadRefusal::HeadSetSaturated
+        );
+        // Reconciliation reads the live heads off the refusal itself, so the
+        // retry costs no extra round trip.
+        assert_eq!(
+            conflict.current_heads(),
+            [content_id(1).to_string(), content_id(2).to_string()]
+        );
+        let message = conflict.to_string();
+        assert!(message.contains("saturated"), "{message}");
+        assert!(!message.contains("head keeps moving"), "{message}");
+        // Still retryable: the reload merges the divergence back down.
+        assert!(crate::transaction::is_op_heads_cas_conflict(
+            &crate::transaction::TransactionCommitError::OpHeadsStore(error)
+        ));
     }
 }

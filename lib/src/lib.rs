@@ -118,6 +118,7 @@ pub mod union_find;
 pub mod vex;
 pub mod vex_backend;
 pub mod vex_freshness;
+pub mod vex_op_head_delta;
 pub mod vex_op_heads_store;
 pub mod vex_op_store;
 pub mod vex_publish;

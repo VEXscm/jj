@@ -73,10 +73,34 @@ pub const PENDING_PUBLISH_FILE: &str = "vex-pending-publish";
 /// Last confirmed server op-head set, and which local operation it stands for.
 pub const SERVER_HEADS_FILE: &str = "vex-server-heads";
 
-/// Marker schema version. Bump only for an incompatible change: an older
-/// client reading a newer marker falls back to synchronous publication rather
-/// than misreading it.
-pub const MARKER_VERSION: u32 = 1;
+/// Marker schema versions written by this client. Each file carries its own:
+/// they are separate schemas that happen to share a write discipline, and a
+/// shared constant would version-bump a file whose contents never changed.
+/// That is not cosmetic — a marker is read by whatever binary the user is
+/// running, and rolling the CLI *back* is the recovery path. An older binary
+/// reading a version it does not know returns
+/// [`MarkerError::UnsupportedVersion`], which [`VexPublisher::drain`]
+/// propagates, so every sync barrier fails hard until the file is deleted by
+/// hand and locally committed operations stop reaching the server for the
+/// whole rollback window. A file only moves when its own schema does.
+///
+/// [`PendingPublishMarker`] is at v2: it added [`PendingOpEntry::removes`],
+/// the removal set jj asked for.
+pub const PENDING_PUBLISH_MARKER_VERSION: u32 = 2;
+
+/// Oldest [`PendingPublishMarker`] version this client still reads. A version
+/// bump must not strand a queue that is already on disk: falling back to
+/// synchronous publication leaves the queued operations unpublished and
+/// unreachable — the sync read path skips a queue it cannot parse — so every
+/// version whose meaning this client can still reconstruct is accepted and
+/// rewritten at [`PENDING_PUBLISH_MARKER_VERSION`] by the next write. A v1
+/// entry carries no removal set, and its parents are exactly what a v1 client
+/// would have sent for it.
+pub const MIN_PENDING_PUBLISH_MARKER_VERSION: u32 = 1;
+
+/// [`ServerHeadsMarker`]'s schema is unchanged, so it stays at v1 and an older
+/// binary keeps reading it exactly as it always has.
+pub const SERVER_HEADS_MARKER_VERSION: u32 = 1;
 
 /// Objects per `put_objects` call while draining a queue. Sized so a batch
 /// completes well inside the public edge's request timeout even on a slow link;
@@ -276,6 +300,10 @@ impl From<std::io::Error> for MarkerError {
 
 trait VersionedMarker: DeserializeOwned + Serialize {
     const FILE: &'static str;
+    /// The version this client writes.
+    const VERSION: u32;
+    /// The oldest version it still reads.
+    const MIN_VERSION: u32;
     fn version(&self) -> u32;
 }
 
@@ -300,6 +328,8 @@ pub struct ServerHeadsMarker {
 
 impl VersionedMarker for ServerHeadsMarker {
     const FILE: &'static str = SERVER_HEADS_FILE;
+    const VERSION: u32 = SERVER_HEADS_MARKER_VERSION;
+    const MIN_VERSION: u32 = SERVER_HEADS_MARKER_VERSION;
 
     fn version(&self) -> u32 {
         self.v
@@ -309,7 +339,7 @@ impl VersionedMarker for ServerHeadsMarker {
 impl ServerHeadsMarker {
     pub fn new(heads: Vec<ContentId>, published_local_head: Option<ContentId>) -> Self {
         Self {
-            v: MARKER_VERSION,
+            v: SERVER_HEADS_MARKER_VERSION,
             heads: heads.iter().map(ToString::to_string).collect(),
             published_local_head: published_local_head.map(|id| id.to_string()),
             updated_unix: SystemTime::now()
@@ -333,11 +363,29 @@ impl ServerHeadsMarker {
 }
 
 /// One locally committed, unpublished operation and the objects it introduced.
+///
+/// `removes` is the other half of jj's `update_op_heads(old_ids, new_id)`
+/// delta: the heads that operation asked to retire. It has to be carried,
+/// because it is not derivable from the operation. jj's ancestor-prune sends
+/// removals that are *transitive* ancestors of the added head, and its merge
+/// publish sends those ancestors alongside the merge's parents; re-deriving
+/// the removal set from the queued operation's parents silently discards both,
+/// so a prune can never leave the queue and a stale head can never be dropped.
+/// Empty means "this entry predates v2" — see
+/// [`MIN_PENDING_PUBLISH_MARKER_VERSION`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PendingOpEntry {
     pub op: String,
     #[serde(default)]
+    pub removes: Vec<String>,
+    #[serde(default)]
     pub objects: Vec<PendingObject>,
+}
+
+impl PendingOpEntry {
+    pub fn removal_ids(&self) -> Result<Vec<ContentId>, MarkerError> {
+        parse_ids(PENDING_PUBLISH_FILE, &self.removes)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -366,6 +414,8 @@ pub struct PendingPublishMarker {
 
 impl VersionedMarker for PendingPublishMarker {
     const FILE: &'static str = PENDING_PUBLISH_FILE;
+    const VERSION: u32 = PENDING_PUBLISH_MARKER_VERSION;
+    const MIN_VERSION: u32 = MIN_PENDING_PUBLISH_MARKER_VERSION;
 
     fn version(&self) -> u32 {
         self.v
@@ -375,7 +425,7 @@ impl VersionedMarker for PendingPublishMarker {
 impl PendingPublishMarker {
     pub fn new(base_heads: &[ContentId]) -> Self {
         Self {
-            v: MARKER_VERSION,
+            v: PENDING_PUBLISH_MARKER_VERSION,
             base_heads: base_heads.iter().map(ToString::to_string).collect(),
             ops: Vec::new(),
         }
@@ -394,17 +444,59 @@ impl PendingPublishMarker {
         self.ops.iter().any(|entry| entry.op == hex)
     }
 
+    /// Queue an operation whose removal set is its own parents — jj's ordinary
+    /// transaction shape (`update_op_heads(parent_ids, id)`), and the only one
+    /// a v1 marker could hold.
     pub fn push(&mut self, op: &ContentId, objects: &[(ObjectKind, ContentId)]) {
-        self.ops.push(PendingOpEntry {
-            op: op.to_string(),
-            objects: objects
-                .iter()
-                .map(|(kind, id)| PendingObject {
-                    kind: kind_to_str(*kind).to_string(),
-                    id: id.to_string(),
-                })
-                .collect(),
-        });
+        self.push_pruning(op, &[], objects);
+    }
+
+    /// Queue `op`, to be published with `removes` as its CAS removal set.
+    ///
+    /// Idempotent in the operation id. A chain that cannot drain is re-walked
+    /// by every later command, and jj re-emits the same reconciliation each
+    /// time, so appending unconditionally grows the queue by one duplicate
+    /// entry per command. A repeat unions what it asked for into the entry
+    /// already queued instead: a second sighting can name removals or objects
+    /// the first did not.
+    pub fn push_pruning(
+        &mut self,
+        op: &ContentId,
+        removes: &[ContentId],
+        objects: &[(ObjectKind, ContentId)],
+    ) {
+        let hex = op.to_string();
+        let position = match self.ops.iter().position(|entry| entry.op == hex) {
+            Some(position) => position,
+            None => {
+                self.ops.push(PendingOpEntry {
+                    op: hex.clone(),
+                    removes: Vec::new(),
+                    objects: Vec::new(),
+                });
+                self.ops.len() - 1
+            }
+        };
+        let entry = &mut self.ops[position];
+        // An operation never retires itself; jj's own contract forbids it and
+        // the backend ignores it, so dropping it here keeps the marker honest.
+        for id in removes
+            .iter()
+            .map(ToString::to_string)
+            .filter(|id| *id != hex)
+        {
+            if !entry.removes.contains(&id) {
+                entry.removes.push(id);
+            }
+        }
+        for object in objects.iter().map(|(kind, id)| PendingObject {
+            kind: kind_to_str(*kind).to_string(),
+            id: id.to_string(),
+        }) {
+            if !entry.objects.contains(&object) {
+                entry.objects.push(object);
+            }
+        }
     }
 }
 
@@ -434,7 +526,7 @@ fn read_marker<T: VersionedMarker>(dir: &Path) -> Result<Option<T>, MarkerError>
         file: T::FILE,
         message: err.to_string(),
     })?;
-    if marker.version() != MARKER_VERSION {
+    if !(T::MIN_VERSION..=T::VERSION).contains(&marker.version()) {
         return Err(MarkerError::UnsupportedVersion {
             file: T::FILE,
             version: marker.version(),
@@ -549,11 +641,51 @@ fn is_root_content_id(id: &ContentId) -> bool {
 }
 
 /// Result of one `commit_op_heads` CAS.
+///
+/// `current_heads` is the head set the server reported alongside its answer:
+/// on an accepted publish that is the *resulting* set — which under the delta
+/// contract can hold sibling heads besides the one just published — and on a
+/// refusal it is what was live when the server refused. Either way it is the
+/// authority on what the server holds, so the drain records and reconciles
+/// from it rather than inferring a single head or issuing a second read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CasOutcome {
     pub ok: bool,
     pub current_heads: Vec<ContentId>,
+    /// Why the server refused, when it did. `None` on an accepted publish, and
+    /// also on a refusal from a server too old to say — such a server is
+    /// treated as the ordinary precondition failure it has always been by
+    /// [`crate::vex_op_head_delta::classify_refusal`], which never yields
+    /// `None`.
+    pub refusal: Option<crate::vex_op_head_delta::OpHeadRefusal>,
     pub error_message: String,
+}
+
+impl CasOutcome {
+    /// Whether the refusal was the head set already standing at its bound.
+    ///
+    /// Worth separating from ordinary contention: no amount of retrying the
+    /// same publish clears it, and the head set the server returned is the one
+    /// this repo has to merge down, so the drain reconciles from that set
+    /// directly instead of re-reading heads that cannot have changed in its
+    /// favour.
+    fn is_saturated(&self) -> bool {
+        matches!(
+            self.refusal,
+            Some(crate::vex_op_head_delta::OpHeadRefusal::HeadSetSaturated)
+        )
+    }
+
+    /// The head set to record after this CAS was accepted. A server that
+    /// reported nothing (an old one, or a fake in a test) leaves the published
+    /// head as the only thing known to be live.
+    fn resulting_heads(&self, published: &ContentId) -> Vec<ContentId> {
+        if self.current_heads.is_empty() {
+            vec![*published]
+        } else {
+            self.current_heads.clone()
+        }
+    }
 }
 
 /// The backend operations the publisher needs. A trait so the publisher's
@@ -738,7 +870,7 @@ impl<'a> VexPublisher<'a> {
     }
 
     /// Publish each queued operation under its own id, in order, with
-    /// `expected` set to that operation's real parents.
+    /// `expected` set to the removal set jj asked for.
     ///
     /// This is the only strategy that cannot diverge. Operation ids are
     /// preserved end to end, so the server head after a drain is literally the
@@ -759,32 +891,81 @@ impl<'a> VexPublisher<'a> {
         while let Some(entry) = chain.ops.first() {
             let id = ContentId::from_hex(&entry.op)
                 .map_err(|err| PublishError::Corrupt(format!("invalid pending op id: {err}")))?;
+            let removes = entry.removal_ids()?;
             let operation = self.read_operation(&id)?;
             let view = content_id_from_view_id(&operation.view_id)
                 .ok_or_else(|| PublishError::Corrupt("invalid view id length".to_string()))?;
-            let expected = operation_parents(&operation);
+            // The removal set travels with the entry. Re-deriving it from the
+            // operation's parents is only correct for jj's plain transaction
+            // shape; for an ancestor-prune it drops the prune outright, which
+            // leaves the stale head on the server forever and re-queues the
+            // same operation on every later command. A v1 entry recorded none,
+            // and its parents are what the client that queued it would have
+            // sent.
+            let expected = if removes.is_empty() {
+                operation_parents(&operation)
+            } else {
+                removes
+            };
 
             let outcome = self.commit_repairing_missing_objects(&expected, &id, &view).await?;
             if outcome.ok || outcome.current_heads == [id] {
                 chain.ops.remove(0);
-                self.commit_progress(&chain, &id, first_queued.as_deref())?;
+                let resulting = outcome.resulting_heads(&id);
+                self.commit_progress(&chain, &id, &resulting, first_queued.as_deref())?;
                 published += 1;
                 head = Some(id);
                 continue;
             }
 
             stats.publish_cas_conflicts.fetch_add(1, Ordering::Relaxed);
-            let server_heads = self.transport.get_op_heads().await?;
+            // A saturated head set is not contention: the server named the
+            // heads that made it saturated, and re-reading them would only
+            // return the same set one round trip later. Reconcile from what it
+            // already handed back — merging those heads down is the only thing
+            // that clears the condition, and that is exactly what the fold and
+            // merge-forward paths below do.
+            let server_heads = if outcome.is_saturated() && !outcome.current_heads.is_empty() {
+                outcome.current_heads.clone()
+            } else {
+                self.transport.get_op_heads().await?
+            };
             // A previous drain may have published further down the chain than
             // its marker update recorded. Resume from wherever the server got
             // to rather than republishing.
+            //
+            // The queued operation only has to be *among* the server's heads,
+            // not its whole head set: under the delta contract a sibling head
+            // published by another writer sits beside ours, and dead-ending on
+            // its presence would strand a chain that has in fact advanced. The
+            // sibling is carried into the recorded head set, so the next repo
+            // load serves both and jj merges them.
+            //
+            // Its presence is not on its own enough, though: this is the
+            // server's `delta_already_applied`, and it has the second half for
+            // a reason. A prune re-publishes a head the repository already
+            // holds, so "my operation is live" is true of a prune *by
+            // construction* — including the prune the server just refused.
+            // Folding on that alone would drop the refused prune, report it
+            // published, and leave the stale head standing for every later
+            // command to re-emit. The removal set has to have landed too.
+            let live = id_set(&server_heads);
             if let Some(index) = chain.ops.iter().position(|queued| {
-                server_heads.len() == 1 && queued.op == server_heads[0].to_string()
+                live.contains(&queued.op)
+                    && !queued.removes.iter().any(|removed| live.contains(removed))
             }) {
+                let published_head = ContentId::from_hex(&chain.ops[index].op).map_err(|err| {
+                    PublishError::Corrupt(format!("invalid pending op id: {err}"))
+                })?;
                 chain.ops.drain(..=index);
-                self.commit_progress(&chain, &server_heads[0], first_queued.as_deref())?;
+                self.commit_progress(
+                    &chain,
+                    &published_head,
+                    &server_heads,
+                    first_queued.as_deref(),
+                )?;
                 published += index + 1;
-                head = Some(server_heads[0]);
+                head = Some(published_head);
                 stats.publish_folds.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -800,7 +981,8 @@ impl<'a> VexPublisher<'a> {
                     .await?;
                 if outcome.ok || outcome.current_heads == [merge.id] {
                     chain.ops.drain(..=index);
-                    self.commit_progress(&chain, &merge.id, first_queued.as_deref())?;
+                    let resulting = outcome.resulting_heads(&merge.id);
+                    self.commit_progress(&chain, &merge.id, &resulting, first_queued.as_deref())?;
                     published += index + 1;
                     head = Some(merge.id);
                     stats.publish_folds.fetch_add(1, Ordering::Relaxed);
@@ -835,16 +1017,30 @@ impl<'a> VexPublisher<'a> {
         }
     }
 
-    /// Persist the drain's progress: the server is now at `head`, and only the
-    /// operations still in `chain` remain queued. Written after every CAS so a
-    /// crash mid-drain resumes instead of replaying.
+    /// Persist the drain's progress: the operation this repo got onto the
+    /// server is `head`, the server's whole head set is now `server_heads`, and
+    /// only the operations still in `chain` remain queued. Written after every
+    /// CAS so a crash mid-drain resumes instead of replaying.
+    ///
+    /// The two are not the same set once divergence is permitted. `head` is
+    /// what the rest of the chain is parented on, so it is what the chain's
+    /// base becomes; `server_heads` may additionally hold siblings published by
+    /// other writers, and recording those is what lets
+    /// [`crate::vex_freshness::known_divergence`] see the divergence and serve
+    /// both sides for jj to merge. Recording only `head` would make the base
+    /// and the marker agree by construction and report a divergent repository
+    /// as converged.
     fn commit_progress(
         &self,
         chain: &PendingPublishMarker,
         head: &ContentId,
+        server_heads: &[ContentId],
         first_queued: Option<&str>,
     ) -> Result<(), PublishError> {
-        write_server_heads(self.dir, &ServerHeadsMarker::new(vec![*head], None))?;
+        write_server_heads(
+            self.dir,
+            &ServerHeadsMarker::new(server_heads.to_vec(), None),
+        )?;
         if chain.is_empty() {
             remove_marker(self.dir, PENDING_PUBLISH_FILE)?;
             self.clear_folded_registration(first_queued)?;
@@ -884,12 +1080,20 @@ impl<'a> VexPublisher<'a> {
             let (head, view, coalesced) = self.head_to_publish(&tip, &base).await?;
             let outcome = self.transport.commit_op_heads(&base, &head, &view).await?;
             if outcome.ok || outcome.current_heads == [head] {
-                return self.record_published(&chain, &tip.id, &head, coalesced, start);
+                let resulting = outcome.resulting_heads(&head);
+                return self.record_published(&chain, &tip.id, &head, &resulting, coalesced, start);
             }
             stats.publish_cas_conflicts.fetch_add(1, Ordering::Relaxed);
             let server_heads = self.transport.get_op_heads().await?;
             if server_heads == [head] {
-                return self.record_published(&chain, &tip.id, &head, coalesced, start);
+                return self.record_published(
+                    &chain,
+                    &tip.id,
+                    &head,
+                    &server_heads,
+                    coalesced,
+                    start,
+                );
             }
             match self.refold(&mut chain, &server_heads, &tip)? {
                 Some(new_base) if attempt + 1 < MAX_PUBLISH_ATTEMPTS => {
@@ -1174,13 +1378,14 @@ impl<'a> VexPublisher<'a> {
         chain: &PendingPublishMarker,
         local_tip: &ContentId,
         head: &ContentId,
+        server_heads: &[ContentId],
         coalesced: bool,
         start: Instant,
     ) -> Result<PublishOutcome, PublishError> {
         let published_local_head = (head != local_tip).then_some(*local_tip);
         write_server_heads(
             self.dir,
-            &ServerHeadsMarker::new(vec![*head], published_local_head),
+            &ServerHeadsMarker::new(server_heads.to_vec(), published_local_head),
         )?;
         remove_marker(self.dir, PENDING_PUBLISH_FILE)?;
         self.clear_folded_registration(chain.ops.first().map(|entry| entry.op.as_str()))?;
@@ -1360,9 +1565,12 @@ impl PublishTransport for VexClientTransport<'_> {
                     .map_err(|err| PublishError::Corrupt(format!("invalid op head: {err}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let refusal =
+            (!response.ok).then(|| crate::vex_op_head_delta::classify_refusal(&response).refusal());
         Ok(CasOutcome {
             ok: response.ok,
             current_heads,
+            refusal,
             error_message: response.error_message,
         })
     }
@@ -1477,11 +1685,67 @@ mod tests {
         /// 1-based CAS call number that simulates a backend accepting the
         /// call and never answering within its deadline.
         deadline_on_call: Option<usize>,
+        /// Head sets the next CAS attempts are refused against with
+        /// `HEAD_SET_BOUND_EXCEEDED`, popped in order. Unlike `cas_conflicts`
+        /// these do *not* become the fake's live heads, so a drain that reads
+        /// heads again instead of reconciling from the refusal is visible.
+        saturations: Vec<Vec<ContentId>>,
+        /// Whether a CAS whose expected heads are no longer live is accepted
+        /// as a *sibling* rather than refused — the delta contract the fleet
+        /// runs under (`divergence_ok`), where the precondition is only that
+        /// the expected heads be ancestor-or-self of the new operation, which
+        /// the parent-covering check below already establishes.
+        ///
+        /// Off by default because the reconciliation tests in this module
+        /// deliberately pin the refusal behaviour, and a fake that silently
+        /// accepted their CASes would stop exercising the fold and
+        /// merge-forward paths at all. Turned on by the tests that are about
+        /// divergence itself.
+        divergence_ok: bool,
     }
 
     #[derive(Default)]
     struct FakeTransport {
         state: Mutex<FakeState>,
+    }
+
+    /// Whether every id `expected` retires is ancestor-or-self of `new_head`,
+    /// walked over the fake's own operation objects the way the service walks
+    /// real parent edges. An operation whose bytes are absent is a dead
+    /// branch, exactly as it is server-side: an unreadable ancestor cannot
+    /// prove reachability.
+    fn removals_are_ancestors(
+        state: &FakeState,
+        new_head: &ContentId,
+        expected: &[ContentId],
+    ) -> bool {
+        let mut remaining: std::collections::HashSet<ContentId> = expected
+            .iter()
+            .copied()
+            .filter(|id| id != new_head && !is_root_content_id(id))
+            .collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut frontier = vec![*new_head];
+        while let Some(id) = frontier.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            remaining.remove(&id);
+            if remaining.is_empty() {
+                return true;
+            }
+            let Some(bytes) = state.objects.get(&(ObjectKind::Op, id)) else {
+                continue;
+            };
+            let Ok(proto) = crate::protos::simple_op_store::Operation::decode(&**bytes) else {
+                continue;
+            };
+            let Ok(operation) = operation_from_proto(proto) else {
+                continue;
+            };
+            frontier.extend(operation_parents(&operation));
+        }
+        remaining.is_empty()
     }
 
     impl FakeTransport {
@@ -1500,6 +1764,13 @@ mod tests {
 
         fn set_heads(&self, heads: Vec<ContentId>) {
             self.state.lock().unwrap().heads = heads;
+        }
+
+        /// Serve the delta contract: a publish whose expected heads have
+        /// already been superseded lands beside the live ones instead of
+        /// being refused. See [`FakeState::divergence_ok`].
+        fn accept_divergent_publishes(&self) {
+            self.state.lock().unwrap().divergence_ok = true;
         }
 
         fn heads(&self) -> Vec<ContentId> {
@@ -1552,17 +1823,31 @@ mod tests {
                     budget: Duration::from_secs(30),
                 });
             }
-            // The backend's parent contract, mirrored so the client tests are
-            // held to the same rule the service enforces
-            // (`ensure_operation_matches_expected_heads`): the new
-            // operation's parents must *cover* the CAS expectation. Extra
-            // parents — which is what a merge operation has — are allowed;
-            // dropping an expected head is not. A violation is a validation
-            // error, not a CAS conflict, exactly as in `commit_operation`.
-            if let Some(bytes) = state.objects.get(&(ObjectKind::Op, *new_head)).cloned()
+            // The backend's precondition on the removal set, mirrored so the
+            // client tests are held to the same rule the service enforces. A
+            // violation is a validation error, not a CAS conflict, exactly as
+            // in `commit_operation`.
+            if state.divergence_ok {
+                // The delta contract: every id the publish retires must be
+                // ancestor-or-self of the one it adds, which the service
+                // proves with a bounded walk over real parent edges
+                // (`check_precondition`). This is what makes jj's
+                // ancestor-prune — whose removals are transitive ancestors,
+                // not parents — expressible at all.
+                if !removals_are_ancestors(&state, new_head, expected) {
+                    return Err(PublishError::Transport(format!(
+                        "expected operation heads {:?} are not ancestor-or-self of {new_head}",
+                        id_set(expected)
+                    )));
+                }
+            } else if let Some(bytes) = state.objects.get(&(ObjectKind::Op, *new_head)).cloned()
                 && let Ok(proto) = crate::protos::simple_op_store::Operation::decode(&*bytes)
                 && let Ok(operation) = operation_from_proto(proto)
             {
+                // Set equality (`ensure_operation_matches_expected_heads`):
+                // the new operation's parents must *cover* the CAS
+                // expectation. Extra parents — which is what a merge operation
+                // has — are allowed; dropping an expected head is not.
                 let parents = id_set(&operation_parents(&operation));
                 let expected_set = id_set(expected);
                 let covered = if expected_set.is_empty() {
@@ -1577,26 +1862,56 @@ mod tests {
                     )));
                 }
             }
+            if let Some(saturated) = state.saturations.pop() {
+                return Ok(CasOutcome {
+                    ok: false,
+                    current_heads: saturated,
+                    refusal: Some(crate::vex_op_head_delta::OpHeadRefusal::HeadSetSaturated),
+                    error_message: "op head set bound exceeded".to_string(),
+                });
+            }
             if let Some(conflict) = state.cas_conflicts.pop() {
                 state.heads = conflict.clone();
                 return Ok(CasOutcome {
                     ok: false,
                     current_heads: conflict,
+                    refusal: Some(crate::vex_op_head_delta::OpHeadRefusal::PreconditionUnmet),
                     error_message: "cas conflict".to_string(),
                 });
             }
-            if id_set(&state.heads) != id_set(expected) {
+            // The backend's precondition, mirrored: every head the publish
+            // names must still be live. Heads it does not name are *not* a
+            // conflict — that is the whole point of the delta contract — they
+            // simply stay where they are, beside the newly added one.
+            let live = id_set(&state.heads);
+            let named = id_set(expected);
+            let satisfied = if named.is_empty() {
+                live.is_empty()
+            } else {
+                state.divergence_ok || named.is_subset(&live)
+            };
+            if !satisfied {
                 let current = state.heads.clone();
                 return Ok(CasOutcome {
                     ok: false,
                     current_heads: current,
+                    refusal: Some(crate::vex_op_head_delta::OpHeadRefusal::PreconditionUnmet),
                     error_message: "cas conflict".to_string(),
                 });
             }
-            state.heads = vec![*new_head];
+            state
+                .heads
+                .retain(|head| !named.contains(&head.to_string()));
+            // A pure prune re-publishes a head that is already live, so adding
+            // it back unconditionally would duplicate it.
+            if !state.heads.contains(new_head) {
+                state.heads.push(*new_head);
+            }
+            let current = state.heads.clone();
             Ok(CasOutcome {
                 ok: true,
-                current_heads: vec![*new_head],
+                current_heads: current,
+                refusal: None,
                 error_message: String::new(),
             })
         }
@@ -1622,7 +1937,7 @@ mod tests {
         for index in 0..count {
             let op = operation(100 + index as u8, &[parent]);
             let op_id = fake.stage_operation(&op);
-            marker.push(&op_id, &[(ObjectKind::Op, op_id)]);
+            marker.push_pruning(&op_id, &[parent], &[(ObjectKind::Op, op_id)]);
             ids.push(op_id);
             parent = op_id;
         }
@@ -1711,6 +2026,42 @@ mod tests {
         assert!(matches!(
             read_pending_publish(dir),
             Err(MarkerError::Corrupt { .. })
+        ));
+    }
+
+    /// The two markers are separate schemas, and only the queue's changed.
+    ///
+    /// Rolling the CLI back is the recovery path for a bad release, so a
+    /// binary that predates this change has to keep reading everything it
+    /// wrote. It rejects any version it does not know, and `drain` propagates
+    /// that rejection to every sync barrier — `vex push`, `vex land`, the
+    /// durability commands — so a gratuitous bump on the unchanged file would
+    /// wedge the rollback until someone deleted it by hand.
+    #[test]
+    fn the_server_heads_marker_is_still_written_at_v1() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+
+        write_server_heads(dir, &ServerHeadsMarker::new(vec![id(1)], None)).unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(SERVER_HEADS_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(on_disk["v"], serde_json::json!(1));
+
+        // The queue moved on its own, and a reader holds each file to its own
+        // schema rather than to a shared high-water mark.
+        let mut chain = PendingPublishMarker::new(&[id(1)]);
+        chain.push_pruning(&id(3), &[id(1)], &[]);
+        write_pending_publish(dir, &chain).unwrap();
+        let queued: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(PENDING_PUBLISH_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(queued["v"], serde_json::json!(2));
+
+        std::fs::write(dir.join(SERVER_HEADS_FILE), r#"{"v":2,"heads":[]}"#).unwrap();
+        assert!(matches!(
+            read_server_heads(dir),
+            Err(MarkerError::UnsupportedVersion { .. })
         ));
     }
 
@@ -1901,7 +2252,7 @@ mod tests {
         let mut marker = PendingPublishMarker::new(&[id(1)]);
         let op = operation(50, &[id(2)]);
         let op_id = fake.stage_operation(&op);
-        marker.push(&op_id, &[(ObjectKind::Op, op_id)]);
+        marker.push_pruning(&op_id, &[id(2)], &[(ObjectKind::Op, op_id)]);
         write_pending_publish(temp.path(), &marker).unwrap();
         fake.set_heads(vec![id(2)]);
 
@@ -1936,6 +2287,116 @@ mod tests {
         assert_eq!(outcome.published_ops(), 2);
         assert_eq!(fake.heads(), vec![ids[1]]);
         assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// A saturated head set is a refusal the drain has to act on, not the
+    /// ordinary contention it used to be flattened into. The server names the
+    /// heads that made it saturated, and merging those down is the only thing
+    /// that clears the condition — so the drain reconciles from them directly
+    /// rather than spending a round trip asking again.
+    #[test]
+    fn a_saturated_head_set_reconciles_from_the_refusal_without_a_second_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let ours = id(1);
+        let theirs = id(2);
+        // jj already merged the two divergent heads locally; the merge is
+        // queued like any other operation.
+        let merge = operation(50, &[ours, theirs]);
+        let merge_id = fake.stage_operation(&merge);
+        let mut marker = PendingPublishMarker::new(&[ours]);
+        marker.push_pruning(&merge_id, &[ours, theirs], &[(ObjectKind::Op, merge_id)]);
+        write_pending_publish(temp.path(), &marker).unwrap();
+        fake.set_heads(vec![ours, theirs]);
+        fake.state.lock().unwrap().saturations = vec![vec![ours, theirs]];
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        let outcome = block_on(publisher.drain()).unwrap();
+
+        assert_eq!(outcome.published_ops(), 1);
+        assert_eq!(fake.heads(), vec![merge_id], "the merge cleared the bound");
+        assert_eq!(
+            fake.state.lock().unwrap().get_head_calls,
+            0,
+            "the refusal already carried the head set to reconcile from"
+        );
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+    }
+
+    /// The server is the authority on its own head set. Recording only the
+    /// operation this repo just published makes the marker agree with the
+    /// chain's base by construction, which is precisely the comparison
+    /// [`crate::vex_freshness::known_divergence`] uses to decide whether the
+    /// repository is converged.
+    #[test]
+    fn a_published_operation_records_the_servers_whole_resulting_head_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let sibling = id(9);
+        let ids = queue_chain(temp.path(), &fake, id(1), 2);
+        // Another writer's head sits beside the one this chain is parented on.
+        fake.set_heads(vec![id(1), sibling]);
+        // Stop the drain after the first CAS, so what is under test is the
+        // progress it recorded rather than its final state.
+        fake.state.lock().unwrap().deadline_on_call = Some(2);
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        assert!(matches!(
+            block_on(publisher.drain()),
+            Err(PublishError::Deadline { .. })
+        ));
+
+        let server = read_server_heads(temp.path()).unwrap().unwrap();
+        assert_eq!(
+            id_set(&server.head_ids().unwrap()),
+            id_set(&[ids[0], sibling]),
+            "the sibling head the server still holds must not be dropped"
+        );
+        let chain = read_pending_publish(temp.path()).unwrap().unwrap();
+        assert_eq!(chain.base_heads, vec![ids[0].to_string()]);
+        assert_eq!(
+            crate::vex_freshness::known_divergence(&[ids[0]], Some(&chain), Some(&server)).unwrap(),
+            Some(vec![ids[0], sibling]),
+            "a divergent repository must not read as converged"
+        );
+    }
+
+    /// Resuming a partly drained chain cannot require the server to hold
+    /// exactly one head: with the delta contract in force a sibling published
+    /// by another writer is co-resident with ours, and refusing to recognize
+    /// our own operation among the live heads strands the chain behind work it
+    /// has already published.
+    #[test]
+    fn a_partly_drained_chain_folds_past_a_co_resident_sibling_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        let sibling = id(9);
+        let ids = queue_chain(temp.path(), &fake, id(1), 3);
+        // A previous drain published the first two operations and died before
+        // clearing the marker; the sibling has been beside them throughout.
+        fake.set_heads(vec![ids[1], sibling]);
+
+        let publisher = VexPublisher::new(temp.path(), &fake);
+        let outcome = block_on(publisher.drain()).unwrap();
+
+        assert_eq!(outcome.published_ops(), 3);
+        assert_eq!(
+            id_set(&fake.heads()),
+            id_set(&[ids[2], sibling]),
+            "the drain advanced its own head and left the sibling alone"
+        );
+        assert!(read_pending_publish(temp.path()).unwrap().is_none());
+        assert_eq!(
+            id_set(
+                &read_server_heads(temp.path())
+                    .unwrap()
+                    .unwrap()
+                    .head_ids()
+                    .unwrap()
+            ),
+            id_set(&[ids[2], sibling]),
+            "the sibling stays recorded so the next load serves both for jj to merge"
+        );
     }
 
     #[test]
@@ -1984,7 +2445,7 @@ mod tests {
         let merge = operation(200, &parents);
         let merge_id = fake.stage_operation(&merge);
         chain.base_heads = server_heads.iter().map(ToString::to_string).collect();
-        chain.push(&merge_id, &[(ObjectKind::Op, merge_id)]);
+        chain.push_pruning(&merge_id, &parents, &[(ObjectKind::Op, merge_id)]);
         write_pending_publish(dir, &chain).unwrap();
         merge_id
     }
@@ -2107,7 +2568,7 @@ mod tests {
         let mut chain = read_pending_publish(temp.path()).unwrap().unwrap();
         let follow_up = operation(210, &[merge]);
         let follow_up_id = fake.stage_operation(&follow_up);
-        chain.push(&follow_up_id, &[(ObjectKind::Op, follow_up_id)]);
+        chain.push_pruning(&follow_up_id, &[merge], &[(ObjectKind::Op, follow_up_id)]);
         write_pending_publish(temp.path(), &chain).unwrap();
 
         let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
@@ -2133,7 +2594,7 @@ mod tests {
         let merge = queue_merge(temp.path(), &fake, &[remote], ids[1]);
         let mut chain = read_pending_publish(temp.path()).unwrap().unwrap();
         let follow_up_id = fake.stage_operation(&operation(210, &[merge]));
-        chain.push(&follow_up_id, &[(ObjectKind::Op, follow_up_id)]);
+        chain.push_pruning(&follow_up_id, &[merge], &[(ObjectKind::Op, follow_up_id)]);
         write_pending_publish(temp.path(), &chain).unwrap();
 
         // Call 1 is the doomed CAS of the chain's head, call 2 is the merge;
@@ -2313,10 +2774,14 @@ mod tests {
         let registration = operation(60, &[id(1)]);
         let registration_id = fake.stage_operation(&registration);
         let mut marker = PendingPublishMarker::new(&[id(1)]);
-        marker.push(&registration_id, &[]);
+        marker.push_pruning(&registration_id, &[id(1)], &[]);
         let follow_up = operation(61, &[registration_id]);
         let follow_up_id = fake.stage_operation(&follow_up);
-        marker.push(&follow_up_id, &[(ObjectKind::Op, follow_up_id)]);
+        marker.push_pruning(
+            &follow_up_id,
+            &[registration_id],
+            &[(ObjectKind::Op, follow_up_id)],
+        );
         write_pending_publish(temp.path(), &marker).unwrap();
         let registration_path = temp
             .path()
@@ -2354,6 +2819,326 @@ mod tests {
         let publisher = VexPublisher::new(temp.path(), &fake);
         assert_eq!(block_on(publisher.drain()).unwrap().published_ops(), 1);
         assert!(registration_path.exists());
+    }
+
+    /// A local-first store over `dir`, with an unroutable endpoint on purpose:
+    /// anything that reached the backend fails the test rather than quietly
+    /// answering.
+    fn local_first_store(dir: &Path) -> crate::vex_op_heads_store::VexOpHeadsStore {
+        let config = crate::vex::VexRepoConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            tenant_id: "tenant-id".to_string(),
+            tenant_slug: "acme".to_string(),
+            repo_id: "repo-id".to_string(),
+            repo_slug: "widget".to_string(),
+            repository_scope_kind: Some("repository".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
+            access_token: None,
+            local_writes: false,
+            durability: VexDurability::LocalFirst,
+            object_read_mode: crate::vex::VexObjectReadMode::NativeOnly,
+        };
+        crate::vex_op_heads_store::VexOpHeadsStore::init(config, dir).unwrap()
+    }
+
+    /// A local-first repo reading its own op heads, with the freshness refresh
+    /// at its default (no budget, so the read never touches the network).
+    fn read_op_heads(dir: &Path) -> Vec<ContentId> {
+        let store = local_first_store(dir);
+        block_on(crate::op_heads_store::OpHeadsStore::get_op_heads(&store))
+            .unwrap()
+            .iter()
+            .filter_map(content_id_from_op_id)
+            .collect()
+    }
+
+    /// jj's own reconciliation, replayed against a real store: drop the
+    /// ancestor heads it filtered out and re-publish the one it kept.
+    fn update_op_heads(dir: &Path, old_ids: &[ContentId], new_id: &ContentId) {
+        let store = local_first_store(dir);
+        let old_ids: Vec<_> = old_ids.iter().map(op_id_from_content_id).collect();
+        block_on(crate::op_heads_store::OpHeadsStore::update_op_heads(
+            &store,
+            &old_ids,
+            &op_id_from_content_id(new_id),
+        ))
+        .unwrap();
+    }
+
+    /// Two workspaces branch from one head, and the second one's publish is
+    /// *accepted* as a sibling instead of being refused — the whole point of
+    /// the delta contract. That leaves the workspace which created the
+    /// divergence in the one state nothing else corrects: its queue is empty,
+    /// so there is no chain whose base can disagree with the server, and the
+    /// CAS refusal that used to force the merge never happens. Its next read
+    /// has to surface the sibling head off the markers alone, or it keeps
+    /// committing on its own lineage and silently stops seeing every other
+    /// workspace's work.
+    #[test]
+    fn the_workspace_that_created_the_divergence_still_reads_the_sibling_head() {
+        let _guard = crate::vex::test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let fake = FakeTransport::default();
+        fake.accept_divergent_publishes();
+        let common = fake.stage_operation(&operation(1, &[]));
+        fake.set_heads(vec![common]);
+
+        // Both workspaces start converged on the common head.
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for dir in [first.path(), second.path()] {
+            write_server_heads(dir, &ServerHeadsMarker::new(vec![common], None)).unwrap();
+            write_local_heads(dir, &[common]).unwrap();
+        }
+
+        // Each commits one operation on it and queues it, exactly as
+        // `record_pending_operation` does.
+        let queue_one = |dir: &Path, view: u8| {
+            let op = operation(view, &[common]);
+            let id = fake.stage_operation(&op);
+            let mut chain = PendingPublishMarker::new(&[common]);
+            chain.push_pruning(&id, &[common], &[(ObjectKind::Op, id)]);
+            write_pending_publish(dir, &chain).unwrap();
+            write_local_heads(dir, &[id]).unwrap();
+            id
+        };
+        let a = queue_one(first.path(), 101);
+        let b = queue_one(second.path(), 102);
+
+        // The first workspace's drain wins the head outright.
+        assert_eq!(
+            block_on(VexPublisher::new(first.path(), &fake).drain())
+                .unwrap()
+                .published_ops(),
+            1
+        );
+        assert_eq!(fake.heads(), vec![a]);
+
+        // The second workspace's drain is accepted beside it rather than
+        // refused, so its queue empties too.
+        assert_eq!(
+            block_on(VexPublisher::new(second.path(), &fake).drain())
+                .unwrap()
+                .published_ops(),
+            1
+        );
+        assert_eq!(fake.heads(), vec![a, b], "the server holds both lineages");
+        assert!(
+            read_pending_publish(second.path()).unwrap().is_none(),
+            "nothing stays queued, so the queue cannot carry the divergence"
+        );
+        assert_eq!(
+            read_server_heads(second.path())
+                .unwrap()
+                .unwrap()
+                .head_ids()
+                .unwrap(),
+            vec![a, b]
+        );
+        assert_eq!(read_local_heads(second.path()).unwrap().unwrap().len(), 1);
+
+        // The read that decides what the next command builds on.
+        assert_eq!(
+            read_op_heads(second.path()),
+            vec![b, a],
+            "the divergence creator must still see the sibling lineage"
+        );
+
+        // jj resolves those two heads into a merge, which publishes like any
+        // other operation; both sides then agree and the read is back on the
+        // plain local fast path — no loop, no standing extra work.
+        let merge = fake.stage_operation(&operation(103, &[a, b]));
+        let mut chain = PendingPublishMarker::new(&[a, b]);
+        chain.push_pruning(&merge, &[a, b], &[(ObjectKind::Op, merge)]);
+        write_pending_publish(second.path(), &chain).unwrap();
+        write_local_heads(second.path(), &[merge]).unwrap();
+        assert_eq!(
+            block_on(VexPublisher::new(second.path(), &fake).drain())
+                .unwrap()
+                .published_ops(),
+            1
+        );
+        assert_eq!(fake.heads(), vec![merge]);
+        assert_eq!(read_op_heads(second.path()), vec![merge]);
+    }
+
+    /// jj's ancestor-prune, end to end, on the only stale head the server can
+    /// actually leave behind.
+    ///
+    /// The server's swallow probe folds a re-sent operation back onto its
+    /// descendant whenever it is within a few generations, so every stale head
+    /// that survives is a *deep* ancestor — one whose removal is neither the
+    /// tip nor one of the tip's parents. The tip's parent set therefore cannot
+    /// stand in for the removal set jj asked for, and a client that rebuilds
+    /// `expected` from it never sends the prune at all: the head set never
+    /// reconverges, the read keeps serving both heads, and every command
+    /// re-queues and re-publishes the same operation forever.
+    #[test]
+    fn a_deep_stale_head_is_pruned_by_the_prune_jj_emits() {
+        let _guard = crate::vex::test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let fake = FakeTransport::default();
+        fake.accept_divergent_publishes();
+
+        // Five generations between the stale head and the tip, so the prune
+        // clears the probe depth the server folds within.
+        let stale = fake.stage_operation(&operation(1, &[]));
+        let mut tip = stale;
+        for generation in 0..5u8 {
+            tip = fake.stage_operation(&operation(10 + generation, &[tip]));
+        }
+        fake.set_heads(vec![tip, stale]);
+        write_server_heads(dir, &ServerHeadsMarker::new(vec![tip, stale], None)).unwrap();
+        write_local_heads(dir, &[tip]).unwrap();
+
+        // The read hands jj both heads; jj drops the ancestor and asks for it
+        // to be retired while re-publishing the head it kept.
+        assert_eq!(read_op_heads(dir), vec![tip, stale]);
+        update_op_heads(dir, &[stale], &tip);
+
+        let queued = read_pending_publish(dir).unwrap().unwrap();
+        assert_eq!(queued.ops.len(), 1);
+        assert_eq!(
+            queued.ops[0].removes,
+            vec![stale.to_string()],
+            "the removal set jj asked for has to survive the queue"
+        );
+
+        block_on(VexPublisher::new(dir, &fake).drain()).unwrap();
+        assert_eq!(
+            fake.heads(),
+            vec![tip],
+            "the prune must reach the server and drop the stale head"
+        );
+
+        // And the loop is gone: the repository reads as converged, so the next
+        // command queues nothing and there is nothing left to publish.
+        assert_eq!(read_op_heads(dir), vec![tip]);
+        assert!(read_pending_publish(dir).unwrap().is_none());
+        assert_eq!(
+            block_on(VexPublisher::new(dir, &fake).drain()).unwrap(),
+            PublishOutcome::Idle
+        );
+    }
+
+    /// A prune the server refused must stay queued.
+    ///
+    /// The resume-fold reads "my queued operation is among the live heads" as
+    /// "a previous drain already published it". For a prune that is true the
+    /// moment it is queued — the head it adds is the live tip — so the fold
+    /// fires on the *refusal* as readily as on a success: the entry leaves the
+    /// queue, the marker is deleted, and the drain reports a published
+    /// operation while the stale head the prune existed to retire is still
+    /// standing. The repository then re-emits the same prune on every command
+    /// and is told it worked every time.
+    ///
+    /// The fold predicate therefore has to be the server's
+    /// `delta_already_applied`: live *and* nothing it asked to remove still
+    /// live.
+    #[test]
+    fn a_refused_prune_stays_queued_instead_of_folding_away() {
+        let _guard = crate::vex::test_stats_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let fake = FakeTransport::default();
+
+        // A divergent repository: a stale ancestor beside the tip that jj
+        // wants retired.
+        let stale = fake.stage_operation(&operation(1, &[]));
+        let tip = fake.stage_operation(&operation(2, &[stale]));
+        fake.set_heads(vec![tip, stale]);
+        write_server_heads(dir, &ServerHeadsMarker::new(vec![tip, stale], None)).unwrap();
+        write_local_heads(dir, &[tip]).unwrap();
+
+        let mut chain = PendingPublishMarker::new(&[tip, stale]);
+        chain.push_pruning(&tip, &[stale], &[(ObjectKind::Op, tip)]);
+        write_pending_publish(dir, &chain).unwrap();
+
+        // The server refuses the prune and hands back the head set unchanged —
+        // both heads still live, so nothing the prune asked for landed.
+        fake.state.lock().unwrap().cas_conflicts = vec![vec![tip, stale]];
+
+        let outcome = block_on(VexPublisher::new(dir, &fake).drain()).unwrap();
+        assert_eq!(
+            outcome.published_ops(),
+            0,
+            "a refused prune must not be reported as a successful publish"
+        );
+        assert!(
+            matches!(outcome, PublishOutcome::ServerHeadMoved { .. }),
+            "the refusal has to surface, not be folded into success: {outcome:?}"
+        );
+        assert_eq!(
+            fake.heads(),
+            vec![tip, stale],
+            "the stale head is still standing"
+        );
+
+        // And the prune is still queued, so a later drain can land it.
+        let queued = read_pending_publish(dir).unwrap().expect("chain queued");
+        assert_eq!(queued.ops.len(), 1);
+        assert_eq!(queued.ops[0].op, tip.to_string());
+        assert_eq!(queued.ops[0].removes, vec![stale.to_string()]);
+    }
+
+    /// A chain that cannot drain is re-walked by every command, and jj re-emits
+    /// the same reconciliation each time. Appending unconditionally grew the
+    /// queue by one duplicate per command, so a repository that was merely
+    /// stuck also grew without bound.
+    #[test]
+    fn re_queueing_the_same_operation_unions_it_instead_of_duplicating_it() {
+        let mut chain = PendingPublishMarker::new(&[id(1)]);
+        chain.push_pruning(&id(3), &[id(1)], &[(ObjectKind::Op, id(3))]);
+        chain.push_pruning(&id(3), &[id(2)], &[(ObjectKind::Op, id(3))]);
+
+        assert_eq!(chain.ops.len(), 1);
+        assert_eq!(
+            chain.ops[0].removes,
+            vec![id(1).to_string(), id(2).to_string()],
+            "a second sighting can name removals the first did not"
+        );
+        assert_eq!(chain.ops[0].objects.len(), 1);
+        // An operation never retires itself.
+        chain.push_pruning(&id(3), &[id(3)], &[]);
+        assert_eq!(chain.ops[0].removes.len(), 2);
+    }
+
+    /// A queue written before `removes` existed must still drain, not strand
+    /// its operations behind an unreadable marker: an entry with no recorded
+    /// removal set publishes against its parents, which is exactly what the
+    /// client that queued it would have sent.
+    #[test]
+    fn a_v1_queue_on_disk_still_drains_against_the_operations_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::default();
+        fake.set_heads(vec![id(1)]);
+        let op = operation(50, &[id(1)]);
+        let op_id = fake.stage_operation(&op);
+        std::fs::write(
+            temp.path().join(PENDING_PUBLISH_FILE),
+            format!(
+                r#"{{"v":1,"base_heads":["{}"],"ops":[{{"op":"{op_id}","objects":[{{"kind":"op","id":"{op_id}"}}]}}]}}"#,
+                id(1)
+            ),
+        )
+        .unwrap();
+
+        let chain = read_pending_publish(temp.path()).unwrap().unwrap();
+        assert_eq!(chain.v, 1);
+        assert!(chain.ops[0].removes.is_empty());
+
+        let outcome = block_on(VexPublisher::new(temp.path(), &fake).drain()).unwrap();
+        assert_eq!(outcome.published_ops(), 1);
+        assert_eq!(fake.heads(), vec![op_id]);
     }
 
     #[test]
