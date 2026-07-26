@@ -116,9 +116,14 @@ pub async fn cmd_debug_publish(
         // `no_snapshot`: this is a publish barrier, not a working-copy mutation.
         command.workspace_helper_no_snapshot(ui).await?;
     }
+    // A moved head is no longer a refusal in itself (roadmap 093): this publish
+    // and the writer that beat us would both have landed. Exhausting the
+    // attempts means every merge we built was outraced before we could publish
+    // it, so report the sustained race rather than the moved head.
     Err(user_error(format!(
-        "the server operation head keeps moving (now {}); another writer is publishing to this \
-         repository concurrently — run this command again once it settles",
+        "every attempt to merge and republish was outraced (heads now {}); this repository is \
+         under sustained concurrent writes — the queued operations are safe on disk and the \
+         next command will retry them",
         moved_to.join(", ")
     )))
 }

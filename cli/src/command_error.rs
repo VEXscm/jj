@@ -458,15 +458,22 @@ impl From<ResetError> for CommandError {
 impl From<TransactionCommitError> for CommandError {
     fn from(err: TransactionCommitError) -> Self {
         if is_op_heads_cas_conflict(&err) {
+            // Under the remove-and-add op-head contract (roadmap 093) an
+            // unrelated writer moving the repository no longer refuses a
+            // publish — those two operations simply both land and the next
+            // read merges them. Reaching here means this operation's *own*
+            // precondition was not met: the head it asked to remove is not one
+            // the server can prove it descends from, which is what keeps
+            // history reachable. That is almost always a workspace that is
+            // behind, so the recovery is to reload rather than to wait.
             user_error_with_message(
-                "Another Vex writer advanced the repository while this command was writing \
-                 (op-head conflict); your files are untouched.",
+                "This command could not publish its operation: the repository state it was \
+                 written against is no longer one it can build on; your files are untouched.",
                 err,
             )
             .hinted(
-                "This is usually transient contention with another writer, such as a background \
-                 snapshot. Rerun the command. Repeated failures may mean the working copy is \
-                 stale; run `vex status` to check.",
+                "Rerun the command — reloading picks up the current state and merges it. If it \
+                 keeps failing, the working copy is probably stale; run `vex status` to check.",
             )
         } else {
             internal_error(err)
@@ -1197,15 +1204,15 @@ mod tests {
         assert_eq!(error.kind, CommandErrorKind::User);
         assert_eq!(
             error.error.to_string(),
-            "Another Vex writer advanced the repository while this command was writing \
-             (op-head conflict); your files are untouched."
+            "This command could not publish its operation: the repository state it was written \
+             against is no longer one it can build on; your files are untouched."
         );
         assert!(matches!(
             error.hints.as_slice(),
             [ErrorHint::PlainText(hint)]
-                if hint == "This is usually transient contention with another writer, such as a \
-                    background snapshot. Rerun the command. Repeated failures may mean the \
-                    working copy is stale; run `vex status` to check."
+                if hint == "Rerun the command — reloading picks up the current state and merges \
+                    it. If it keeps failing, the working copy is probably stale; run `vex status` \
+                    to check."
         ));
         let mut source = error.error.source();
         let mut found_cas_detail = false;
