@@ -55,3 +55,4 @@ pub mod templater;
 pub mod text_util;
 pub mod time_util;
 pub mod ui;
+pub mod vex_stale_recovery;

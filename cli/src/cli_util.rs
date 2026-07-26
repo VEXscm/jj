@@ -199,6 +199,7 @@ use crate::templater::WrapTemplateProperty;
 use crate::text_util;
 use crate::ui::ColorChoice;
 use crate::ui::Ui;
+use crate::vex_stale_recovery;
 
 const SHORT_CHANGE_ID_TEMPLATE_TEXT: &str = "format_short_change_id_with_change_offset(self)";
 
@@ -477,7 +478,10 @@ impl CommandHelper {
         let mut workspace_command = self.workspace_helper_no_snapshot(ui).await?;
 
         let (workspace_command, stats) = match workspace_command.maybe_snapshot_impl(ui).await {
-            Ok(stats) => (workspace_command, stats),
+            Ok(stats) => {
+                vex_stale_recovery::clear(workspace_command.workspace_root());
+                (workspace_command, stats)
+            }
             Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
                 let is_vex = current_cli_name() == "vex";
@@ -492,6 +496,12 @@ impl CommandHelper {
                 // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
                 // of the working copy.
                 if is_vex {
+                    // Recovering repeatedly is how a degraded backend turns one
+                    // change into several partial commits, so the streak is bounded.
+                    if !vex_stale_recovery::record_recovery(workspace_command.workspace_root()) {
+                        return Err(user_error(vex_stale_recovery::exhausted_message())
+                            .hinted(vex_stale_recovery::exhausted_hint()));
+                    }
                     writeln!(
                         ui.status(),
                         "Concurrent Vex operation left the working copy stale; recovering \
