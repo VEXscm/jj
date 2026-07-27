@@ -25,6 +25,12 @@ include = [
 [[test]]
 name = "runner"
 
+# Its own binary, not a `runner` submodule: the S14 concurrency suite re-execs
+# `current_exe()` to spawn child processes, so it needs a test binary whose only
+# tests are its own.
+[[test]]
+name = "test_vex_local_op_heads_concurrency"
+
 [[bench]]
 name = "diff_bench"
 harness = false

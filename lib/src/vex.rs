@@ -865,13 +865,13 @@ pub struct VexRepoConfig {
     /// continue to persist to the backend.
     #[serde(default)]
     pub local_writes: bool,
-    /// When the op-head CAS runs relative to the command that produced the
-    /// operation (see [`VexDurability`]). Defaults to
-    /// [`VexDurability::LocalFirst`] — the operation is durable on local disk
-    /// when the command returns and a background publisher moves it to the
-    /// server, with `push`/`pull`/`submit`/`land` flushing first — and is
-    /// overridden per invocation by `VEX_DURABILITY`. Distinct from
-    /// [`Self::local_writes`], which never publishes at all.
+    /// Historical durability mode (see [`VexDurability`]). **Transitional,
+    /// read-compat only:** since roadmap/088 Stage 7 the operation log is
+    /// local, every operation is durable before the command returns, and
+    /// [`VexClient::durability`] always reports [`VexDurability::Sync`]
+    /// whatever this says. The field survives so a repository cloned before
+    /// Stage 7, whose `vex.json` carries `"durability": "local-first"`, still
+    /// deserializes. Removed in Stage 9 (C9).
     #[serde(default, skip_serializing_if = "VexDurability::is_serialized_default")]
     pub durability: VexDurability,
     /// Object decode policy for backend reads (see [`VexObjectReadMode`]).
@@ -1508,15 +1508,29 @@ impl VexClient {
         self.local_writes
     }
 
-    /// The effective durability mode: the repo's configured mode unless
-    /// `VEX_DURABILITY` overrides it. `local_writes` repos never publish, so
-    /// they always report [`VexDurability::Sync`] — the deferred-publish
-    /// machinery must stay out of their way.
+    /// The effective durability mode, which since roadmap/088 Stage 7 is
+    /// always [`VexDurability::Sync`]: the operation log is local, so an
+    /// operation is durable the moment its files are on disk and there is
+    /// nothing left for a deferred mode to defer. Transitional — removed in
+    /// Stage 9 (C9).
     pub fn durability(&self) -> VexDurability {
-        if self.local_writes {
-            return VexDurability::Sync;
-        }
         VexDurability::resolve(self.config.durability)
+    }
+
+    /// Read this repository's opaque ref-freshness token (D8), bounded by
+    /// `budget`. `Ok(None)` means no token is available.
+    ///
+    /// BLOCKED-ON-STAGE6: this is the client seam for the repo-scoped
+    /// ref-freshness token RPC that Stage 6 is adding to the backend
+    /// (`jj-backend`); no such RPC exists yet, so the seam answers `Ok(None)`
+    /// and [`crate::vex_freshness`] reports `Unknown`. It deliberately does
+    /// *not* fall back to `get_op_heads`: repointing a ref question at the op
+    /// log is exactly the coupling Stage 7 removes.
+    pub fn ref_freshness_token_within(
+        &self,
+        _budget: Duration,
+    ) -> Result<Option<String>, VexClientError> {
+        Ok(None)
     }
 
     /// Whether this client uses the pack-resident metadata cache
@@ -3870,13 +3884,7 @@ impl VexClient {
             if !self.has_pending_object(kind, content_id) {
                 let over_cap = self.buffer_pending_object(kind, content_id, data);
                 if over_cap {
-                    // A deferred-publish repo must not touch the network here:
-                    // spill to the local cache and let the publisher upload.
-                    if self.durability().defers_publish() {
-                        self.stage_pending_uploads()?;
-                    } else {
-                        self.flush_pending_uploads()?;
-                    }
+                    self.flush_pending_uploads()?;
                 }
             }
             return Ok(());

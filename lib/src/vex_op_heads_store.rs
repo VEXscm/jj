@@ -12,51 +12,98 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Vex operation-head storage (roadmap/088 Stage 7).
+//!
+//! Op heads are **local**. This store keeps them in `<op_heads>/heads/` by
+//! delegating to [`SimpleOpHeadsStore`], jj's own directory-per-head scheme,
+//! and never contacts the backend to read or write a head.
+//!
+//! Delegating rather than reimplementing is the point (D11). The upstream store
+//! already has the two properties this stage exists to guarantee:
+//!
+//! - **Add before remove.** [`SimpleOpHeadsStore::update_op_heads`] writes the
+//!   new head file first and only then removes the old ones, and a removal that
+//!   finds nothing succeeds. An interruption therefore leaves an *extra* head,
+//!   which jj merges on the next load — never zero heads, which is
+//!   unrecoverable.
+//! - **A real lock.** [`SimpleOpHeadsStore::lock`] returns a `FileLock` on
+//!   `heads/lock`. The no-op lock this store used to return is what let N
+//!   concurrent readers each commit a competing merge operation.
+//!
+//! The two stores share the `op_heads` directory without colliding: this file's
+//! legacy markers (`vex-local-heads`, `vex-pending-publish`, `vex-server-heads`)
+//! are flat files at the top level, while heads live one level down in
+//! `heads/`, whose `lock` file is skipped by the reader because it is not hex.
+//! Vex's 32-byte sha256 operation ids are written and read purely as hex, so
+//! the length difference from upstream's 64-byte ids does not matter.
+//!
+//! **No local path may refuse a head write for concurrency reasons.** An
+//! operation that has been committed cannot fail to be recorded (D10).
+
 #![expect(missing_docs)]
 
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use prost::Message as _;
-use sha2::Digest as _;
-use sha2::Sha256;
 
 use crate::backend::BackendInitError;
 use crate::object_id::ObjectId as _;
 use crate::op_heads_store::OpHeadsStore;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_heads_store::OpHeadsStoreLock;
-use crate::op_store::Operation;
 use crate::op_store::OperationId;
-use crate::op_store::View;
-use crate::op_store::ViewId;
-use crate::ref_name::WorkspaceNameBuf;
-use crate::simple_op_store::operation_from_proto;
-use crate::simple_op_store::operation_to_proto;
-use crate::simple_op_store::view_from_proto;
-use crate::simple_op_store::view_to_proto;
+use crate::simple_op_heads_store::SimpleOpHeadsStore;
 use crate::vex::VexClient;
 use crate::vex::VexRepoConfig;
-use crate::vex_freshness::known_divergence;
-use crate::vex_freshness::refresh_once;
-use crate::vex_op_head_delta::OpHeadRefusal;
 use crate::vex_op_head_delta::classify_refusal;
-use crate::vex_publish::LOCAL_HEADS_FILE;
-use crate::vex_publish::MarkerError;
-use crate::vex_publish::PendingPublishMarker;
-use crate::vex_publish::PublishError;
-use crate::vex_publish::PublishOutcome;
-use crate::vex_publish::ServerHeadsMarker;
-use crate::vex_publish::VexClientTransport;
-use crate::vex_publish::VexDurability;
-use crate::vex_publish::VexPublisher;
-use crate::vex_publish::content_id_from_op_id;
-use crate::vex_publish::op_id_from_content_id;
 
 const ID_LENGTH: usize = 32;
+
+/// Subdirectory of the op-heads store where heads actually live. Its existence
+/// is the permanent guard on the one-time bootstrap: once it is there, nothing
+/// in this file may ever contact the backend for op heads again.
+const HEADS_DIR: &str = "heads";
+/// Staging directory for the one-time bootstrap. Renamed onto [`HEADS_DIR`],
+/// which is the commit point.
+const HEADS_TMP_DIR: &str = "heads.tmp";
+
+/// Default budget for the single backend read a pre-Stage-7 clone may perform
+/// while seeding its local heads directory. Tunable with
+/// `VEX_OP_HEADS_BOOTSTRAP_MS`.
+const DEFAULT_BOOTSTRAP_MS: u64 = 10_000;
+
+fn bootstrap_budget() -> Duration {
+    let millis = std::env::var("VEX_OP_HEADS_BOOTSTRAP_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(DEFAULT_BOOTSTRAP_MS);
+    Duration::from_millis(millis)
+}
+
+/// Compatibility escape (roadmap/088 §0.4). With `VEX_PUBLISH_OP_LOG=1` a
+/// successful *local* head write is additionally mirrored to the server's
+/// `CommitOperation` CAS, so a mixed fleet of old and new clients can share a
+/// repository during the rollout.
+///
+/// It restores *publishing*, nothing else: the deferred queue, the registration
+/// fold and the client-side conflict classifier are deleted outright, and a
+/// failed publish is logged rather than returned. Local storage stays
+/// authoritative in both modes.
+fn publish_op_log_escape() -> bool {
+    static ESCAPE: OnceLock<bool> = OnceLock::new();
+    *ESCAPE.get_or_init(|| {
+        matches!(
+            std::env::var("VEX_PUBLISH_OP_LOG").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
 
 fn to_content_id(id: &OperationId) -> Result<jj_backend_types::ContentId, OpHeadsStoreError> {
     let bytes = id.to_bytes();
@@ -78,120 +125,38 @@ fn is_root_operation_id(id: &OperationId) -> bool {
     id.to_bytes().iter().all(|byte| *byte == 0)
 }
 
-/// Turn a refused `CommitOperation` response into the write error the caller
-/// sees, with the refusal itself as a typed source: `transaction` classifies
-/// the retry from the reason rather than the message, and the heads the server
-/// reported travel along so nothing downstream has to read them back.
-fn refusal_error(
-    response: &jj_backend_api::CommitOperationResponse,
-    new_id: &OperationId,
-) -> OpHeadsStoreError {
-    OpHeadsStoreError::Write {
-        new_op_id: new_id.clone(),
-        source: Box::new(classify_refusal(response)),
-    }
-}
-
-fn sha256_content_id(data: &[u8]) -> jj_backend_types::ContentId {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    jj_backend_types::ContentId::from_bytes(hasher.finalize().into())
+fn read_error(err: impl std::error::Error + Send + Sync + 'static) -> OpHeadsStoreError {
+    OpHeadsStoreError::Read(Box::new(err))
 }
 
 #[derive(Debug)]
-struct VexNoopLock;
-
-impl OpHeadsStoreLock for VexNoopLock {}
-
-/// Name of the marker file (inside the op_heads store dir) recording a
-/// deferred workspace registration. See [`PendingRegistration`].
-/// How many times a clone rebuilds its deferred registration on a moved server
-/// head before giving up. Concurrent clones all fold against the same head, so
-/// every one but the winner has to rebuild; a single attempt makes a majority
-/// of concurrent first-commits fail.
-const REGISTRATION_FOLD_ATTEMPTS: usize = 5;
-
-pub(crate) const PENDING_REGISTRATION_FILE: &str = "vex-pending-registration";
-
-/// Persistent record of a clone whose workspace registration was deferred: the
-/// workspace operation was committed locally only, and no op-head CAS reached
-/// the server. The next `update_op_heads` that would CAS the server publishes
-/// ("folds") the registration first.
-///
-/// Two states, distinguished by `pending_op_id`:
-///
-/// - **Armed** (`pending_op_id == None`): written by `Workspace::clone_vex`
-///   before it commits the workspace operation. Tells `update_op_heads` to
-///   record that operation locally instead of CASing the server.
-/// - **Pending** (`pending_op_id == Some`): written by `update_op_heads` once
-///   the workspace operation committed. `get_op_heads` now serves the local
-///   heads file, and the next server-bound `update_op_heads` folds the
-///   registration.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct PendingRegistration {
-    /// Name of the workspace the deferred operation registers. Needed to
-    /// rebuild the registration on a newer server head after a CAS conflict.
-    workspace_name: String,
-    /// Hex content id of the locally committed workspace operation.
-    #[serde(default)]
-    pending_op_id: Option<String>,
-    /// Hex content ids of the server op heads the pending operation was built
-    /// on (its non-root parents). The server validates that a committed
-    /// operation's parents cover the CAS `expected` set, and this operation
-    /// has exactly those parents, so this is the only `expected` the pending
-    /// operation can ever be published with.
-    #[serde(default)]
-    server_head_ids: Vec<String>,
-}
-
-/// Builds the view for a deferred workspace registration rebuilt onto a newer
-/// server head. The new server view wins wholesale; only the deferred
-/// workspace's wc-commit entry is carried over (and its wc commit becomes a
-/// visible head). The clone-time trunk-bookmark write is intentionally not
-/// replayed: it only ever (re)creates the bookmark at the clone's start
-/// commit, and the newer server view's bookmark state is authoritative.
-fn registration_view_on_head(
-    mut head_view: View,
-    pending_view: &View,
-    workspace_name: &str,
-) -> Result<View, String> {
-    let name = WorkspaceNameBuf::from(workspace_name.to_owned());
-    let Some(wc_commit_id) = pending_view.wc_commit_ids.get(&name) else {
-        return Err(format!(
-            "pending registration operation has no working-copy commit for workspace \
-             {workspace_name}"
-        ));
-    };
-    head_view.head_ids.insert(wc_commit_id.clone());
-    head_view.wc_commit_ids.insert(name, wc_commit_id.clone());
-    Ok(head_view)
-}
-
-/// Snapshot of the deferred-publish markers taken once per operation, so the
-/// read and write paths agree on what is queued.
-struct DeferredState {
-    chain: Option<PendingPublishMarker>,
-    server: Option<ServerHeadsMarker>,
-}
-
-#[derive(Debug, Clone)]
 pub struct VexOpHeadsStore {
     client: VexClient,
-    /// The `op_heads` store directory: home of the local heads file and the
-    /// deferred-registration marker.
+    /// The `op_heads` store directory: home of `heads/` and of the legacy
+    /// bookkeeping markers the one-time bootstrap reads.
     store_dir: PathBuf,
-    /// When true, local-write mode is active (READ_ONLY CI runner): op heads
-    /// are recorded to the local heads file instead of the backend, and read
-    /// back from it. Local heads stay authoritative forever and are never
-    /// folded to the server.
+    /// Head storage: `<store_dir>/heads`.
+    simple: SimpleOpHeadsStore,
+    /// When true, local-write mode is active (READ_ONLY CI runner). Since
+    /// Stage 7 every mode stores heads locally, so this no longer selects a
+    /// storage scheme; it means "never contact the backend at all", which now
+    /// covers only the one-time bootstrap read and the compatibility escape.
     local_writes: bool,
-    /// When the op-head CAS runs relative to the operation that produced it.
-    /// [`VexDurability::Sync`] keeps every path in this file exactly as it was
-    /// before roadmap/088.
-    durability: VexDurability,
-    /// Wall-clock budget for the opportunistic freshness refresh, resolved
-    /// once from the environment. `None` disables it.
-    refresh_budget: Option<Duration>,
+    /// Per-process memo for [`Self::ensure_heads_dir`], so the guard costs one
+    /// `stat` per process rather than one per call.
+    bootstrapped: Arc<OnceLock<()>>,
+}
+
+impl Clone for VexOpHeadsStore {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            simple: SimpleOpHeadsStore::load(&self.store_dir),
+            store_dir: self.store_dir.clone(),
+            local_writes: self.local_writes,
+            bootstrapped: Arc::clone(&self.bootstrapped),
+        }
+    }
 }
 
 impl VexOpHeadsStore {
@@ -202,780 +167,198 @@ impl VexOpHeadsStore {
     pub fn init(config: VexRepoConfig, store_path: &Path) -> Result<Self, BackendInitError> {
         let local_writes = config.local_writes;
         let client = VexClient::from_config(config).map_err(|err| BackendInitError(err.into()))?;
-        let durability = client.durability();
-        Ok(Self {
-            client,
-            store_dir: store_path.to_path_buf(),
-            local_writes,
-            durability,
-            refresh_budget: crate::vex_freshness::refresh_budget(),
-        })
+        // Deliberately not `SimpleOpHeadsStore::init`: that calls `create_dir`,
+        // which fails when the directory exists, and `<repo>/op_heads` has
+        // already been created by the caller (`ReadonlyRepo::init`) before this
+        // initializer runs.
+        let heads_dir = store_path.join(HEADS_DIR);
+        fs::create_dir_all(&heads_dir).map_err(|err| BackendInitError(err.into()))?;
+        Ok(Self::at(client, store_path, local_writes))
     }
 
     pub fn load(store_path: &Path) -> Result<Self, crate::backend::BackendLoadError> {
         let client = VexClient::from_store_path(store_path)
             .map_err(|err| crate::backend::BackendLoadError(err.into()))?;
         let local_writes = client.local_writes();
-        let durability = client.durability();
-        Ok(Self {
+        Ok(Self::at(client, store_path, local_writes))
+    }
+
+    fn at(client: VexClient, store_path: &Path, local_writes: bool) -> Self {
+        Self {
             client,
+            simple: SimpleOpHeadsStore::load(store_path),
             store_dir: store_path.to_path_buf(),
             local_writes,
-            durability,
-            refresh_budget: crate::vex_freshness::refresh_budget(),
-        })
-    }
-
-    /// Arms deferred workspace registration for a clone: the next
-    /// `update_op_heads` (the clone's workspace operation) is recorded locally
-    /// instead of CASed to the server, and is published transparently by the
-    /// first mutating operation that reaches the backend. Must be called before
-    /// the workspace operation commits. Not for `local_writes` repos, whose
-    /// local heads are already authoritative and never published.
-    pub fn arm_deferred_registration(
-        store_path: &Path,
-        workspace_name: &str,
-    ) -> std::io::Result<()> {
-        let marker = PendingRegistration {
-            workspace_name: workspace_name.to_owned(),
-            pending_op_id: None,
-            server_head_ids: Vec::new(),
-        };
-        let data = serde_json::to_vec_pretty(&marker).map_err(std::io::Error::other)?;
-        fs::create_dir_all(store_path)?;
-        fs::write(store_path.join(PENDING_REGISTRATION_FILE), data)
-    }
-
-    fn local_heads_path(&self) -> PathBuf {
-        self.store_dir.join(LOCAL_HEADS_FILE)
-    }
-
-    fn pending_registration_path(&self) -> PathBuf {
-        self.store_dir.join(PENDING_REGISTRATION_FILE)
-    }
-
-    /// Read op heads previously recorded locally (local-write mode or a
-    /// deferred registration). Returns `None` when no head has been recorded,
-    /// so callers fall back to the backend.
-    fn read_local_heads(&self) -> Result<Option<Vec<OperationId>>, OpHeadsStoreError> {
-        crate::vex_publish::read_local_heads(&self.store_dir)
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))
-    }
-
-    /// Record op heads locally, replacing any previous set.
-    fn write_local_heads(&self, new_id: &OperationId) -> Result<(), OpHeadsStoreError> {
-        let content_id = to_content_id(new_id)?;
-        crate::vex_publish::write_local_heads(&self.store_dir, &[content_id]).map_err(|err| {
-            OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            }
-        })
-    }
-
-    fn read_pending_registration(&self) -> Result<Option<PendingRegistration>, OpHeadsStoreError> {
-        let path = self.pending_registration_path();
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(OpHeadsStoreError::Read(Box::new(err))),
-        };
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))
-    }
-
-    fn write_pending_registration(
-        &self,
-        marker: &PendingRegistration,
-        new_id: &OperationId,
-    ) -> Result<(), OpHeadsStoreError> {
-        let data = serde_json::to_vec_pretty(marker).map_err(|err| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: Box::new(err),
-        })?;
-        fs::write(self.pending_registration_path(), data).map_err(|err| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: Box::new(err),
-        })
-    }
-
-    /// Deletes the deferred-registration state. The local heads file goes
-    /// first: if marker deletion then fails, `get_op_heads` already falls back
-    /// to the server and a later fold self-heals via the server's replay check.
-    fn clear_deferred_registration(&self, new_id: &OperationId) -> Result<(), OpHeadsStoreError> {
-        for path in [self.local_heads_path(), self.pending_registration_path()] {
-            if let Err(err) = fs::remove_file(&path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(OpHeadsStoreError::Write {
-                    new_op_id: new_id.clone(),
-                    source: Box::new(err),
-                });
-            }
+            bootstrapped: Arc::new(OnceLock::new()),
         }
+    }
+
+    fn heads_dir(&self) -> PathBuf {
+        self.store_dir.join(HEADS_DIR)
+    }
+
+    /// Make sure `heads/` exists, seeding it once for a repository cloned
+    /// before Stage 7.
+    ///
+    /// Idempotent, at most once per process per store (the `bootstrapped`
+    /// memo), and at most once *ever* per repository (the existence of
+    /// `heads/`). That second guard is what keeps this from becoming an ongoing
+    /// server dependency: a repo that has the directory never reaches the seed
+    /// logic, so no code path in this file can contact the backend for op heads
+    /// again.
+    async fn ensure_heads_dir(&self) -> Result<(), OpHeadsStoreError> {
+        if self.bootstrapped.get().is_some() {
+            return Ok(());
+        }
+        if !self.heads_dir().is_dir() {
+            self.bootstrap_heads_dir().await?;
+        }
+        let _ = self.bootstrapped.set(());
         Ok(())
     }
 
-    /// Records the clone's workspace operation locally instead of CASing the
-    /// server. The operation's objects normally upload as a batch right before
-    /// the op-head CAS; with no CAS here, flush them explicitly so the local
-    /// cache holds them durably and a later fold from another process finds
-    /// them on the server.
-    fn record_deferred_registration(
-        &self,
-        mut marker: PendingRegistration,
-        expected: &[jj_backend_types::ContentId],
-        new_id: &OperationId,
-    ) -> Result<(), OpHeadsStoreError> {
-        self.client
-            .flush_pending_uploads()
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-        self.write_local_heads(new_id)?;
-        marker.pending_op_id = Some(to_content_id(new_id)?.to_string());
-        marker.server_head_ids = expected.iter().map(ToString::to_string).collect();
-        self.write_pending_registration(&marker, new_id)
-    }
-
-    async fn read_operation_object(
-        &self,
-        id: &jj_backend_types::ContentId,
-        new_id: &OperationId,
-    ) -> Result<Operation, OpHeadsStoreError> {
-        let data = self
-            .client
-            .get_object(jj_backend_types::ObjectKind::Op, id)
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-        let proto = crate::protos::simple_op_store::Operation::decode(&*data).map_err(|err| {
-            OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
+    /// Seed `heads/` from whatever this repository already knows.
+    ///
+    /// Every source contributes: the set is a union, never narrowed to one id.
+    /// Narrowing is the silent head loss D11 forbids, which is also why the
+    /// PRD's "construct a fresh log from refs" instruction (right for `vex
+    /// clone`, which has no history to lose) is deliberately not reused here.
+    async fn bootstrap_heads_dir(&self) -> Result<(), OpHeadsStoreError> {
+        let mut seed: Vec<OperationId> = Vec::new();
+        let add = |id: OperationId, seed: &mut Vec<OperationId>| {
+            if !seed.contains(&id) {
+                seed.push(id);
             }
-        })?;
-        operation_from_proto(proto).map_err(|err| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: Box::new(err),
-        })
-    }
+        };
 
-    async fn read_view_object(
-        &self,
-        id: &ViewId,
-        new_id: &OperationId,
-    ) -> Result<View, OpHeadsStoreError> {
-        let bytes = id.to_bytes();
-        if bytes.len() != ID_LENGTH {
-            return Err(OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(std::io::Error::other(format!(
-                    "invalid view id length: expected {ID_LENGTH}, got {}",
-                    bytes.len()
-                ))),
-            });
-        }
-        let mut content_bytes = [0; ID_LENGTH];
-        content_bytes.copy_from_slice(&bytes);
-        let content_id = jj_backend_types::ContentId::from_bytes(content_bytes);
-        let data = self
-            .client
-            .get_object(jj_backend_types::ObjectKind::View, &content_id)
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-        let proto = crate::protos::simple_op_store::View::decode(&*data).map_err(|err| {
-            OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
+        // (a) Heads a pre-Stage-7 client recorded locally. Covers every
+        // `local_writes` repo and every repo in a deferred-publish session,
+        // which is what the fleet was running by default.
+        match crate::vex_publish::read_local_heads(&self.store_dir) {
+            Ok(Some(ids)) => {
+                for id in ids {
+                    add(id, &mut seed);
+                }
             }
-        })?;
-        view_from_proto(proto).map_err(|err| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: Box::new(err),
-        })
-    }
-
-    /// The server head moved between clone and first publish, so the pending
-    /// operation can never be accepted. Rebuild the registration as a fresh
-    /// operation parented on the current server head.
-    /// Fold a still-pending clone registration onto a moved server head, from
-    /// the read path.
-    ///
-    /// A clone keeps its registration local until its first mutation folds it.
-    /// Until then the repository serves its clone-time head, so someone who
-    /// clones and only reads never sees a teammate's or an agent's work. This
-    /// republishes the registration on whatever the server holds now, which
-    /// rejoins the server's lineage and makes everything published since the
-    /// clone visible.
-    ///
-    /// The rebuilt operation is parented on BOTH the current server head and
-    /// the local registration operation. Parenting it on the server head alone
-    /// would leave the working copy's operation a *sibling* of the repository's,
-    /// which is unrecoverable ("the repo was loaded at operation X, which seems
-    /// to be a sibling of the working copy's operation Y"); keeping the local
-    /// operation as a parent makes the working copy merely stale, which jj
-    /// recovers on its own. The extra parent is publishable because the backend
-    /// requires a published operation's parents to *cover* the CAS expectation
-    /// rather than equal it.
-    ///
-    /// Returns the heads to serve on success. Every failure returns `None` so
-    /// the caller falls back to serving local heads — a stale view is worse
-    /// than nothing, but it is much better than a failed command.
-    ///
-    /// A divergent server is served rather than folded. Building the
-    /// registration on one of several heads would publish an operation whose
-    /// view descends from that head alone, silently dropping what the others
-    /// carry; merging views is jj's job, not this function's. Reporting the
-    /// server's heads alongside the local one hands the merge to
-    /// `resolve_op_heads`, which is the same answer the deferred-publish path
-    /// gives for the same situation. Doing anything else would mean an unfolded
-    /// clone serves its clone-time head for as long as the repository is
-    /// divergent — and divergence is now an ordinary state, not a rare one.
-    async fn fold_registration_onto_moved_head(
-        &self,
-        marker: &PendingRegistration,
-        local: &[jj_backend_types::ContentId],
-    ) -> Option<Vec<jj_backend_types::ContentId>> {
-        let pending_hex = marker.pending_op_id.as_deref()?;
-        let pending_op = jj_backend_types::ContentId::from_hex(pending_hex).ok()?;
-        let recorded: Vec<_> = marker
-            .server_head_ids
-            .iter()
-            .filter_map(|id| jj_backend_types::ContentId::from_hex(id).ok())
-            .collect();
-
-        let budget = crate::vex_freshness::unfolded_clone_refresh_budget();
-        let current = self.client.get_op_heads_within(budget).ok().flatten()?;
-        if current.is_empty() {
-            return None;
+            Ok(None) => {}
+            Err(err) => tracing::warn!(error = %err, "unusable local-heads marker while seeding"),
         }
-        if recorded.iter().collect::<std::collections::HashSet<_>>()
-            == current.iter().collect::<std::collections::HashSet<_>>()
-        {
-            // The server has not moved since the clone: nothing to fold, and the
-            // local registration head is already the freshest view available.
-            return None;
+        // (b) The tip of a queue left behind by a deferred-publish session.
+        match crate::vex_publish::read_pending_publish(&self.store_dir) {
+            Ok(Some(chain)) => match chain.tip_ids() {
+                Ok(ids) => {
+                    for id in ids {
+                        add(crate::vex_publish::op_id_from_content_id(&id), &mut seed);
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "unusable queue marker while seeding"),
+            },
+            Ok(None) => {}
+            Err(err) => tracing::warn!(error = %err, "unusable queue marker while seeding"),
         }
-        let [head] = current.as_slice() else {
-            let merged = crate::vex_op_head_delta::heads_with_local(local, &current);
-            tracing::debug!(
-                workspace = marker.workspace_name,
-                server_heads = current.len(),
-                "server is divergent; serving its heads with the local one so jj merges them"
-            );
-            return Some(merged);
-        };
-
-        let dummy = OperationId::new(pending_op.as_bytes().to_vec());
-        let head_operation = self.read_operation_object(head, &dummy).await.ok()?;
-        let head_view = self
-            .read_view_object(&head_operation.view_id, &dummy)
-            .await
-            .ok()?;
-        let pending_operation = self.read_operation_object(&pending_op, &dummy).await.ok()?;
-        let pending_view = self
-            .read_view_object(&pending_operation.view_id, &dummy)
-            .await
-            .ok()?;
-        let new_view =
-            registration_view_on_head(head_view, &pending_view, &marker.workspace_name).ok()?;
-
-        let view_data = view_to_proto(&new_view).encode_to_vec();
-        let view_content_id = sha256_content_id(&view_data);
-        self.client
-            .put_object(
-                jj_backend_types::ObjectKind::View,
-                &view_content_id,
-                view_data,
-            )
-            .await
-            .ok()?;
-
-        let new_operation = Operation {
-            view_id: ViewId::new(view_content_id.as_bytes().to_vec()),
-            parents: vec![
-                OperationId::new(head.as_bytes().to_vec()),
-                OperationId::new(pending_op.as_bytes().to_vec()),
-            ],
-            metadata: pending_operation.metadata.clone(),
-            commit_predecessors: pending_operation.commit_predecessors.clone(),
-        };
-        let op_data = operation_to_proto(&new_operation).encode_to_vec();
-        let op_content_id = sha256_content_id(&op_data);
-        self.client
-            .put_object(jj_backend_types::ObjectKind::Op, &op_content_id, op_data)
-            .await
-            .ok()?;
-
-        let response = self
-            .client
-            .commit_op_heads(std::slice::from_ref(head), &op_content_id, &op_content_id)
-            .await
-            .ok()?;
-        if !response.ok {
-            tracing::debug!(
-                workspace = marker.workspace_name,
-                "lost the CAS folding the deferred registration; serving local heads"
-            );
-            return None;
-        }
-
-        let heads = vec![op_content_id];
-        crate::vex_publish::write_local_heads(&self.store_dir, &heads).ok()?;
-        let dummy_id = OperationId::new(op_content_id.as_bytes().to_vec());
-        let _ = self.clear_deferred_registration(&dummy_id);
-        tracing::info!(
-            workspace = marker.workspace_name,
-            folded_op = %op_content_id,
-            "folded the deferred workspace registration onto the current server head"
-        );
-        Some(heads)
-    }
-
-    async fn rebuild_pending_registration(
-        &self,
-        marker: &PendingRegistration,
-        pending_op: &jj_backend_types::ContentId,
-        current_heads: &[jj_backend_types::ContentId],
-        new_id: &OperationId,
-    ) -> Result<(), OpHeadsStoreError> {
-        let write_err = |message: String| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: Box::new(std::io::Error::other(message)),
-        };
-        let [head] = current_heads else {
-            // Rebuilding on one of several heads would publish a registration
-            // whose view descends from that head alone. Report the divergence
-            // as the retryable conflict it is instead: the reload the caller
-            // performs runs jj's own op-head resolution, which merges the heads
-            // back down to one and makes the rebuild well defined.
-            return Err(write_err(
-                crate::vex_op_head_delta::divergent_registration_conflict(current_heads.len()),
-            ));
-        };
-        let head_operation = self.read_operation_object(head, new_id).await?;
-        let head_view = self
-            .read_view_object(&head_operation.view_id, new_id)
-            .await?;
-        let pending_operation = self.read_operation_object(pending_op, new_id).await?;
-        let pending_view = self
-            .read_view_object(&pending_operation.view_id, new_id)
-            .await?;
-        let new_view = registration_view_on_head(head_view, &pending_view, &marker.workspace_name)
-            .map_err(write_err)?;
-
-        let view_data = view_to_proto(&new_view).encode_to_vec();
-        let view_content_id = sha256_content_id(&view_data);
-        self.client
-            .put_object(
-                jj_backend_types::ObjectKind::View,
-                &view_content_id,
-                view_data,
-            )
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-
-        let new_operation = Operation {
-            view_id: ViewId::new(view_content_id.as_bytes().to_vec()),
-            parents: vec![OperationId::new(head.as_bytes().to_vec())],
-            metadata: pending_operation.metadata.clone(),
-            commit_predecessors: pending_operation.commit_predecessors.clone(),
-        };
-        let op_data = operation_to_proto(&new_operation).encode_to_vec();
-        let op_content_id = sha256_content_id(&op_data);
-        self.client
-            .put_object(jj_backend_types::ObjectKind::Op, &op_content_id, op_data)
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-
-        let response = self
-            .client
-            .commit_op_heads(std::slice::from_ref(head), &op_content_id, &op_content_id)
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-        if response.ok {
-            tracing::info!(
-                workspace = marker.workspace_name,
-                pending_op = %pending_op,
-                republished_op = %op_content_id,
-                "republished deferred workspace registration on the current server head"
-            );
-            Ok(())
-        } else {
-            Err(write_err(
-                "CAS conflict on op heads: server head moved while republishing the deferred \
-                 workspace registration"
-                    .to_string(),
-            ))
-        }
-    }
-
-    /// Publishes a pending deferred workspace registration before the current
-    /// operation's own CAS. A moved server head requires rebuilding the
-    /// registration on that head, then reporting a CAS conflict so the caller
-    /// reloads and rebuilds its user mutation.
-    async fn fold_pending_registration(
-        &self,
-        marker: &PendingRegistration,
-        new_id: &OperationId,
-    ) -> Result<(), OpHeadsStoreError> {
-        let write_err = |message: String| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: Box::new(std::io::Error::other(message)),
-        };
-        let pending_hex = marker
-            .pending_op_id
-            .as_deref()
-            .expect("fold requires a recorded pending op");
-        let pending_op = jj_backend_types::ContentId::from_hex(pending_hex)
-            .map_err(|err| write_err(format!("invalid pending registration op id: {err}")))?;
-        let expected = marker
-            .server_head_ids
-            .iter()
-            .map(|id| jj_backend_types::ContentId::from_hex(id))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| write_err(format!("invalid pending registration parent id: {err}")))?;
-        let response = self
-            .client
-            .commit_op_heads(&expected, &pending_op, &pending_op)
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-        if response.ok {
-            tracing::info!(
-                workspace = marker.workspace_name,
-                pending_op = %pending_op,
-                "published deferred workspace registration"
-            );
-            return self.clear_deferred_registration(new_id);
-        }
-        let current_heads = response
-            .current_op_head_ids
-            .iter()
-            .map(|id| jj_backend_types::ContentId::from_hex(id))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| write_err(format!("invalid op head from server: {err}")))?;
-        if current_heads == [pending_op] {
-            return self.clear_deferred_registration(new_id);
-        }
-        let refusal = classify_refusal(&response);
-        if refusal.refusal() == OpHeadRefusal::HeadSetSaturated {
-            // Rebuilding the registration on the heads the server just reported
-            // would only ask for another head on a repository that has no room
-            // for one, so there is nothing to retry here and no reason to spend
-            // a second read learning heads we were already told. Surface the
-            // saturation; the reload the caller performs is what merges the
-            // divergence away.
-            return Err(refusal_error(&response, new_id));
-        }
-        if current_heads.len() > 1 {
-            // Every rebuild below needs a single head to build the registration
-            // view on, so a divergent repository would spend the whole retry
-            // budget re-learning the same thing. Surface the conflict now; the
-            // caller's reload merges the heads and the next fold has one.
-            return Err(refusal_error(&response, new_id));
-        }
-        // Losing this race is ordinary contention, not a failure: several
-        // clones folding their registrations at once all target the same head,
-        // so all but one lose. Rebuilding on whatever the server holds now and
-        // retrying is exactly what the error used to ask the user to do by
-        // hand, and with N concurrent clients the hand-retry turns into a
-        // majority of commits failing.
-        let mut heads = current_heads;
-        let mut last_error = None;
-        for attempt in 0..REGISTRATION_FOLD_ATTEMPTS {
-            match self
-                .rebuild_pending_registration(marker, &pending_op, &heads, new_id)
-                .await
-            {
-                Ok(()) => {
-                    last_error = None;
-                    break;
+        // (c) Heads a v1 server-heads marker recorded.
+        match crate::vex_publish::read_server_heads(&self.store_dir) {
+            Ok(Some(marker)) => match marker.head_ids() {
+                Ok(ids) => {
+                    for id in ids {
+                        add(crate::vex_publish::op_id_from_content_id(&id), &mut seed);
+                    }
                 }
                 Err(err) => {
-                    last_error = Some(err);
-                    if attempt + 1 == REGISTRATION_FOLD_ATTEMPTS {
-                        break;
-                    }
-                    // Re-read the head the next rebuild must target. Without a
-                    // fresh read the retry rebuilds on the same stale head and
-                    // loses the same race again.
-                    match self.client.get_op_heads().await {
-                        Ok(current) => {
-                            if current.is_empty() {
-                                break;
-                            }
-                            heads = current;
-                        }
-                        Err(_) => break,
+                    tracing::warn!(error = %err, "unusable server-heads marker while seeding");
+                }
+            },
+            Ok(None) => {}
+            Err(err) => tracing::warn!(error = %err, "unusable server-heads marker while seeding"),
+        }
+        // (d) Nothing local to go on: read the server's heads exactly once,
+        // under a bounded deadline. `local_writes` repos skip even this — they
+        // are forbidden from contacting the backend at all.
+        if seed.is_empty() && !self.local_writes {
+            match self.client.get_op_heads_within(bootstrap_budget()) {
+                Ok(Some(ids)) => {
+                    // ALL returned ids, each as its own head. A divergent
+                    // repository must not be collapsed on the way in.
+                    for id in ids {
+                        add(crate::vex_publish::op_id_from_content_id(&id), &mut seed);
                     }
                 }
+                Ok(None) => tracing::warn!("op-head bootstrap read exceeded its budget"),
+                Err(err) => tracing::warn!(error = %err, "op-head bootstrap read failed"),
             }
         }
-        if let Some(err) = last_error {
-            return Err(err);
+        // (e) Still nothing. Seeding an empty directory would tell jj this
+        // repository has no operations at all, which is worse than failing.
+        if seed.is_empty() {
+            return Err(read_error(std::io::Error::other(format!(
+                "cannot start a local operation log for {}: no local operation heads were \
+                 recorded and none could be read from the backend; re-run `vex clone` to \
+                 create a fresh workspace",
+                self.store_dir.display()
+            ))));
         }
-        self.clear_deferred_registration(new_id)?;
-        Err(write_err(
-            "CAS conflict on op heads: the deferred workspace registration was republished on \
-             the current server head; reload and retry"
-                .to_string(),
-        ))
+        self.write_seed(&seed)
     }
 
-    /// The deferred-publish state of this repo, or `None` when the markers
-    /// cannot be trusted. An unreadable marker is reported once and then
-    /// treated as "no deferred state", which routes every path in this file
-    /// back to synchronous publication — always correct, just slower.
-    fn deferred_state(&self) -> Option<DeferredState> {
-        if !self.durability.defers_publish() {
-            return None;
-        }
-        let chain = match crate::vex_publish::read_pending_publish(&self.store_dir) {
-            Ok(chain) => chain,
-            Err(err) => return self.report_unusable_markers(err),
-        };
-        let server = match crate::vex_publish::read_server_heads(&self.store_dir) {
-            Ok(server) => server,
-            Err(err) => return self.report_unusable_markers(err),
-        };
-        Some(DeferredState { chain, server })
-    }
-
-    fn report_unusable_markers(&self, err: MarkerError) -> Option<DeferredState> {
-        tracing::warn!(
-            error = %err,
-            "unusable local-first marker; falling back to synchronous op-head publication"
-        );
-        None
-    }
-
-    /// Record `new_id` as the local head and queue it for publication. The
-    /// chain is written before the local heads file: a crash in between leaves
-    /// an operation queued that the local repo has not adopted yet, which the
-    /// next publish resolves into a server head that is a descendant of the
-    /// local one. The reverse order would lose the operation silently.
-    fn record_pending_operation(
-        &self,
-        state: &DeferredState,
-        expected: &[jj_backend_types::ContentId],
-        new_id: &OperationId,
-    ) -> Result<(), OpHeadsStoreError> {
-        let write_err = |err: Box<dyn std::error::Error + Send + Sync>| OpHeadsStoreError::Write {
-            new_op_id: new_id.clone(),
-            source: err,
-        };
-        self.client
-            .stage_pending_uploads()
-            .map_err(|err| write_err(Box::new(err)))?;
-        let objects = self.client.take_staged_objects();
-        let new_content_id = to_content_id(new_id)?;
-
-        let mut chain = match state.chain.clone() {
-            Some(chain) if !chain.is_empty() => self.rebase_chain_base(chain, expected, state),
-            _ => self.start_chain(expected, state, new_id)?,
-        };
-        chain.push_pruning(&new_content_id, expected, &objects);
-        crate::vex_publish::write_pending_publish(&self.store_dir, &chain)
-            .map_err(|err| write_err(Box::new(err)))?;
-        self.write_local_heads(new_id)
-    }
-
-    /// The head set a fresh chain is parented on. The last confirmed server
-    /// heads are authoritative — after a coalesced publish the local head is
-    /// not a server operation at all, so `expected` (which names local heads)
-    /// cannot be used. A repo with no recorded server heads yet is publishing
-    /// its first deferred operation on top of whatever the read path resolved,
-    /// which is exactly `expected`.
-    fn start_chain(
-        &self,
-        expected: &[jj_backend_types::ContentId],
-        state: &DeferredState,
-        new_id: &OperationId,
-    ) -> Result<PendingPublishMarker, OpHeadsStoreError> {
-        let base = match &state.server {
-            Some(server) => server.head_ids().map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?,
-            None => expected.to_vec(),
-        };
-        let mut chain = PendingPublishMarker::new(&base);
-        // A clone whose workspace registration was deferred (roadmap/076) has
-        // one published-object, unpublished-head operation; it is the chain's
-        // first entry so the publisher advances past it in the same CAS.
-        if let Some(marker) = self.read_pending_registration()?
-            && let Some(pending) = marker.pending_op_id.as_deref()
-            && let Ok(pending) = jj_backend_types::ContentId::from_hex(pending)
-        {
-            chain.base_heads = marker.server_head_ids.clone();
-            // The registration's parents are exactly the server heads it was
-            // built on, which is therefore the only removal set it can be
-            // published with.
-            let removes: Vec<_> = marker
-                .server_head_ids
-                .iter()
-                .filter_map(|id| jj_backend_types::ContentId::from_hex(id).ok())
-                .collect();
-            chain.push_pruning(&pending, &removes, &[]);
-        }
-        Ok(chain)
-    }
-
-    /// An operation whose parents include something outside the chain merged
-    /// server state in, so the chain is now parented on the server's current
-    /// heads rather than the ones it started from.
-    fn rebase_chain_base(
-        &self,
-        mut chain: PendingPublishMarker,
-        expected: &[jj_backend_types::ContentId],
-        state: &DeferredState,
-    ) -> PendingPublishMarker {
-        let external: Vec<_> = expected
-            .iter()
-            .filter(|id| !chain.contains(id))
-            .copied()
-            .collect();
-        if external.is_empty() {
-            return chain;
-        }
-        if let Some(server) = &state.server
-            && let Ok(heads) = server.head_ids()
-            && !heads.is_empty()
-        {
-            chain.base_heads = heads.iter().map(ToString::to_string).collect();
-        }
-        chain
-    }
-
-    /// Serve the op heads from local state, without a backend round trip.
-    /// `None` when this repo has no local heads recorded yet and must resolve
-    /// them from the server once.
+    /// Write the seed into `heads.tmp` and rename it onto `heads`.
     ///
-    /// Divergence — known from the markers, or discovered by the budgeted
-    /// refresh — is surfaced as an extra head rather than resolved here: jj's
-    /// own op-head resolution drops ancestors and merges the rest, which is
-    /// the only place a view merge belongs.
-    fn serve_local_heads(
-        &self,
-        state: &DeferredState,
-    ) -> Result<Option<Vec<OperationId>>, OpHeadsStoreError> {
-        let Some(local) = self.read_local_heads()? else {
-            return Ok(None);
-        };
-        crate::vex::vex_client_stats()
-            .op_head_local_serves
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let local_ids: Vec<_> = local.iter().filter_map(content_id_from_op_id).collect();
-        let known = known_divergence(&local_ids, state.chain.as_ref(), state.server.as_ref())
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?;
-        if let Some(heads) = known {
-            return Ok(Some(heads.iter().map(op_id_from_content_id).collect()));
+    /// The rename is the commit point, so an interrupted bootstrap leaves a
+    /// stray `heads.tmp` and re-runs from scratch rather than leaving a
+    /// half-seeded `heads/` that would look authoritative.
+    fn write_seed(&self, seed: &[OperationId]) -> Result<(), OpHeadsStoreError> {
+        let staging = self.store_dir.join(HEADS_TMP_DIR);
+        if staging.exists() {
+            fs::remove_dir_all(&staging).map_err(read_error)?;
         }
-        if state
-            .chain
-            .as_ref()
-            .is_none_or(PendingPublishMarker::is_empty)
-            && let Some(heads) = refresh_once(
-                &self.store_dir,
-                &self.client,
-                self.refresh_budget,
-                &local_ids,
-                state.chain.as_ref(),
-                state.server.as_ref(),
-            )
-        {
-            return Ok(Some(heads.iter().map(op_id_from_content_id).collect()));
+        fs::create_dir_all(&staging).map_err(read_error)?;
+        for id in seed {
+            fs::write(staging.join(id.hex()), "").map_err(read_error)?;
         }
-        Ok(Some(local))
-    }
-
-    /// Resolve this repo's op heads from the server once, and adopt them as
-    /// the local heads. Only reached before a deferred-publish repo has any
-    /// local state — there is nothing to serve without it, so the read has to
-    /// happen, but it runs under a deadline rather than the client's
-    /// five-attempt retry against a 300 s per-request transport timeout, which
-    /// can otherwise stall a command for many minutes while it holds the
-    /// working-copy lock.
-    fn bootstrap_local_heads(&self) -> Result<Vec<jj_backend_types::ContentId>, OpHeadsStoreError> {
-        let deadline = crate::vex_publish::publish_rpc_deadline();
-        let ids = self
-            .client
-            .get_op_heads_within(deadline)
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?
-            .ok_or_else(|| {
-                OpHeadsStoreError::Read(Box::new(std::io::Error::other(format!(
-                    "the backend did not return this repository's operation heads within {}s",
-                    deadline.as_secs_f32()
-                ))))
-            })?;
-        self.record_server_heads(&ids)?;
-        crate::vex_publish::write_local_heads(&self.store_dir, &ids)
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?;
-        Ok(ids)
-    }
-
-    fn record_server_heads(
-        &self,
-        heads: &[jj_backend_types::ContentId],
-    ) -> Result<(), OpHeadsStoreError> {
-        crate::vex_publish::write_server_heads(
-            &self.store_dir,
-            &ServerHeadsMarker::new(heads.to_vec(), None),
-        )
-        .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))
-    }
-
-    /// Drain a queue left behind by a deferred-publish session before falling
-    /// back to a server read. Only reachable when this invocation publishes
-    /// inline, so the queue is always someone else's leftovers.
-    async fn drain_queue_before_server_read(&self) -> Result<(), OpHeadsStoreError> {
-        match crate::vex_publish::read_pending_publish(&self.store_dir) {
-            Ok(Some(chain)) if !chain.is_empty() => {}
-            _ => return Ok(()),
+        if let Ok(handle) = fs::File::open(&staging) {
+            drop(handle.sync_all());
         }
-        self.ensure_published()
-            .await
-            .map(|_| ())
-            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))
+        match fs::rename(&staging, self.heads_dir()) {
+            Ok(()) => {
+                tracing::info!(
+                    heads = seed.len(),
+                    "seeded the local operation-head directory from this repository's existing \
+                     state"
+                );
+                Ok(())
+            }
+            Err(err) if self.heads_dir().is_dir() => {
+                // Another process bootstrapped concurrently and won. Its seed
+                // came from the same sources, so discard ours.
+                tracing::debug!(error = %err, "lost the bootstrap race; keeping the other seed");
+                drop(fs::remove_dir_all(&staging));
+                Ok(())
+            }
+            Err(err) => Err(read_error(err)),
+        }
     }
 
-    /// Publish everything queued for this repo. Sync barriers call this before
-    /// their own backend work; a failure here must fail the barrier rather
-    /// than let the command proceed against a server that is behind.
-    pub async fn ensure_published(&self) -> Result<PublishOutcome, PublishError> {
-        let transport = VexClientTransport::new(&self.client);
-        VexPublisher::new(&self.store_dir, &transport).drain().await
-    }
-
-    async fn commit_new_head(
+    /// Mirror a head that is already stored locally to the server's CAS, under
+    /// the `VEX_PUBLISH_OP_LOG=1` escape. Best effort by construction: the
+    /// caller logs any error and keeps the local head.
+    async fn publish_head_best_effort(
         &self,
-        expected: &[jj_backend_types::ContentId],
+        old_ids: &[OperationId],
         new_id: &OperationId,
     ) -> Result<(), OpHeadsStoreError> {
+        // The root operation is synthetic and never written to the remote
+        // object store, so there is nothing to publish for it.
+        if is_root_operation_id(new_id) {
+            return Ok(());
+        }
+        let expected = old_ids
+            .iter()
+            .filter(|id| !is_root_operation_id(id))
+            .map(to_content_id)
+            .collect::<Result<Vec<_>, _>>()?;
         let new_content_id = to_content_id(new_id)?;
         let response = self
             .client
-            .commit_op_heads(expected, &new_content_id, &new_content_id)
+            .commit_op_heads(&expected, &new_content_id, &new_content_id)
             .await
             .map_err(|err| OpHeadsStoreError::Write {
                 new_op_id: new_id.clone(),
@@ -984,8 +367,32 @@ impl VexOpHeadsStore {
         if response.ok {
             Ok(())
         } else {
-            Err(refusal_error(&response, new_id))
+            Err(OpHeadsStoreError::Write {
+                new_op_id: new_id.clone(),
+                source: Box::new(classify_refusal(&response)),
+            })
         }
+    }
+
+    /// The write path, with the escape decision passed in so it can be
+    /// exercised without mutating the process environment.
+    async fn update_op_heads_publishing(
+        &self,
+        old_ids: &[OperationId],
+        new_id: &OperationId,
+        publish: bool,
+    ) -> Result<(), OpHeadsStoreError> {
+        self.ensure_heads_dir().await?;
+        self.simple.update_op_heads(old_ids, new_id).await?;
+        if publish
+            && let Err(err) = self.publish_head_best_effort(old_ids, new_id).await
+        {
+            tracing::warn!(
+                error = %err,
+                "VEX_PUBLISH_OP_LOG publish failed; the local head stands"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -995,136 +402,62 @@ impl OpHeadsStore for VexOpHeadsStore {
         Self::name_static()
     }
 
+    /// Record `new_id` as a head and retire `old_ids`.
+    ///
+    /// There is deliberately no root-operation short circuit here. The bootstrap
+    /// write `ReadonlyRepo::init` performs is exactly `update_op_heads(&[],
+    /// root_op_id)`, and swallowing it leaves `heads/` empty, so a freshly
+    /// initialised repository would resolve no heads at all.
+    ///
+    /// This cannot fail for concurrency reasons. `SimpleOpHeadsStore` adds
+    /// before it removes and tolerates a removal that finds nothing, so a
+    /// racing writer costs an extra head that jj merges — never a refusal, and
+    /// never a lost operation.
     async fn update_op_heads(
         &self,
         old_ids: &[OperationId],
         new_id: &OperationId,
     ) -> Result<(), OpHeadsStoreError> {
-        let expected = old_ids
-            .iter()
-            .filter(|id| !is_root_operation_id(id))
-            .map(to_content_id)
-            .collect::<Result<Vec<_>, _>>()?;
-        // The root operation is synthetic and never written to the remote object store.
-        // JJ bootstraps new repos by pointing op heads at that all-zero id first, and the
-        // first real operation CASes against that synthetic parent.
-        if expected.is_empty() && is_root_operation_id(new_id) {
-            return Ok(());
-        }
-        // Local-write mode (READ_ONLY CI runner): the op-head pointer update is a
-        // backend write (`commit_op_heads` -> gRPC `CommitOperation`) that the
-        // READ_ONLY token rejects ("repository access token lacks required
-        // permission"). Record the new head locally instead so the clone's
-        // working-copy operation is recorded without contacting the backend; the
-        // referenced operation/view objects are already in the local cache (see
-        // `VexClient::put_object`). `get_op_heads` reads this file back. Local
-        // heads stay authoritative forever — they are never folded to the server.
-        if self.local_writes {
-            return self.write_local_heads(new_id);
-        }
-        if let Some(marker) = self.read_pending_registration()?
-            && marker.pending_op_id.is_none()
-        {
-            return self.record_deferred_registration(marker, &expected, new_id);
-        }
-        // Deferred publication (roadmap/088): the operation is durable once its
-        // objects and the queue marker are on disk. A pending clone
-        // registration is not folded here — it becomes the queue's first entry
-        // and publishes with the rest.
-        if let Some(state) = self.deferred_state() {
-            return self.record_pending_operation(&state, &expected, new_id);
-        }
-        if let Some(marker) = self.read_pending_registration()? {
-            self.fold_pending_registration(&marker, new_id).await?;
-        }
-        self.commit_new_head(&expected, new_id).await
+        self.update_op_heads_publishing(
+            old_ids,
+            new_id,
+            publish_op_log_escape() && !self.local_writes,
+        )
+        .await
     }
 
+    /// Read the heads out of `heads/`. Zero backend calls, in every mode.
     async fn get_op_heads(&self) -> Result<Vec<OperationId>, OpHeadsStoreError> {
-        // Local-write mode: once the runner has recorded an op head locally, it is
-        // authoritative for this ephemeral workspace (we never advance the backend
-        // head), so serve it without a backend round trip. Before the first local
-        // write (e.g. resolving the clone's starting head) fall through to the
-        // backend read, which the READ_ONLY token is allowed to perform.
-        if self.local_writes {
-            if let Some(local) = self.read_local_heads()? {
-                return Ok(local);
-            }
-        } else if let Some(marker) = self.read_pending_registration()? {
-            if marker.pending_op_id.is_some()
-                && let Some(local) = self.read_local_heads()?
-            {
-                // A clone whose registration is still pending is normally
-                // authoritative for its own heads. It stops being so once the
-                // server has demonstrably moved off what this repo's queue is
-                // parented on: serving only the local head there would hide the
-                // divergence from jj, so the queue could never merge and would
-                // stay stuck forever. Serve both heads so jj's own op-head
-                // resolution merges them into a publishable merge operation.
-                let local_ids: Vec<_> = local.iter().filter_map(content_id_from_op_id).collect();
-                let state = self.deferred_state();
-                if let Some(state) = &state
-                    && let Some(heads) =
-                        known_divergence(&local_ids, state.chain.as_ref(), state.server.as_ref())
-                            .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?
-                {
-                    return Ok(heads.iter().map(op_id_from_content_id).collect());
-                }
-                // A clone that is only ever read keeps its registration
-                // pending forever, and serving the clone-time head for that
-                // whole window hides every other workspace's work. Fold the
-                // registration onto whatever the server holds now, which
-                // rejoins its lineage; a lost race or an unreachable server
-                // just falls through to the local head, exactly as before.
-                if let Some(heads) = self
-                    .fold_registration_onto_moved_head(&marker, &local_ids)
-                    .await
-                {
-                    return Ok(heads.iter().map(op_id_from_content_id).collect());
-                }
-                return Ok(local);
-            }
-        }
-        let deferred = self.deferred_state();
-        if let Some(state) = &deferred
-            && let Some(heads) = self.serve_local_heads(state)?
-        {
-            return Ok(heads);
-        }
-        // Publishing inline again (`sync` mode, or a repo whose markers cannot
-        // be read) has to start from a drained queue: the operation this read
-        // feeds is parented on whatever comes back, so the server must already
-        // hold everything recorded locally.
-        self.drain_queue_before_server_read().await?;
-        let Some(_state) = &deferred else {
-            let ids = self
-                .client
-                .get_op_heads()
-                .await
-                .map_err(|err| OpHeadsStoreError::Read(Box::new(err)))?;
-            return Ok(ids.iter().map(op_id_from_content_id).collect());
-        };
-        let ids = self.bootstrap_local_heads()?;
-        Ok(ids.iter().map(op_id_from_content_id).collect())
+        self.ensure_heads_dir().await?;
+        self.simple.get_op_heads().await
     }
 
+    /// A real `FileLock` on `heads/lock`.
+    ///
+    /// This is what makes `resolve_op_heads` safe under concurrency: N readers
+    /// that each find the repository divergent take this lock in turn, so one
+    /// writes the merge operation and the rest observe it, instead of all N
+    /// committing competing merges.
     async fn lock(&self) -> Result<Box<dyn OpHeadsStoreLock + '_>, OpHeadsStoreError> {
-        Ok(Box::new(VexNoopLock))
+        self.ensure_heads_dir().await?;
+        self.simple.lock().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::HashSet;
 
     use futures::executor::block_on;
 
     use super::*;
-    use crate::backend::CommitId;
-    use crate::op_store::RefTarget;
     use crate::vex::VexObjectReadMode;
+    use crate::vex_publish::ServerHeadsMarker;
+    use crate::vex_publish::VexDurability;
 
+    /// The configured endpoint is unroutable, so any backend round trip either
+    /// fails outright or costs a connection refusal — a test that succeeds
+    /// without one proves the path is local.
     fn test_config(local_writes: bool) -> VexRepoConfig {
         VexRepoConfig {
             endpoint: "http://127.0.0.1:1".to_string(),
@@ -1144,563 +477,361 @@ mod tests {
         }
     }
 
+    /// A store over an already-initialised repo: `heads/` exists, so nothing
+    /// here ever enters the bootstrap.
     fn store_at(dir: &Path, local_writes: bool) -> VexOpHeadsStore {
         VexOpHeadsStore::init(test_config(local_writes), dir).unwrap()
     }
 
-    /// A store in a deferred-publish mode with the freshness refresh disabled,
-    /// so every assertion below is about local state only. The configured
-    /// endpoint is unroutable: any backend round trip fails the test outright.
-    fn deferred_store_at(dir: &Path, durability: VexDurability) -> VexOpHeadsStore {
-        let mut store = VexOpHeadsStore::init(test_config(false), dir).unwrap();
-        store.durability = durability;
-        store.refresh_budget = None;
-        store
+    /// A store constructed straight over `dir`, without the `vex.json` lookup
+    /// `VexOpHeadsStore::load` performs. Used both to reopen an initialised
+    /// repo and to model a *pre-Stage-7* one, where the directory exists but
+    /// `heads/` does not.
+    fn store_over(dir: &Path, local_writes: bool) -> VexOpHeadsStore {
+        fs::create_dir_all(dir).unwrap();
+        let client = VexClient::from_config(test_config(local_writes)).unwrap();
+        VexOpHeadsStore::at(client, dir, local_writes)
     }
 
     fn op_id(byte: u8) -> OperationId {
         OperationId::new(vec![byte; ID_LENGTH])
     }
 
+    fn root_op_id() -> OperationId {
+        OperationId::new(vec![0; ID_LENGTH])
+    }
+
     fn content_id(byte: u8) -> jj_backend_types::ContentId {
         jj_backend_types::ContentId::from_bytes([byte; ID_LENGTH])
     }
 
-    fn pending_chain(dir: &Path) -> Option<PendingPublishMarker> {
-        crate::vex_publish::read_pending_publish(dir).unwrap()
+    fn heads_of(store: &VexOpHeadsStore) -> HashSet<OperationId> {
+        block_on(store.get_op_heads()).unwrap().into_iter().collect()
+    }
+
+    fn head_files(dir: &Path) -> HashSet<String> {
+        fs::read_dir(dir.join(HEADS_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The bootstrap write `ReadonlyRepo::init` performs. The old store
+    /// short-circuited it, which under local storage would leave `heads/` empty
+    /// and the repository with no resolvable operation at all.
+    #[test]
+    fn root_operation_is_written_as_a_head_not_swallowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_at(temp.path(), false);
+
+        block_on(store.update_op_heads(&[], &root_op_id())).unwrap();
+
+        assert_eq!(heads_of(&store), HashSet::from([root_op_id()]));
+        assert_eq!(head_files(temp.path()), HashSet::from(["0".repeat(64)]));
     }
 
     #[test]
-    fn armed_registration_records_local_head_and_marker() {
+    fn update_op_heads_adds_the_new_head_before_removing_old_ones() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_at(temp.path(), false);
-        VexOpHeadsStore::arm_deferred_registration(temp.path(), "vex-clone-1").unwrap();
+        block_on(store.update_op_heads(&[], &op_id(1))).unwrap();
 
-        assert_eq!(store.read_pending_registration().unwrap().unwrap(), {
-            PendingRegistration {
-                workspace_name: "vex-clone-1".to_string(),
-                pending_op_id: None,
-                server_head_ids: Vec::new(),
-            }
+        block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).unwrap();
+        assert_eq!(heads_of(&store), HashSet::from([op_id(2)]));
+
+        // The ordering property itself: with the old head already gone the
+        // removal is a no-op, and the add still happened, so the repository is
+        // never left with zero heads.
+        fs::remove_file(temp.path().join(HEADS_DIR).join(op_id(2).hex())).unwrap();
+        fs::write(temp.path().join(HEADS_DIR).join(op_id(5).hex()), "").unwrap();
+        block_on(store.update_op_heads(&[op_id(2)], &op_id(6))).unwrap();
+        assert_eq!(heads_of(&store), HashSet::from([op_id(5), op_id(6)]));
+    }
+
+    #[test]
+    fn removing_a_head_that_is_already_gone_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_at(temp.path(), false);
+        block_on(store.update_op_heads(&[op_id(9)], &op_id(1))).unwrap();
+        assert_eq!(heads_of(&store), HashSet::from([op_id(1)]));
+    }
+
+    /// Two independent stores over one directory, committing at the same time.
+    /// Both heads must survive: this is the S14(a) property in-process, and it
+    /// is what the pre-Stage-7 whole-file rewrite of `vex-local-heads` could
+    /// not provide, because the second writer replaced the first writer's file.
+    #[test]
+    fn two_stores_on_one_dir_each_committing_leave_both_heads() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let seed = store_at(&dir, false);
+        block_on(seed.update_op_heads(&[], &root_op_id())).unwrap();
+
+        let handles: Vec<_> = [op_id(1), op_id(2)]
+            .into_iter()
+            .map(|id| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let store = store_over(&dir, false);
+                    block_on(store.update_op_heads(&[root_op_id()], &id)).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let heads = heads_of(&seed);
+        assert!(heads.contains(&op_id(1)), "{heads:?}");
+        assert!(heads.contains(&op_id(2)), "{heads:?}");
+    }
+
+    #[test]
+    fn lock_is_held_and_excludes_a_second_locker() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let store = store_at(&dir, false);
+        let held = block_on(store.lock()).unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let other = store_over(&dir, false);
+            let lock = block_on(other.lock()).unwrap();
+            let _ = sender.send(());
+            drop(lock);
         });
-        assert!(store.read_local_heads().unwrap().is_none());
-
-        let parent = op_id(1);
-        let workspace_op = op_id(2);
-        block_on(store.update_op_heads(std::slice::from_ref(&parent), &workspace_op)).unwrap();
-
-        assert_eq!(
-            store.read_local_heads().unwrap(),
-            Some(vec![workspace_op.clone()])
-        );
-        let marker = store.read_pending_registration().unwrap().unwrap();
-        assert_eq!(marker.workspace_name, "vex-clone-1");
-        assert_eq!(
-            marker.pending_op_id.as_deref(),
-            Some(to_content_id(&workspace_op).unwrap().to_string().as_str())
-        );
-        assert_eq!(
-            marker.server_head_ids,
-            vec![to_content_id(&parent).unwrap().to_string()]
-        );
-        assert_eq!(
-            block_on(store.get_op_heads()).unwrap(),
-            vec![workspace_op.clone()]
-        );
-
-        store.clear_deferred_registration(&workspace_op).unwrap();
-        assert!(store.read_local_heads().unwrap().is_none());
-        assert!(store.read_pending_registration().unwrap().is_none());
-        store.clear_deferred_registration(&workspace_op).unwrap();
-    }
-
-    #[test]
-    fn armed_registration_with_root_parent_records_empty_server_heads() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = store_at(temp.path(), false);
-        VexOpHeadsStore::arm_deferred_registration(temp.path(), "vex-clone-1").unwrap();
-
-        let workspace_op = op_id(2);
-        block_on(store.update_op_heads(&[OperationId::new(vec![0; ID_LENGTH])], &workspace_op))
-            .unwrap();
-        let marker = store.read_pending_registration().unwrap().unwrap();
-        assert!(marker.server_head_ids.is_empty());
-    }
-
-    #[test]
-    fn local_writes_mode_keeps_local_heads_authoritative_and_ignores_marker() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = store_at(temp.path(), true);
-        VexOpHeadsStore::arm_deferred_registration(temp.path(), "vex-clone-1").unwrap();
-
-        let first = op_id(3);
-        block_on(store.update_op_heads(&[op_id(1)], &first)).unwrap();
-        assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![first.clone()]);
-
-        let second = op_id(4);
-        block_on(store.update_op_heads(std::slice::from_ref(&first), &second)).unwrap();
-        assert_eq!(
-            block_on(store.get_op_heads()).unwrap(),
-            vec![second.clone()]
-        );
-        let marker = store.read_pending_registration().unwrap().unwrap();
-        assert_eq!(marker.pending_op_id, None);
-    }
-
-    #[test]
-    fn stale_local_heads_without_marker_are_not_served_in_normal_mode() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = store_at(temp.path(), false);
-        store.write_local_heads(&op_id(5)).unwrap();
-        assert!(block_on(store.get_op_heads()).is_err());
-    }
-
-    #[test]
-    fn pending_registration_marker_round_trips() {
-        let armed = PendingRegistration {
-            workspace_name: "ws".to_string(),
-            pending_op_id: None,
-            server_head_ids: Vec::new(),
-        };
-        let json = serde_json::to_string(&armed).unwrap();
-        assert_eq!(
-            serde_json::from_str::<PendingRegistration>(&json).unwrap(),
-            armed
-        );
-
-        let pending = PendingRegistration {
-            workspace_name: "ws".to_string(),
-            pending_op_id: Some("aa".repeat(32)),
-            server_head_ids: vec!["bb".repeat(32)],
-        };
-        let json = serde_json::to_string(&pending).unwrap();
-        assert_eq!(
-            serde_json::from_str::<PendingRegistration>(&json).unwrap(),
-            pending
-        );
-    }
-
-    #[test]
-    fn local_first_mutation_records_locally_without_a_backend_cas() {
-        let _guard = crate::vex::test_stats_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(1)], None),
-        )
-        .unwrap();
-
-        let first = op_id(2);
-        block_on(store.update_op_heads(&[op_id(1)], &first)).unwrap();
-
-        assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![first.clone()]);
-        let chain = pending_chain(temp.path()).unwrap();
-        assert_eq!(chain.base_heads, vec![content_id(1).to_string()]);
-        assert_eq!(chain.ops.len(), 1);
-        assert_eq!(chain.ops[0].op, content_id(2).to_string());
-    }
-
-    #[test]
-    fn a_burst_of_local_operations_queues_one_chain_on_one_base() {
-        let _guard = crate::vex::test_stats_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(1)], None),
-        )
-        .unwrap();
-
-        let mut parent = op_id(1);
-        for byte in 2..12 {
-            let next = op_id(byte);
-            block_on(store.update_op_heads(std::slice::from_ref(&parent), &next)).unwrap();
-            parent = next;
-        }
-
-        let chain = pending_chain(temp.path()).unwrap();
-        assert_eq!(chain.ops.len(), 10);
-        assert_eq!(
-            chain.base_heads,
-            vec![content_id(1).to_string()],
-            "every operation in the burst publishes from the one recorded server head"
-        );
-        assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![op_id(11)]);
-    }
-
-    #[test]
-    fn a_chain_started_after_a_coalesced_publish_uses_the_server_head_as_its_base() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        // The server holds a rewrite of local operation 5.
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(9)], Some(content_id(5))),
-        )
-        .unwrap();
-        crate::vex_publish::write_local_heads(temp.path(), &[content_id(5)]).unwrap();
-
-        block_on(store.update_op_heads(&[op_id(5)], &op_id(6))).unwrap();
-
-        let chain = pending_chain(temp.path()).unwrap();
-        assert_eq!(
-            chain.base_heads,
-            vec![content_id(9).to_string()],
-            "the CAS base is the server head, never the aliased local head"
-        );
-    }
-
-    #[test]
-    fn merging_a_moved_server_head_rebases_the_chain_base() {
-        let _guard = crate::vex::test_stats_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(1)], None),
-        )
-        .unwrap();
-        block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).unwrap();
-
-        // The publisher hit a CAS conflict and recorded where the server is.
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(7)], None),
-        )
-        .unwrap();
-        assert_eq!(
-            block_on(store.get_op_heads()).unwrap(),
-            vec![op_id(2), op_id(7)],
-            "a known-diverged repo serves both heads so jj merges them"
-        );
-
-        // jj merges the two heads into one operation.
-        block_on(store.update_op_heads(&[op_id(2), op_id(7)], &op_id(3))).unwrap();
-
-        let chain = pending_chain(temp.path()).unwrap();
-        assert_eq!(chain.base_heads, vec![content_id(7).to_string()]);
-        assert_eq!(chain.ops.len(), 2);
-        assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![op_id(3)]);
-    }
-
-    /// The read half of the divergence fix: while a chain is queued and the
-    /// recorded server heads are off its base, both heads are served so jj's
-    /// own op-head resolution merges them. Serving only the local head is what
-    /// left the queue with nothing that could ever be CASed onto the moved
-    /// server head.
-    #[test]
-    fn a_queued_chain_serves_the_union_of_local_and_server_heads() {
-        let _guard = crate::vex::test_stats_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(1)], None),
-        )
-        .unwrap();
-        let mut parent = op_id(1);
-        for byte in 2..5 {
-            let next = op_id(byte);
-            block_on(store.update_op_heads(std::slice::from_ref(&parent), &next)).unwrap();
-            parent = next;
-        }
-        assert_eq!(
-            block_on(store.get_op_heads()).unwrap(),
-            vec![op_id(4)],
-            "a chain still parented on the recorded server head is not divergent"
-        );
-
-        // The publisher hit the moved head and recorded it.
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(9)], None),
-        )
-        .unwrap();
-
-        assert_eq!(
-            block_on(store.get_op_heads()).unwrap(),
-            vec![op_id(4), op_id(9)],
-            "both heads are served so jj merges them into a publishable operation"
-        );
-
-        // jj's merge lands as the chain's next entry, and the chain is rebased
-        // onto the head it merged in.
-        block_on(store.update_op_heads(&[op_id(4), op_id(9)], &op_id(10))).unwrap();
-        let chain = pending_chain(temp.path()).unwrap();
-        assert_eq!(chain.base_heads, vec![content_id(9).to_string()]);
-        assert_eq!(chain.ops.len(), 4);
-        assert_eq!(chain.ops.last().unwrap().op, content_id(10).to_string());
-        assert_eq!(
-            block_on(store.get_op_heads()).unwrap(),
-            vec![op_id(10)],
-            "once the merge is queued the repo is no longer divergent"
-        );
-    }
-
-    /// `local_writes` (the READ_ONLY CI runner) never publishes and never
-    /// merges: its local heads stay authoritative even with deferred-publish
-    /// markers sitting beside them.
-    #[test]
-    fn local_writes_ignores_divergent_publish_markers() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = store_at(temp.path(), true);
-        block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).unwrap();
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(9)], None),
-        )
-        .unwrap();
-        let mut chain = PendingPublishMarker::new(&[content_id(1)]);
-        chain.push_pruning(&content_id(2), &[content_id(1)], &[]);
-        crate::vex_publish::write_pending_publish(temp.path(), &chain).unwrap();
-
-        assert_eq!(block_on(store.get_op_heads()).unwrap(), vec![op_id(2)]);
         assert!(
-            pending_chain(temp.path()).is_some(),
-            "the queue is untouched"
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second locker must not get in while the first holds the lock"
         );
+
+        drop(held);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the lock is released on drop");
+        waiter.join().unwrap();
     }
 
-    /// The configured endpoint is unroutable, so a resolution that returned
-    /// heads at all proves no backend round trip was on the path — a stronger
-    /// statement than a counter, which is process-global and shared with every
-    /// other test in this binary. The local-serve counter is still checked as
-    /// a delta, since only this module writes it.
+    /// `local_writes` is no longer a storage scheme. Keeping a second
+    /// authoritative head store behind a per-process boolean — the same
+    /// `.jj/repo` can be opened with it both set and unset — is a head-loss
+    /// vector by construction.
     #[test]
-    fn a_converged_local_first_repo_serves_heads_with_no_backend_rpcs() {
-        let _guard = crate::vex::test_stats_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+    fn local_writes_uses_the_same_heads_directory_as_every_other_mode() {
         let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        crate::vex_publish::write_server_heads(
-            temp.path(),
-            &ServerHeadsMarker::new(vec![content_id(1)], None),
+        let store = store_at(temp.path(), true);
+        block_on(store.update_op_heads(&[], &op_id(3))).unwrap();
+
+        assert_eq!(head_files(temp.path()), HashSet::from([op_id(3).hex()]));
+        assert!(
+            !temp
+                .path()
+                .join(crate::vex_publish::LOCAL_HEADS_FILE)
+                .exists(),
+            "the flat local-heads file is never written again"
+        );
+        // And the same directory is what a non-local_writes store reads.
+        let other = store_over(temp.path(), false);
+        assert_eq!(heads_of(&other), HashSet::from([op_id(3)]));
+    }
+
+    #[test]
+    fn bootstrap_seeds_every_id_from_vex_local_heads_without_a_client() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            temp.path().join(crate::vex_publish::LOCAL_HEADS_FILE),
+            format!("{}\n{}\n", content_id(1), content_id(2)),
         )
         .unwrap();
-        crate::vex_publish::write_local_heads(temp.path(), &[content_id(1)]).unwrap();
+        let store = store_over(temp.path(), false);
 
-        let before = crate::vex::vex_client_stats_snapshot().op_head_local_serves;
-        let heads = block_on(store.get_op_heads()).unwrap();
-        let after = crate::vex::vex_client_stats_snapshot().op_head_local_serves;
-
-        assert_eq!(heads, vec![op_id(1)]);
-        assert_eq!(after - before, 1);
+        assert_eq!(heads_of(&store), HashSet::from([op_id(1), op_id(2)]));
+        assert!(!temp.path().join(HEADS_TMP_DIR).exists());
     }
 
     #[test]
-    fn a_deferred_clone_registration_becomes_the_chains_first_entry() {
+    fn bootstrap_seeds_all_server_head_ids_not_just_one() {
         let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
-        VexOpHeadsStore::arm_deferred_registration(temp.path(), "vex-clone-1").unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        // A v1 marker, as a pre-Stage-7 client left it, recording a divergent
+        // repository. Narrowing this to one id is the silent head loss.
+        fs::write(
+            temp.path().join(crate::vex_publish::SERVER_HEADS_FILE),
+            format!(
+                r#"{{"v":1,"heads":["{}","{}","{}"],"updated_unix":1}}"#,
+                content_id(4),
+                content_id(5),
+                content_id(6)
+            ),
+        )
+        .unwrap();
+        let store = store_over(temp.path(), false);
 
-        let workspace_op = op_id(2);
-        block_on(store.update_op_heads(&[op_id(1)], &workspace_op)).unwrap();
-        // The armed registration still takes the 076 path.
-        assert!(pending_chain(temp.path()).is_none());
-
-        block_on(store.update_op_heads(&[workspace_op.clone()], &op_id(3))).unwrap();
-
-        let chain = pending_chain(temp.path()).unwrap();
         assert_eq!(
-            chain.base_heads,
-            vec![content_id(1).to_string()],
-            "the chain inherits the registration's recorded server heads"
+            heads_of(&store),
+            HashSet::from([op_id(4), op_id(5), op_id(6)])
         );
-        assert_eq!(chain.ops.len(), 2);
-        assert_eq!(chain.ops[0].op, content_id(2).to_string());
-        assert_eq!(chain.ops[1].op, content_id(3).to_string());
     }
 
+    /// The seed is a union of local sources, and it is complete before any RPC
+    /// is considered — step (d) only runs when nothing local was found. The
+    /// unroutable endpoint proves it: a bootstrap that consulted the backend
+    /// here would have to fail or stall.
     #[test]
-    fn an_unreadable_marker_falls_back_to_synchronous_publication() {
+    fn bootstrap_prefers_local_heads_over_any_rpc() {
         let temp = tempfile::tempdir().unwrap();
-        let store = deferred_store_at(temp.path(), VexDurability::LocalFirst);
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            temp.path().join(crate::vex_publish::LOCAL_HEADS_FILE),
+            format!("{}\n", content_id(1)),
+        )
+        .unwrap();
         fs::write(
             temp.path().join(crate::vex_publish::PENDING_PUBLISH_FILE),
-            "{\"v\":99}",
+            format!(
+                r#"{{"v":2,"base_heads":["{}"],"ops":[{{"op":"{}"}},{{"op":"{}"}}]}}"#,
+                content_id(1),
+                content_id(7),
+                content_id(8)
+            ),
         )
         .unwrap();
+        let store = store_over(temp.path(), false);
 
-        // With no usable marker the mutation takes the inline CAS path, which
-        // this unroutable endpoint cannot complete.
-        assert!(block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).is_err());
+        let started = std::time::Instant::now();
+        let heads = heads_of(&store);
         assert!(
-            crate::vex_publish::read_local_heads(temp.path())
-                .unwrap()
-                .is_none()
+            started.elapsed() < Duration::from_secs(2),
+            "the bootstrap must not have gone near the network"
+        );
+        assert_eq!(
+            heads,
+            HashSet::from([op_id(1), op_id(8)]),
+            "the local head and the queue tip, unioned"
+        );
+    }
+
+    /// The permanent guard. Once `heads/` exists no later load may consult the
+    /// backend or the legacy markers again — the directory is the whole truth.
+    #[test]
+    fn bootstrap_never_runs_twice_once_heads_dir_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            temp.path().join(crate::vex_publish::LOCAL_HEADS_FILE),
+            format!("{}\n", content_id(1)),
+        )
+        .unwrap();
+        let first = store_over(temp.path(), false);
+        assert_eq!(heads_of(&first), HashSet::from([op_id(1)]));
+
+        // The repository moves on, and the stale marker is deliberately left
+        // behind (Stage 9 deletes the marker family).
+        block_on(first.update_op_heads(&[op_id(1)], &op_id(2))).unwrap();
+
+        // A brand new store, with no in-process memo, must serve the directory
+        // and must not re-seed from the marker.
+        let second = store_over(temp.path(), false);
+        assert_eq!(heads_of(&second), HashSet::from([op_id(2)]));
+        assert!(
+            temp.path()
+                .join(crate::vex_publish::LOCAL_HEADS_FILE)
+                .exists(),
+            "the legacy marker is left alone, and ignored"
         );
     }
 
     #[test]
-    fn sync_mode_keeps_the_pre_088_paths() {
+    fn bootstrap_with_no_local_source_and_no_server_errors_rather_than_seeding_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_over(temp.path(), true);
+
+        let error = block_on(store.get_op_heads()).unwrap_err();
+        assert!(
+            error.to_string().contains("operation")
+                || format!("{error:?}").contains("vex clone"),
+            "{error:?}"
+        );
+        assert!(
+            !temp.path().join(HEADS_DIR).exists(),
+            "an empty heads directory would tell jj the repo has no operations"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_bootstrap_leaves_no_heads_dir_and_reruns() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        // A crash between "staged the seed" and "renamed it into place".
+        let staging = temp.path().join(HEADS_TMP_DIR);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join(op_id(9).hex()), "").unwrap();
+        assert!(!temp.path().join(HEADS_DIR).exists());
+
+        fs::write(
+            temp.path().join(crate::vex_publish::LOCAL_HEADS_FILE),
+            format!("{}\n", content_id(1)),
+        )
+        .unwrap();
+        let store = store_over(temp.path(), false);
+
+        assert_eq!(
+            heads_of(&store),
+            HashSet::from([op_id(1)]),
+            "the re-run seeds from the sources, not from the abandoned staging dir"
+        );
+        assert!(!staging.exists());
+    }
+
+    /// S1, counter-asserted: an ordinary read/write session touches the client
+    /// zero times. Any RPC against this endpoint would fail, so completing at
+    /// all is the proof.
+    #[test]
+    fn get_op_heads_makes_zero_backend_calls() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_at(temp.path(), false);
-
-        // No local state is consulted or written; both paths go to the backend.
-        assert!(block_on(store.update_op_heads(&[op_id(1)], &op_id(2))).is_err());
-        assert!(block_on(store.get_op_heads()).is_err());
-        assert!(pending_chain(temp.path()).is_none());
-        assert!(
-            crate::vex_publish::read_server_heads(temp.path())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            crate::vex_publish::read_local_heads(temp.path())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn registration_view_on_head_carries_workspace_entry_only() {
-        let commit = |byte: u8| CommitId::new(vec![byte; ID_LENGTH]);
-        let mut pending_view = View {
-            head_ids: HashSet::from([commit(1), commit(2)]),
-            local_bookmarks: BTreeMap::new(),
-            local_tags: BTreeMap::new(),
-            remote_views: BTreeMap::new(),
-            git_refs: BTreeMap::new(),
-            git_head: RefTarget::absent(),
-            wc_commit_ids: BTreeMap::new(),
-        };
-        pending_view
-            .wc_commit_ids
-            .insert(WorkspaceNameBuf::from("vex-clone-1".to_string()), commit(2));
-        pending_view
-            .local_bookmarks
-            .insert("master".into(), RefTarget::normal(commit(1)));
-
-        let head_view = View {
-            head_ids: HashSet::from([commit(3)]),
-            local_bookmarks: BTreeMap::new(),
-            local_tags: BTreeMap::new(),
-            remote_views: BTreeMap::new(),
-            git_refs: BTreeMap::new(),
-            git_head: RefTarget::absent(),
-            wc_commit_ids: BTreeMap::from([(
-                WorkspaceNameBuf::from("other".to_string()),
-                commit(3),
-            )]),
-        };
-
-        let rebuilt = registration_view_on_head(head_view, &pending_view, "vex-clone-1").unwrap();
-        assert_eq!(rebuilt.head_ids, HashSet::from([commit(2), commit(3)]));
-        assert_eq!(
-            rebuilt.wc_commit_ids,
-            BTreeMap::from([
-                (WorkspaceNameBuf::from("other".to_string()), commit(3)),
-                (WorkspaceNameBuf::from("vex-clone-1".to_string()), commit(2)),
-            ])
-        );
-        assert!(rebuilt.local_bookmarks.is_empty());
-
-        let head_view = View {
-            head_ids: HashSet::new(),
-            local_bookmarks: BTreeMap::new(),
-            local_tags: BTreeMap::new(),
-            remote_views: BTreeMap::new(),
-            git_refs: BTreeMap::new(),
-            git_head: RefTarget::absent(),
-            wc_commit_ids: BTreeMap::new(),
-        };
-        assert!(registration_view_on_head(head_view, &pending_view, "unknown").is_err());
-    }
-
-    /// A refused `CommitOperation` response, as the server sends it.
-    fn refusal_response(
-        reason: jj_backend_api::CommitOperationFailureReason,
-        heads: &[jj_backend_types::ContentId],
-        limit: u32,
-    ) -> jj_backend_api::CommitOperationResponse {
-        jj_backend_api::CommitOperationResponse {
-            ok: false,
-            current_op_head_ids: heads.iter().map(ToString::to_string).collect(),
-            error_message: "CAS conflict on op heads".to_string(),
-            failure_reason: reason as i32,
-            effective_max_op_heads: limit,
-            divergence_applied: false,
+        let mut parent = root_op_id();
+        block_on(store.update_op_heads(&[], &parent)).unwrap();
+        for byte in 1..8 {
+            let next = op_id(byte);
+            block_on(store.update_op_heads(std::slice::from_ref(&parent), &next)).unwrap();
+            assert_eq!(heads_of(&store), HashSet::from([next.clone()]));
+            parent = next;
         }
     }
 
-    fn conflict_source(error: &OpHeadsStoreError) -> &crate::vex_op_head_delta::OpHeadCasConflict {
-        let OpHeadsStoreError::Write { source, .. } = error else {
-            panic!("expected a write error, got {error:?}");
-        };
-        source
-            .downcast_ref::<crate::vex_op_head_delta::OpHeadCasConflict>()
-            .expect("the refusal should travel as a typed source")
+    /// The escape is off by default, and when on it can only ever add a server
+    /// round trip — it can never turn a durable local write into a failure.
+    #[test]
+    fn publish_op_log_escape_publishes_but_never_fails_the_write() {
+        assert!(
+            !publish_op_log_escape(),
+            "the escape must be opt-in; the fleet default is local-only"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_at(temp.path(), false);
+        // `publish = true` against an unroutable endpoint: the publish attempt
+        // is made and fails, and the write still succeeds.
+        block_on(store.update_op_heads_publishing(&[], &op_id(1), true)).unwrap();
+        block_on(store.update_op_heads_publishing(&[op_id(1)], &op_id(2), true)).unwrap();
+        assert_eq!(heads_of(&store), HashSet::from([op_id(2)]));
     }
 
+    /// The marker family is read for the bootstrap and never written again.
     #[test]
-    fn every_publish_asks_for_the_delta_semantics_by_default() {
-        // The process environment is untouched here, which is the fleet
-        // default; the opt-out values are covered in `vex_op_head_delta`.
-        assert!(crate::vex_op_head_delta::divergence_ok());
-        assert_eq!(crate::vex_op_head_delta::max_op_heads(), 0);
-    }
-
-    #[test]
-    fn a_precondition_refusal_is_the_same_conflict_as_before() {
-        let error = refusal_error(
-            &refusal_response(
-                jj_backend_api::CommitOperationFailureReason::PreconditionUnmet,
-                &[content_id(1)],
-                32,
-            ),
-            &op_id(2),
-        );
-        // The message every out-of-crate retry loop still matches on.
-        assert_eq!(
-            conflict_source(&error).to_string(),
-            "CAS conflict on op heads"
-        );
-        assert_eq!(
-            conflict_source(&error).refusal(),
-            crate::vex_op_head_delta::OpHeadRefusal::PreconditionUnmet
-        );
-        assert!(crate::transaction::is_op_heads_cas_conflict(
-            &crate::transaction::TransactionCommitError::OpHeadsStore(error)
-        ));
-    }
-
-    #[test]
-    fn a_saturation_refusal_names_itself_and_carries_the_heads_to_retry_from() {
-        let error = refusal_error(
-            &refusal_response(
-                jj_backend_api::CommitOperationFailureReason::HeadSetBoundExceeded,
-                &[content_id(1), content_id(2)],
-                2,
-            ),
-            &op_id(3),
-        );
-        let conflict = conflict_source(&error);
-        assert_eq!(
-            conflict.refusal(),
-            crate::vex_op_head_delta::OpHeadRefusal::HeadSetSaturated
-        );
-        // Reconciliation reads the live heads off the refusal itself, so the
-        // retry costs no extra round trip.
-        assert_eq!(
-            conflict.current_heads(),
-            [content_id(1).to_string(), content_id(2).to_string()]
-        );
-        let message = conflict.to_string();
-        assert!(message.contains("saturated"), "{message}");
-        assert!(!message.contains("head keeps moving"), "{message}");
-        // Still retryable: the reload merges the divergence back down.
-        assert!(crate::transaction::is_op_heads_cas_conflict(
-            &crate::transaction::TransactionCommitError::OpHeadsStore(error)
-        ));
+    fn a_v1_server_heads_marker_is_readable_by_the_bootstrap() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::vex_publish::write_server_heads(
+            temp.path(),
+            &ServerHeadsMarker::new(Some("token".to_string())),
+        )
+        .unwrap();
+        // A v2 marker carries no heads, so it contributes nothing to a seed.
+        let store = store_over(temp.path(), true);
+        assert!(block_on(store.get_op_heads()).is_err());
     }
 }

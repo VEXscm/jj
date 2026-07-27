@@ -63,7 +63,6 @@ use crate::signing::SignInitError;
 use crate::signing::Signer;
 use crate::simple_backend::SimpleBackend;
 use crate::transaction::TransactionCommitError;
-use crate::transaction::is_op_heads_cas_conflict;
 use crate::vex::CloneBlobMode;
 use crate::vex::VexRepoConfig;
 use crate::vex::create_store_factories;
@@ -315,16 +314,6 @@ async fn init_working_copy_with_parents(
     Ok((working_copy, repo))
 }
 
-/// Vex's production op-head store uses a strict single-head CAS. A large
-/// clone can spend many minutes fetching metadata after loading its initial
-/// operation, so its final workspace transaction is often based on an old
-/// operation head. Retrying the already-written operation cannot work: the
-/// server validates that the operation's parent ids equal the CAS expected
-/// head. Instead, reload the current operation and rebuild the workspace view
-/// mutation on top of it. The workspace name is unique to this clone, so this
-/// preserves concurrent view changes rather than replacing them.
-const MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS: u32 = 3;
-
 fn vex_clone_local_bookmark_to_set<'name, 'commit>(
     repo: &ReadonlyRepo,
     resolved_trunk: Option<&'name str>,
@@ -355,47 +344,32 @@ async fn commit_vex_clone_workspace_operation(
         let bookmark_name: &crate::ref_name::RefName = name.as_ref();
         repo.view().get_local_bookmark(bookmark_name).clone()
     });
-    // The clone's first `load_at_head()` happens before manifest/prefetch work.
-    // Refresh immediately before constructing the write transaction, then do
-    // so again after an exact CAS rejection. Each attempt writes a new
-    // operation whose parent is the currently published head.
-    let mut repo = reload_vex_clone_repo_at_head(repo).await?;
-    let mut attempt = 1;
-    loop {
-        // A clone's workspace name is fresh, but the resolved trunk bookmark
-        // is shared state. If another operation moved it while this clone was
-        // fetching, preserve that newer value instead of resetting it to the
-        // clone's earlier checkout target.
-        let local_bookmark = vex_clone_local_bookmark_to_set(
-            &repo,
-            resolved_trunk,
-            initial_resolved_trunk_target.as_ref(),
-            start_commit,
-        );
-        match commit_workspace_operation(
-            &repo,
-            workspace_name,
-            std::slice::from_ref(start_commit),
-            local_bookmark,
-        )
-        .await
-        {
-            Ok(repo) => return Ok(repo),
-            Err(WorkspaceInitError::TransactionCommit(error))
-                if attempt < MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS
-                    && is_op_heads_cas_conflict(&error) =>
-            {
-                tracing::warn!(
-                    attempt,
-                    max_attempts = MAX_VEX_CLONE_WORKSPACE_OPERATION_ATTEMPTS,
-                    "vex clone workspace op-head CAS conflict; reloading and retrying"
-                );
-                repo = reload_vex_clone_repo_at_head(&repo).await?;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    // The clone's first `load_at_head()` happens before manifest/prefetch work,
+    // so refresh immediately before constructing the write transaction.
+    //
+    // There is no retry ladder here any more (roadmap/088 Stage 7, S11). It
+    // existed because the op head was a strict single-head CAS on the server,
+    // which a slow clone lost to any concurrent writer. Op heads are local now:
+    // the write cannot be refused for concurrency reasons at all, so a loop
+    // would have nothing to retry.
+    let repo = reload_vex_clone_repo_at_head(repo).await?;
+    // A clone's workspace name is fresh, but the resolved trunk bookmark is
+    // shared state. If another operation moved it while this clone was
+    // fetching, preserve that newer value instead of resetting it to the
+    // clone's earlier checkout target.
+    let local_bookmark = vex_clone_local_bookmark_to_set(
+        &repo,
+        resolved_trunk,
+        initial_resolved_trunk_target.as_ref(),
+        start_commit,
+    );
+    commit_workspace_operation(
+        &repo,
+        workspace_name,
+        std::slice::from_ref(start_commit),
+        local_bookmark,
+    )
+    .await
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -681,9 +655,10 @@ impl Workspace {
                     Ok(Box::new(VexBackend::init(backend_config.clone())?))
                 },
                 signer,
-                &move |_settings, _store_path, root_data| {
+                &move |_settings, store_path, root_data| {
                     Ok(Box::new(VexOpStore::init(
                         op_store_config.clone(),
+                        store_path,
                         root_data,
                     )?))
                 },
@@ -787,6 +762,19 @@ impl Workspace {
             std::fs::create_dir(&op_heads_path).context(&op_heads_path)?;
             fs::write(op_heads_path.join("type"), VexOpHeadsStore::name_static())
                 .context(op_heads_path.join("type"))?;
+            // roadmap/088 Stage 7: a clone starts a *fresh local* operation
+            // log, rooted at the synthetic root operation, rather than
+            // inheriting the server's. Creating the directory here is also what
+            // permanently disqualifies a clone from the one-time bootstrap in
+            // `VexOpHeadsStore`, so a fresh clone can never read op heads from
+            // the backend. The view is rebuilt from `list_refs` by the clone
+            // transaction below, which is the only thing that was ever read out
+            // of the published log.
+            let heads_path = op_heads_path.join("heads");
+            std::fs::create_dir(&heads_path).context(&heads_path)?;
+            // The root operation id is 32 all-zero bytes (see `VexOpStore`).
+            let root_op_hex = crate::op_store::OperationId::from_bytes(&[0; 32]).hex();
+            fs::write(heads_path.join(&root_op_hex), "").context(heads_path.join(&root_op_hex))?;
 
             let index_path = repo_dir.join("index");
             std::fs::create_dir(&index_path).context(&index_path)?;
@@ -910,13 +898,6 @@ impl Workspace {
                     hydrate_start_commit_blobs(&repo, &store_path, &start_commit, progress).await;
             }
             let workspace_name = vex_clone_workspace_name(workspace_root);
-            // Arm the op-heads store so the workspace operation below commits
-            // locally; the first mutating operation publishes it transparently.
-            // `local_writes` repos remain local forever.
-            if !register_workspace && !config.local_writes {
-                VexOpHeadsStore::arm_deferred_registration(&op_heads_path, workspace_name.as_str())
-                    .context(&op_heads_path)?;
-            }
             let init_working_copy = init_vex_clone_working_copy_at(
                 &repo,
                 workspace_root,
