@@ -723,7 +723,9 @@ impl Workspace {
         // On the default (`target_commit == None`) path this selects the start
         // commit through native bookmarks only; if the bookmark is absent the
         // clone fails closed with `WorkspaceInitError::NativeTrunkMissing`
-        // (never `git/ref/*`). Ignored when `target_commit` is `Some`. `None`
+        // (never `git/ref/*`), except an entirely empty native repository
+        // starts at root so it can receive its first bookmark. Ignored when
+        // `target_commit` is `Some`. `None`
         // falls back to the native-only main/master/trunk heuristic.
         server_trunk: Option<&str>,
         // Whether to bulk-hydrate the start commit's file/symlink contents into
@@ -1387,8 +1389,9 @@ pub struct NativeBookmarkTarget {
 /// `vex clone` is native-only: selection reads only native view state and
 /// never resolves `git/ref/*` or raw Git objects. With a server-advertised
 /// trunk the only outcomes are a resolved [`NativeBookmarkTarget`] or the
-/// typed [`WorkspaceInitError::NativeTrunkMissing`] error — there is no
-/// fallback chain.
+/// typed [`WorkspaceInitError::NativeTrunkMissing`] error — except an entirely
+/// empty native repository, which starts at root so it can receive its first
+/// bookmark.
 #[derive(Clone, Debug)]
 pub enum NativeCloneTarget {
     /// The server-advertised trunk resolved through native local or
@@ -1496,10 +1499,29 @@ async fn clone_vex_server_trunk_target(
             commit,
         });
     }
+    if clone_vex_native_view_is_empty(repo) {
+        // The catalog's conventional `main` fallback is useful for the UI,
+        // but a newly provisioned native repository has no bookmark until its
+        // first push. Only this zero-state case may begin at root; any native
+        // state with a missing advertised trunk still fails closed below.
+        return Ok(NativeBookmarkTarget {
+            name: server_trunk.to_owned(),
+            commit: repo.store().root_commit(),
+        });
+    }
     crate::vex::vex_client_stats().record_native_trunk_missing();
     Err(WorkspaceInitError::NativeTrunkMissing {
         trunk: server_trunk.to_owned(),
     })
+}
+
+fn clone_vex_native_view_is_empty(repo: &ReadonlyRepo) -> bool {
+    repo.view()
+        .heads()
+        .iter()
+        .all(|head| head == repo.store().root_commit().id())
+        && repo.view().local_bookmarks().next().is_none()
+        && repo.view().all_remote_bookmarks().next().is_none()
 }
 
 /// Legacy native start-commit selection, used only when the server supplied no
@@ -2210,6 +2232,17 @@ mod tests {
         assert_eq!(target.commit().id(), master_head.id());
         assert_eq!(target.bookmark(), Some("master"));
         assert_ne!(target.commit().id(), codex_head.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_vex_start_commit_empty_native_repo_uses_root() -> Result<(), WorkspaceInitError> {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_repo(&settings)?;
+
+        let target = clone_vex_native_target(&repo, Some("main")).block_on()?;
+        assert_eq!(target.commit().id(), repo.store().root_commit().id());
+        assert_eq!(target.bookmark(), Some("main"));
         Ok(())
     }
 
