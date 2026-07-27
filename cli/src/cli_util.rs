@@ -131,7 +131,6 @@ use jj_lib::str_util::StringMatcher;
 use jj_lib::str_util::StringPattern;
 use jj_lib::transaction::Transaction;
 use jj_lib::transaction::TransactionCommitError;
-use jj_lib::transaction::is_op_heads_cas_conflict;
 use jj_lib::working_copy;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
@@ -618,10 +617,20 @@ impl CommandHelper {
         let op_id = workspace.working_copy().operation_id();
 
         match workspace.repo_loader().load_operation(op_id).await {
-            Ok(op) if current_cli_name() != "vex" => {
-                // Preserve jj's merge-capable stale-workspace recovery. Local
-                // op-head stores can publish the snapshot from the stale
-                // operation and then reconcile the resulting divergent heads.
+            Ok(op) => {
+                // jj's merge-capable stale-workspace recovery: snapshot the
+                // working copy on top of the *stale* operation and let the
+                // op-heads store merge the resulting divergent operation (and
+                // the later wc-update op) back into the head.
+                //
+                // Vex used to take a separate recovery-commit path here,
+                // because its op-heads store enforced a strict single-head CAS
+                // that rejected the transiently divergent head this recovery
+                // produces — which is what caused the recurring "working copy
+                // is stale" / "sibling operation" lockup. Op heads are stored
+                // locally now (roadmap/088 Stage 7, S13) and hold several heads
+                // natively, so upstream's path works for every CLI name and the
+                // Vex-only fork is gone.
                 let repo = workspace.repo_loader().load_at(&op).await?;
                 let mut workspace_command = self.for_workable_repo(ui, workspace, repo)?;
                 workspace_command.check_working_copy_writable()?;
@@ -689,59 +698,6 @@ impl CommandHelper {
                     SnapshotStats { untracked_paths }
                 };
                 Ok((workspace_command, merged_stats))
-            }
-            Ok(_op) => {
-                // The working copy's recorded operation is no longer an op head.
-                //
-                // jj's upstream recovery snapshots the working copy on top of that *stale*
-                // op and relies on the op-heads store *merging* the resulting divergent
-                // operation (and the later wc-update op) back into the head. That requires
-                // an op-heads store that can hold more than one head transiently. The Vex
-                // op-heads store instead enforces a strict single-head CAS: every recorded
-                // operation must be parented on the current head, and anything else is
-                // rejected with a "CAS conflict on op heads". So the upstream merge-based
-                // recovery dies partway through and leaves the working copy permanently
-                // pinned to a stale op the backend will never accept (the recurring
-                // "working copy is stale" / "sibling operation" lockup).
-                //
-                // Recover the way the lost-operation branch below does instead: create a
-                // recovery commit on the *current op head*. Every operation that records
-                // (the recovery commit, then the re-snapshot) is parented on the live head,
-                // which the strict CAS accepts, and the working-copy contents are preserved
-                // as uncommitted changes on the recovered commit. We still honor the
-                // not-actually-stale case so `update-stale` on a fresh workspace is a no-op.
-                let mut workspace_command = self.workspace_helper_no_snapshot(ui).await?;
-                let repo = workspace_command.repo().clone();
-                let (mut locked_ws, desired_wc_commit) = workspace_command
-                    .unchecked_start_working_copy_mutation()
-                    .await?;
-                let freshness = WorkingCopyFreshness::check_stale(
-                    locked_ws.locked_wc(),
-                    &desired_wc_commit,
-                    &repo,
-                )
-                .await?;
-                drop(locked_ws);
-                match freshness {
-                    WorkingCopyFreshness::Fresh | WorkingCopyFreshness::Updated(_) => {
-                        writeln!(
-                            ui.status(),
-                            "Attempted recovery, but the working copy is not stale"
-                        )?;
-                        let stats = workspace_command
-                            .maybe_snapshot_impl(ui)
-                            .await
-                            .map_err(|err| err.into_command_error())?;
-                        Ok((workspace_command, stats))
-                    }
-                    WorkingCopyFreshness::WorkingCopyStale
-                    | WorkingCopyFreshness::SiblingOperation => {
-                        let stats = workspace_command
-                            .create_and_check_out_recovery_commit(ui)
-                            .await?;
-                        Ok((workspace_command, stats))
-                    }
-                }
             }
             Err(e @ OpStoreError::ObjectNotFound { .. }) => {
                 writeln!(
@@ -1192,29 +1148,6 @@ pub struct WorkspaceCommandHelper {
 enum SnapshotWorkingCopyError {
     Command(CommandError),
     StaleWorkingCopy(CommandError),
-}
-
-const MAX_OP_HEAD_SNAPSHOT_ATTEMPTS: u32 = 16;
-
-/// Back-off before retrying a lost op-head CAS.
-///
-/// Every writer that loses the race retries, so retrying immediately just
-/// reproduces the same collision: with N concurrent clients the herd stays in
-/// lockstep and most of them exhaust their attempts. Spreading the retries out,
-/// with jitter so they do not re-synchronise, is what lets concurrent commits
-/// all land. The wait is bounded and only paid when a conflict actually happened.
-fn op_head_retry_backoff(attempt: u32) -> std::time::Duration {
-    // The retry window has to outlast the queue of writers ahead of us: each
-    // one holds the head for roughly a publish, so N contending clients need a
-    // window on the order of N publishes. Capping the ceiling too low is what
-    // makes the tail of a large herd fail.
-    let ceiling_ms = 20_u64 << attempt.min(7);
-    let jitter_ms = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| u64::from(since.subsec_nanos()))
-        .unwrap_or(0)
-        % ceiling_ms.max(1);
-    std::time::Duration::from_millis(ceiling_ms / 2 + jitter_ms / 2)
 }
 
 impl SnapshotWorkingCopyError {
@@ -2154,8 +2087,12 @@ to the current parents may contain changes from multiple commits.
             snapshot_start.elapsed(),
         );
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
-            let mut attempt = 1;
-            loop {
+            // No retry ladder: op heads are stored locally (roadmap/088 Stage
+            // 7, S11), so committing the snapshot cannot be refused because
+            // another writer moved the repository — both operations land and
+            // the next read merges them. This block runs once and leaves by
+            // one of its `break`s or by returning the error.
+            'snapshot: {
                 let Some(current_wc_commit_id) = self
                     .user_repo
                     .repo
@@ -2165,7 +2102,7 @@ to the current parents may contain changes from multiple commits.
                 else {
                     // A concurrent operation deleted this workspace. There is no
                     // workspace view entry on which to rebuild the snapshot.
-                    break;
+                    break 'snapshot;
                 };
                 let current_wc_commit = self
                     .user_repo
@@ -2176,7 +2113,7 @@ to the current parents may contain changes from multiple commits.
                     .map_err(snapshot_command_error)?;
                 if new_tree.tree_ids_and_labels() == current_wc_commit.tree().tree_ids_and_labels()
                 {
-                    break;
+                    break 'snapshot;
                 }
 
                 let mut tx = start_repo_transaction(
@@ -2226,27 +2163,6 @@ to the current parents may contain changes from multiple commits.
                 {
                     Ok(repo) => {
                         self.user_repo = ReadonlyUserRepo::new(repo);
-                        break;
-                    }
-                    Err(error)
-                        if attempt < MAX_OP_HEAD_SNAPSHOT_ATTEMPTS
-                            && is_op_heads_cas_conflict(&error) =>
-                    {
-                        writeln!(
-                            ui.status(),
-                            "Concurrent Vex operation detected; reloading and retrying the \
-                             working-copy snapshot."
-                        )
-                        .map_err(snapshot_command_error)?;
-                        std::thread::sleep(op_head_retry_backoff(attempt));
-                        let repo = self
-                            .user_repo
-                            .repo
-                            .reload_at_head()
-                            .await
-                            .map_err(snapshot_command_error)?;
-                        self.user_repo = ReadonlyUserRepo::new(repo);
-                        attempt += 1;
                     }
                     Err(error) => return Err(snapshot_command_error(error)),
                 }

@@ -95,6 +95,57 @@ impl FreshnessState {
             Self::Unknown { .. } => "unknown",
         }
     }
+
+    /// Unix time of the last *successful* contact with the server, when there
+    /// has been one. `None` for a repository that has never been probed
+    /// successfully — which is not the same as "contacted a long time ago", and
+    /// is why this is an `Option` rather than a sentinel.
+    pub fn last_contact_unix(&self) -> Option<i64> {
+        match self {
+            Self::Current { checked_unix } => Some(*checked_unix),
+            Self::Behind {
+                last_confirmed_unix,
+            } => Some(*last_confirmed_unix).filter(|unix| *unix > 0),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    /// The command that resolves this state, if any. Frozen as part of the
+    /// `--format json` schema (C6).
+    pub fn remedy(&self) -> Option<&'static str> {
+        match self {
+            Self::Current { .. } => None,
+            Self::Behind { .. } => Some("vex pull"),
+            Self::Unknown {
+                reason: UnknownReason::Suppressed,
+            } => None,
+            Self::Unknown { .. } => Some("vex status"),
+        }
+    }
+
+    /// Stable machine-readable reason, for `--format json`. `None` unless the
+    /// state is [`Self::Unknown`].
+    pub fn reason_str(&self) -> Option<&'static str> {
+        match self {
+            Self::Unknown { reason } => Some(match reason {
+                UnknownReason::NoProbeYet => "no-probe-yet",
+                UnknownReason::ProbeFailed(_) => "probe-failed",
+                UnknownReason::Suppressed => "suppressed",
+            }),
+            _ => None,
+        }
+    }
+
+    /// The probe failure message, when the state is unknown because a probe
+    /// failed.
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Unknown {
+                reason: UnknownReason::ProbeFailed(message),
+            } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// Budget for a *blocking* refresh on the read path. `None` — the default —
@@ -165,6 +216,15 @@ fn state_of(marker: &ServerHeadsMarker) -> FreshnessState {
             reason: UnknownReason::ProbeFailed(error.clone()),
         };
     }
+    if marker.pending_token.is_some() {
+        // Recorded by a probe that saw the server move, and kept until this
+        // repository is brought back into sync. Being behind survives the
+        // process that discovered it — otherwise only the command that
+        // happened to run the probe would ever say so.
+        return FreshnessState::Behind {
+            last_confirmed_unix: marker.updated_unix,
+        };
+    }
     match marker.ref_token {
         Some(_) => FreshnessState::Current {
             checked_unix: marker.updated_unix,
@@ -172,6 +232,58 @@ fn state_of(marker: &ServerHeadsMarker) -> FreshnessState {
         None => FreshnessState::Unknown {
             reason: UnknownReason::NoProbeYet,
         },
+    }
+}
+
+/// What a probe is allowed to conclude from a token it has never seen before.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeKind {
+    /// An ordinary end-of-command probe. A token that differs from the
+    /// confirmed one means the server moved and this repository is behind.
+    Observe,
+    /// A probe that runs immediately after the local refs were synced with the
+    /// server (clone, pull, push), so whatever the server reports now *is* this
+    /// repository's state. Adopts the token and clears "behind".
+    SyncPoint,
+}
+
+/// Everything the marker records about probing, for `vex doctor` (C8).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProbeReport {
+    /// Current three-state freshness.
+    pub state: Option<FreshnessState>,
+    /// The confirmed server ref token, verbatim and opaque.
+    pub ref_token: Option<String>,
+    /// A newer server token seen while behind.
+    pub pending_token: Option<String>,
+    /// Unix time of the last probe of any outcome.
+    pub last_probe_unix: Option<i64>,
+    /// Unix time the token was last confirmed.
+    pub last_confirmed_unix: Option<i64>,
+    /// Why the last probe failed, when it did.
+    pub last_probe_error: Option<String>,
+    /// Whether a marker existed at all.
+    pub probed: bool,
+}
+
+/// Read everything the freshness marker knows, without probing. Like
+/// [`freshness_state`] this never blocks and never fails: `vex doctor` reporting
+/// nothing is better than `vex doctor` failing.
+pub fn probe_report(dir: &Path) -> ProbeReport {
+    let Ok(Some(marker)) = read_server_heads(dir) else {
+        return ProbeReport {
+            state: Some(freshness_state(dir)),
+            ..ProbeReport::default()
+        };
+    };
+    ProbeReport {
+        state: Some(freshness_state(dir)),
+        ref_token: marker.ref_token.clone(),
+        pending_token: marker.pending_token.clone(),
+        last_probe_unix: marker.last_probe_unix,
+        last_confirmed_unix: (marker.updated_unix > 0).then_some(marker.updated_unix),
+        last_probe_error: marker.last_probe_error.clone(),
+        probed: true,
     }
 }
 
@@ -184,6 +296,16 @@ fn state_of(marker: &ServerHeadsMarker) -> FreshnessState {
 /// and error, so a failing probe is visible to `vex doctor` in another process
 /// rather than only to the process that hit it.
 pub fn refresh_once(dir: &Path, client: &VexClient, budget: Duration) -> FreshnessState {
+    refresh_once_as(dir, client, budget, ProbeKind::Observe)
+}
+
+/// [`refresh_once`], told whether the local refs were just synced.
+pub fn refresh_once_as(
+    dir: &Path,
+    client: &VexClient,
+    budget: Duration,
+    kind: ProbeKind,
+) -> FreshnessState {
     if no_refresh_requested() {
         return FreshnessState::Unknown {
             reason: UnknownReason::Suppressed,
@@ -196,31 +318,37 @@ pub fn refresh_once(dir: &Path, client: &VexClient, budget: Duration) -> Freshne
     let recorded = marker.ref_token.clone();
     let outcome = match client.ref_freshness_token_within(budget) {
         Ok(Some(fetched)) => {
-            let behind = recorded.is_some_and(|recorded| recorded != fetched);
-            let last_confirmed_unix = marker.updated_unix;
-            marker.record_success(Some(fetched));
-            if behind {
-                // The recorded token is genuinely stale. The ref sync that
-                // acts on it is D9 (WP12); until it lands the report is the
-                // whole remedy, which is why it names `vex pull`.
-                FreshnessState::Behind {
-                    last_confirmed_unix,
-                }
-            } else {
+            // A repository with no confirmed token yet has no basis on which to
+            // call itself behind, and reporting "unknown" forever would make the
+            // first probe useless; the first token is the baseline. Every later
+            // probe compares against it.
+            let in_sync = kind == ProbeKind::SyncPoint
+                || recorded
+                    .as_ref()
+                    .is_none_or(|recorded| *recorded == fetched);
+            if in_sync {
+                marker.record_success(Some(fetched));
                 FreshnessState::Current {
                     checked_unix: marker.updated_unix,
+                }
+            } else {
+                // The confirmed token is genuinely stale. The ref sync that
+                // acts on it automatically is D9 (WP12); until that lands the
+                // report is the whole remedy, which is why it names `vex pull`.
+                let last_confirmed_unix = marker.updated_unix;
+                marker.record_behind(fetched);
+                FreshnessState::Behind {
+                    last_confirmed_unix,
                 }
             }
         }
         Ok(None) => {
-            // BLOCKED-ON-STAGE6: `VexClient::ref_freshness_token_within` is a
-            // seam that always answers `None` until Stage 6's repo-scoped
-            // ref-freshness token RPC lands. Reporting `NoProbeYet` rather than
-            // `Current` is deliberate: this client cannot yet establish
-            // freshness, and must not pretend otherwise.
+            // The budget expired, or the backend declined to answer. Either way
+            // this client could not establish freshness and must not pretend
+            // otherwise — an unanswered probe is unknown, never current.
             marker.record_failure("no ref-freshness token available".to_string());
             FreshnessState::Unknown {
-                reason: UnknownReason::NoProbeYet,
+                reason: UnknownReason::ProbeFailed("no ref-freshness token available".to_string()),
             }
         }
         Err(err) => {
@@ -243,6 +371,19 @@ pub fn refresh_once(dir: &Path, client: &VexClient, budget: Duration) -> Freshne
 /// waited for the network.
 pub fn refresh_markers(dir: &Path, client: &VexClient) {
     refresh_once(dir, client, background_refresh_budget());
+}
+
+/// As [`refresh_markers`], for a command that just synced this repository's
+/// refs with the server (clone, pull, push). The token it reads becomes the new
+/// confirmed baseline, so a repository that was behind stops reporting behind
+/// once the user has done the thing the report asked for.
+pub fn refresh_markers_after_sync(dir: &Path, client: &VexClient) {
+    refresh_once_as(
+        dir,
+        client,
+        background_refresh_budget(),
+        ProbeKind::SyncPoint,
+    );
 }
 
 /// Per-process memo of the probe outcome for one repository.
@@ -379,6 +520,124 @@ mod tests {
             background_refresh_budget(),
             Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS)
         );
+    }
+
+    /// The token comparison that makes "behind" possible, and the fact that it
+    /// survives the process that discovered it.
+    #[test]
+    fn a_changed_server_token_reads_back_as_behind_in_another_process() {
+        let temp = tempfile::tempdir().unwrap();
+        marker_with_token(temp.path(), "v2:token-a");
+        let confirmed = read_server_heads(temp.path())
+            .unwrap()
+            .unwrap()
+            .updated_unix;
+
+        // What `refresh_once` does when the fetched token differs.
+        let mut marker = read_server_heads(temp.path()).unwrap().unwrap();
+        assert_ne!(marker.ref_token.as_deref(), Some("v2:token-b"));
+        marker.record_behind("v2:token-b".to_string());
+        write_server_heads(temp.path(), &marker).unwrap();
+
+        assert_eq!(
+            freshness_state(temp.path()),
+            FreshnessState::Behind {
+                last_confirmed_unix: confirmed
+            }
+        );
+        // The confirmed token is *not* overwritten: it is what "last in sync"
+        // means, and adopting the server's would report a stale repo current on
+        // the very next read.
+        let marker = read_server_heads(temp.path()).unwrap().unwrap();
+        assert_eq!(marker.ref_token.as_deref(), Some("v2:token-a"));
+        assert_eq!(marker.pending_token.as_deref(), Some("v2:token-b"));
+    }
+
+    /// Being behind ends when the repository is synced again, not before.
+    #[test]
+    fn a_sync_point_clears_behind() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut marker = ServerHeadsMarker::new(Some("v2:token-a".to_string()));
+        marker.record_behind("v2:token-b".to_string());
+        write_server_heads(temp.path(), &marker).unwrap();
+        assert!(matches!(
+            freshness_state(temp.path()),
+            FreshnessState::Behind { .. }
+        ));
+
+        marker.record_success(Some("v2:token-b".to_string()));
+        write_server_heads(temp.path(), &marker).unwrap();
+        assert!(matches!(
+            freshness_state(temp.path()),
+            FreshnessState::Current { .. }
+        ));
+    }
+
+    /// The three states are mutually exclusive and each has its own name and
+    /// remedy, so no caller can render two of them the same way.
+    #[test]
+    fn the_three_states_are_distinguishable() {
+        let current = FreshnessState::Current { checked_unix: 10 };
+        let behind = FreshnessState::Behind {
+            last_confirmed_unix: 10,
+        };
+        let unknown = FreshnessState::Unknown {
+            reason: UnknownReason::NoProbeYet,
+        };
+
+        assert_eq!(current.as_str(), "current");
+        assert_eq!(behind.as_str(), "behind");
+        assert_eq!(unknown.as_str(), "unknown");
+        assert!(!current.is_unknown() && !behind.is_unknown() && unknown.is_unknown());
+
+        assert_eq!(current.remedy(), None);
+        assert_eq!(behind.remedy(), Some("vex pull"));
+        assert_eq!(unknown.remedy(), Some("vex status"));
+
+        assert_eq!(current.last_contact_unix(), Some(10));
+        assert_eq!(behind.last_contact_unix(), Some(10));
+        assert_eq!(unknown.last_contact_unix(), None);
+
+        assert_eq!(current.reason_str(), None);
+        assert_eq!(unknown.reason_str(), Some("no-probe-yet"));
+        assert_eq!(
+            FreshnessState::Unknown {
+                reason: UnknownReason::ProbeFailed("boom".to_string())
+            }
+            .error_message(),
+            Some("boom")
+        );
+    }
+
+    /// `vex doctor`'s source (C8): the probe record survives the process that
+    /// wrote it, failure included.
+    #[test]
+    fn the_probe_report_reads_the_whole_record() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_report(temp.path()),
+            ProbeReport {
+                state: Some(FreshnessState::Unknown {
+                    reason: UnknownReason::NoProbeYet
+                }),
+                ..ProbeReport::default()
+            }
+        );
+
+        let mut marker = ServerHeadsMarker::new(Some("v2:token-a".to_string()));
+        marker.record_failure("connect timed out".to_string());
+        write_server_heads(temp.path(), &marker).unwrap();
+
+        let report = probe_report(temp.path());
+        assert!(report.probed);
+        assert_eq!(report.ref_token.as_deref(), Some("v2:token-a"));
+        assert_eq!(
+            report.last_probe_error.as_deref(),
+            Some("connect timed out")
+        );
+        assert!(report.last_probe_unix.unwrap() > 0);
+        assert!(report.last_confirmed_unix.unwrap() > 0);
+        assert!(report.state.unwrap().is_unknown());
     }
 
     /// A corrupt marker is an unknown state, never a failure and never a claim

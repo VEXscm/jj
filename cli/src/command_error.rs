@@ -56,7 +56,6 @@ use jj_lib::secure_config::SecureConfigError;
 use jj_lib::str_util::StringPatternParseError;
 use jj_lib::trailer::TrailerParseError;
 use jj_lib::transaction::TransactionCommitError;
-use jj_lib::transaction::is_op_heads_cas_conflict;
 use jj_lib::view::RenameWorkspaceError;
 use jj_lib::working_copy::RecoverWorkspaceError;
 use jj_lib::working_copy::ResetError;
@@ -457,27 +456,7 @@ impl From<ResetError> for CommandError {
 
 impl From<TransactionCommitError> for CommandError {
     fn from(err: TransactionCommitError) -> Self {
-        if is_op_heads_cas_conflict(&err) {
-            // Under the remove-and-add op-head contract (roadmap 093) an
-            // unrelated writer moving the repository no longer refuses a
-            // publish — those two operations simply both land and the next
-            // read merges them. Reaching here means this operation's *own*
-            // precondition was not met: the head it asked to remove is not one
-            // the server can prove it descends from, which is what keeps
-            // history reachable. That is almost always a workspace that is
-            // behind, so the recovery is to reload rather than to wait.
-            user_error_with_message(
-                "This command could not publish its operation: the repository state it was \
-                 written against is no longer one it can build on; your files are untouched.",
-                err,
-            )
-            .hinted(
-                "Rerun the command — reloading picks up the current state and merges it. If it \
-                 keeps failing, the working copy is probably stale; run `vex status` to check.",
-            )
-        } else {
-            internal_error(err)
-        }
+        internal_error(err)
     }
 }
 
@@ -1193,33 +1172,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_op_heads_cas_conflict_is_a_guided_user_error() {
+    fn a_failed_operation_write_is_an_internal_error_not_a_retry_hint() {
+        // Op heads are local (roadmap/088 Stage 7): a write cannot be refused
+        // for concurrency reasons, so there is no "reload and rerun" advice to
+        // give. Anything that reaches here is a genuine failure to write the
+        // operation, which is internal.
         let transaction_error = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
             new_op_id: OperationId::new(vec![7; 32]),
-            source: Box::new(std::io::Error::other("CAS conflict on op heads")),
+            source: Box::new(std::io::Error::other("disk is full")),
         });
 
         let error = CommandError::from(transaction_error);
 
-        assert_eq!(error.kind, CommandErrorKind::User);
-        assert_eq!(
-            error.error.to_string(),
-            "This command could not publish its operation: the repository state it was written \
-             against is no longer one it can build on; your files are untouched."
-        );
-        assert!(matches!(
-            error.hints.as_slice(),
-            [ErrorHint::PlainText(hint)]
-                if hint == "Rerun the command — reloading picks up the current state and merges \
-                    it. If it keeps failing, the working copy is probably stale; run `vex status` \
-                    to check."
-        ));
+        assert_eq!(error.kind, CommandErrorKind::Internal);
         let mut source = error.error.source();
-        let mut found_cas_detail = false;
+        let mut found_detail = false;
         while let Some(current) = source {
-            found_cas_detail |= current.to_string() == "CAS conflict on op heads";
+            found_detail |= current.to_string() == "disk is full";
             source = current.source();
         }
-        assert!(found_cas_detail);
+        assert!(found_detail);
     }
 }

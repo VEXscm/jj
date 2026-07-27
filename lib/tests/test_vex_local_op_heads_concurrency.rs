@@ -200,7 +200,12 @@ fn operation_data(view_id: ViewId, parents: Vec<OperationId>, description: &str)
 }
 
 fn heads_of(store: &VexOpHeadsStore) -> HashSet<OperationId> {
-    store.get_op_heads().block_on().unwrap().into_iter().collect()
+    store
+        .get_op_heads()
+        .block_on()
+        .unwrap()
+        .into_iter()
+        .collect()
 }
 
 fn stored_operation_ids(root: &Path) -> HashSet<String> {

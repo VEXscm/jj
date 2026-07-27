@@ -130,6 +130,13 @@ pub(crate) async fn shared_runtime_sleep(duration: Duration) {
 /// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Ref namespace the freshness probe (roadmap/088, D8) scopes its token to.
+///
+/// Bookmarks are what a user means by "am I behind": scoping to them keeps the
+/// token from churning on namespaces nobody reads (tags, mapping refs, internal
+/// checkpoint refs), which would report every repository as perpetually behind.
+pub const REF_FRESHNESS_PREFIX: &str = "git/ref/refs/heads/";
+
 /// A `PutObjects` batch is content-addressed and create-if-missing, so a
 /// response lost during an edge reload or backend restart may safely be
 /// retried verbatim (fresh connection each attempt). Bulk materialize used to
@@ -1517,20 +1524,88 @@ impl VexClient {
         VexDurability::resolve(self.config.durability)
     }
 
-    /// Read this repository's opaque ref-freshness token (D8), bounded by
-    /// `budget`. `Ok(None)` means no token is available.
+    /// Read this repository's opaque ref-freshness token (D8) under a hard
+    /// wall-clock budget covering the connect handshake, with no retries.
+    /// `Ok(None)` means the budget expired — the caller reports "unknown"
+    /// freshness and the command carries on.
     ///
-    /// BLOCKED-ON-STAGE6: this is the client seam for the repo-scoped
-    /// ref-freshness token RPC that Stage 6 is adding to the backend
-    /// (`jj-backend`); no such RPC exists yet, so the seam answers `Ok(None)`
-    /// and [`crate::vex_freshness`] reports `Unknown`. It deliberately does
-    /// *not* fall back to `get_op_heads`: repointing a ref question at the op
-    /// log is exactly the coupling Stage 7 removes.
+    /// The token is **opaque**: equality-compared only, never ordered, never
+    /// parsed. The server derives it from per-ref state under
+    /// [`REF_FRESHNESS_PREFIX`]; a different token means the refs under that
+    /// scope have moved, and nothing more. It deliberately does *not* fall
+    /// back to `get_op_heads`: repointing a ref question at the op log is
+    /// exactly the coupling Stage 7 removes.
+    ///
+    /// Never fatal to a command (D8). Every caller in [`crate::vex_freshness`]
+    /// turns an error into `Unknown`, and this runs after the command's output
+    /// is done, so it is not on any critical path — which is why it counts
+    /// against `refresh_attempts` rather than `blocking_rpcs`.
     pub fn ref_freshness_token_within(
         &self,
-        _budget: Duration,
+        budget: Duration,
     ) -> Result<Option<String>, VexClientError> {
-        Ok(None)
+        self.ref_freshness_token_for_within(REF_FRESHNESS_PREFIX, budget)
+    }
+
+    /// [`Self::ref_freshness_token_within`] scoped to an explicit ref-name
+    /// prefix. An empty prefix means every ref outside the immutable
+    /// `git/object/sha1/` mapping namespace.
+    pub fn ref_freshness_token_for_within(
+        &self,
+        prefix: &str,
+        budget: Duration,
+    ) -> Result<Option<String>, VexClientError> {
+        let _t = RpcTimer::start(|| "get_refs_freshness/budgeted".to_string());
+        vex_client_stats()
+            .refresh_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let endpoint = self.config.endpoint.clone();
+        let request = jj_backend_api::GetRefsFreshnessRequest {
+            tenant_id: self.config.tenant_id.clone(),
+            repo_id: self.config.repo_id.clone(),
+            prefix: prefix.to_string(),
+        };
+        let token = self.config.access_token.clone();
+        let response = Self::shared_grpc_runtime().block_on(async move {
+            let attempt = async move {
+                let channel = Self::cached_channel_async(&endpoint).await?;
+                JjBackendClient::new(channel)
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .get_refs_freshness(Self::auth_request(request, token.as_deref())?)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(VexClientError::from)
+            };
+            tokio::time::timeout(budget, attempt).await
+        });
+        let response = match response {
+            Err(_elapsed) => {
+                vex_client_stats()
+                    .refresh_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                vex_client_stats()
+                    .refresh_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
+        // An empty token is the server saying "I cannot answer", not "your refs
+        // are at the empty state"; reporting it as a token would let two repos
+        // with no answer compare equal and look current.
+        if response.refs_token.is_empty() {
+            return Ok(None);
+        }
+        tracing::debug!(
+            token = %response.refs_token,
+            ref_count = response.ref_count,
+            scope = %response.scope_prefix,
+            "ref-freshness token"
+        );
+        Ok(Some(response.refs_token))
     }
 
     /// Whether this client uses the pack-resident metadata cache

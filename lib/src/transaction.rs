@@ -36,7 +36,6 @@ use crate::repo::Repo as _;
 use crate::repo::RepoLoader;
 use crate::repo::RepoLoaderError;
 use crate::settings::UserSettings;
-use crate::vex_op_head_delta::OpHeadCasConflict;
 use crate::view::View;
 
 /// Error from attempts to write and publish transaction.
@@ -46,26 +45,6 @@ pub enum TransactionCommitError {
     IndexStore(#[from] IndexStoreError),
     OpHeadsStore(#[from] OpHeadsStoreError),
     OpStore(#[from] OpStoreError),
-}
-
-/// Returns whether `error` is the Vex backend's op-head publish rejection —
-/// either kind, since both are resolved the same way: reload the repo, rebuild
-/// the mutation on what the server holds now, retry.
-///
-/// The backend response is carried as the source of an
-/// [`OpHeadsStoreError::Write`]. The synchronous publish path boxes a typed
-/// [`OpHeadCasConflict`] there, which is what this recognises first. The string
-/// fallback stays because several refusals are still raised as bare messages
-/// (the deferred-registration republish, and any server that predates the
-/// structured failure reason). Keep both deliberately narrow: network, storage,
-/// and other write failures must not be treated as safe concurrency retries.
-pub fn is_op_heads_cas_conflict(error: &TransactionCommitError) -> bool {
-    let TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write { source, .. }) = error
-    else {
-        return false;
-    };
-    source.downcast_ref::<OpHeadCasConflict>().is_some()
-        || source.to_string().contains("CAS conflict on op heads")
 }
 
 /// An in-memory representation of a repo and any changes being made to it.
@@ -252,45 +231,5 @@ impl UnpublishedOperation {
 
     pub fn leave_unpublished(self) -> Arc<ReadonlyRepo> {
         self.repo
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::op_store::OperationId;
-
-    use super::*;
-
-    fn write_error(message: &str) -> TransactionCommitError {
-        TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Write {
-            new_op_id: OperationId::new(vec![7; 32]),
-            source: Box::new(std::io::Error::other(message.to_owned())),
-        })
-    }
-
-    #[test]
-    fn test_is_op_heads_cas_conflict() {
-        assert!(is_op_heads_cas_conflict(&write_error(
-            "CAS conflict on op heads"
-        )));
-        assert!(!is_op_heads_cas_conflict(&write_error(
-            "connection reset by peer"
-        )));
-
-        let read_error = TransactionCommitError::OpHeadsStore(OpHeadsStoreError::Read(Box::new(
-            std::io::Error::other("CAS conflict on op heads"),
-        )));
-        assert!(!is_op_heads_cas_conflict(&read_error));
-    }
-
-    #[test]
-    fn a_divergent_registration_refusal_is_a_retryable_conflict() {
-        // A clone that cannot rebuild its deferred registration because the
-        // repository has several op heads has to be reloaded, not failed: the
-        // reload merges the heads and makes the rebuild well defined. That only
-        // happens if the refusal classifies as a conflict.
-        assert!(is_op_heads_cas_conflict(&write_error(
-            &crate::vex_op_head_delta::divergent_registration_conflict(2)
-        )));
     }
 }

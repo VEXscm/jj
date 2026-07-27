@@ -88,5 +88,6 @@ mod test_undo_redo_commands;
 mod test_util_command;
 mod test_vex_bench;
 mod test_vex_e2e;
+mod test_vex_stale_recovery;
 mod test_working_copy;
 mod test_workspaces;

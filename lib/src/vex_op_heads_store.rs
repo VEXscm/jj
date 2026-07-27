@@ -60,7 +60,6 @@ use crate::op_store::OperationId;
 use crate::simple_op_heads_store::SimpleOpHeadsStore;
 use crate::vex::VexClient;
 use crate::vex::VexRepoConfig;
-use crate::vex_op_head_delta::classify_refusal;
 
 const ID_LENGTH: usize = 32;
 
@@ -369,7 +368,16 @@ impl VexOpHeadsStore {
         } else {
             Err(OpHeadsStoreError::Write {
                 new_op_id: new_id.clone(),
-                source: Box::new(classify_refusal(&response)),
+                // The escape's publish is best effort: the caller logs this
+                // and keeps the local head, so the refusal only has to be
+                // readable. The structured classifier this used to build was
+                // deleted with the rest of the client CAS apparatus (Stage 7,
+                // D10) — nothing retries on it any more.
+                source: format!(
+                    "the server refused this op-head publish: {}",
+                    response.error_message
+                )
+                .into(),
             })
         }
     }
@@ -384,9 +392,7 @@ impl VexOpHeadsStore {
     ) -> Result<(), OpHeadsStoreError> {
         self.ensure_heads_dir().await?;
         self.simple.update_op_heads(old_ids, new_id).await?;
-        if publish
-            && let Err(err) = self.publish_head_best_effort(old_ids, new_id).await
-        {
+        if publish && let Err(err) = self.publish_head_best_effort(old_ids, new_id).await {
             tracing::warn!(
                 error = %err,
                 "VEX_PUBLISH_OP_LOG publish failed; the local head stands"
@@ -506,7 +512,10 @@ mod tests {
     }
 
     fn heads_of(store: &VexOpHeadsStore) -> HashSet<OperationId> {
-        block_on(store.get_op_heads()).unwrap().into_iter().collect()
+        block_on(store.get_op_heads())
+            .unwrap()
+            .into_iter()
+            .collect()
     }
 
     fn head_files(dir: &Path) -> HashSet<String> {
@@ -751,8 +760,7 @@ mod tests {
 
         let error = block_on(store.get_op_heads()).unwrap_err();
         assert!(
-            error.to_string().contains("operation")
-                || format!("{error:?}").contains("vex clone"),
+            error.to_string().contains("operation") || format!("{error:?}").contains("vex clone"),
             "{error:?}"
         );
         assert!(

@@ -243,26 +243,27 @@ impl OpStore for VexOpStore {
         }
 
         let hex = id.hex();
-        let data = match self
-            .read_object(VIEWS_DIR, &hex)
-            .map_err(|err| OpStoreError::ReadObject {
-                object_type: "view".to_string(),
-                hash: hex.clone(),
-                source: err.into(),
-            })? {
-            Some(data) => data,
-            None => {
-                let content_id = to_content_id(&id.to_bytes(), "view")?;
-                self.fetch_and_cache(
-                    jj_backend_types::ObjectKind::View,
-                    VIEWS_DIR,
-                    "view",
-                    &hex,
-                    &content_id,
-                )
-                .await?
-            }
-        };
+        let data =
+            match self
+                .read_object(VIEWS_DIR, &hex)
+                .map_err(|err| OpStoreError::ReadObject {
+                    object_type: "view".to_string(),
+                    hash: hex.clone(),
+                    source: err.into(),
+                })? {
+                Some(data) => data,
+                None => {
+                    let content_id = to_content_id(&id.to_bytes(), "view")?;
+                    self.fetch_and_cache(
+                        jj_backend_types::ObjectKind::View,
+                        VIEWS_DIR,
+                        "view",
+                        &hex,
+                        &content_id,
+                    )
+                    .await?
+                }
+            };
         let proto = crate::protos::simple_op_store::View::decode(&*data).map_err(|err| {
             OpStoreError::ReadObject {
                 object_type: "view".to_string(),

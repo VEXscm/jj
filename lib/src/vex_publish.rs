@@ -220,12 +220,25 @@ trait VersionedMarker: DeserializeOwned + Serialize {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServerHeadsMarker {
     pub v: u32,
-    /// Opaque ref-freshness token, or `None` until the first successful probe.
+    /// Opaque ref-freshness token as of the last time this repository's refs
+    /// were known to *match* the server's. Never overwritten by a probe that
+    /// finds the server has moved — that would erase the evidence of being
+    /// behind one probe after acquiring it. `None` until the first successful
+    /// probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_token: Option<String>,
-    /// When the token was last confirmed.
+    /// When [`Self::ref_token`] was last confirmed.
     #[serde(default)]
     pub updated_unix: i64,
+    /// The server's token as of the last probe, recorded only when it differs
+    /// from [`Self::ref_token`] — i.e. this repository is behind. `None` means
+    /// the last probe found the server unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_token: Option<String>,
+    /// When this repository was first observed to be behind, kept across
+    /// probes so "behind since" does not reset every time the probe re-runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_since_unix: Option<i64>,
     /// When a probe was last attempted, whether or not it succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe_unix: Option<i64>,
@@ -256,6 +269,8 @@ impl ServerHeadsMarker {
             v: SERVER_HEADS_MARKER_VERSION,
             ref_token,
             updated_unix: now,
+            pending_token: None,
+            behind_since_unix: None,
             last_probe_unix: Some(now),
             last_probe_error: None,
             heads: Vec::new(),
@@ -267,12 +282,33 @@ impl ServerHeadsMarker {
         parse_ids(SERVER_HEADS_FILE, &self.heads)
     }
 
-    /// Record a successful probe. Upgrades a v1 marker in place.
+    /// Record a probe that found this repository in sync with the server, or a
+    /// point at which it was brought back into sync (a clone, pull, or push).
+    /// Clears any recorded "behind". Upgrades a v1 marker in place.
     pub fn record_success(&mut self, ref_token: Option<String>) {
         let now = now_unix();
         self.v = SERVER_HEADS_MARKER_VERSION;
         self.ref_token = ref_token;
         self.updated_unix = now;
+        self.pending_token = None;
+        self.behind_since_unix = None;
+        self.last_probe_unix = Some(now);
+        self.last_probe_error = None;
+    }
+
+    /// Record a probe that found the server's token different from the
+    /// confirmed one: this repository is behind.
+    ///
+    /// [`Self::ref_token`] and [`Self::updated_unix`] are deliberately left
+    /// alone. They answer "when were we last actually in sync", which is the
+    /// number `vex status` reports and the one that would be destroyed by
+    /// adopting the server's new token here — after which the very next read
+    /// would call a stale repository current.
+    pub fn record_behind(&mut self, server_token: String) {
+        let now = now_unix();
+        self.v = SERVER_HEADS_MARKER_VERSION;
+        self.behind_since_unix = Some(self.behind_since_unix.unwrap_or(now));
+        self.pending_token = Some(server_token);
         self.last_probe_unix = Some(now);
         self.last_probe_error = None;
     }
@@ -480,12 +516,24 @@ mod tests {
 
     #[test]
     fn durability_always_resolves_to_sync() {
-        assert_eq!(VexDurability::resolve(VexDurability::LocalFirst), VexDurability::Sync);
-        assert_eq!(VexDurability::resolve(VexDurability::FlushOnExit), VexDurability::Sync);
-        assert_eq!(VexDurability::resolve(VexDurability::Sync), VexDurability::Sync);
+        assert_eq!(
+            VexDurability::resolve(VexDurability::LocalFirst),
+            VexDurability::Sync
+        );
+        assert_eq!(
+            VexDurability::resolve(VexDurability::FlushOnExit),
+            VexDurability::Sync
+        );
+        assert_eq!(
+            VexDurability::resolve(VexDurability::Sync),
+            VexDurability::Sync
+        );
         // Still parses and serializes, so a `vex.json` written by either
         // generation of the CLI round-trips.
-        assert_eq!(VexDurability::parse("local-first"), Some(VexDurability::LocalFirst));
+        assert_eq!(
+            VexDurability::parse("local-first"),
+            Some(VexDurability::LocalFirst)
+        );
         assert_eq!(VexDurability::parse("nonsense"), None);
         assert!(VexDurability::LocalFirst.is_serialized_default());
     }
