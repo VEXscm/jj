@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What this client asks of the server's op-head CAS, on the one path that
-//! still talks to it.
+//! What this client would ask of the server's op-head CAS.
 //!
 //! Op heads are stored locally now (roadmap/088 Stage 7): `update_op_heads` is
 //! a directory write under a real file lock, so two writers branching from the
@@ -23,10 +22,11 @@
 //! that sat on top of them — they were deleted with the rest of the client CAS
 //! apparatus (Stage 7, D10/S11).
 //!
-//! What survives is the request-shaping policy for `commit_op_heads`, the
-//! server CAS reached only under the `VEX_PUBLISH_OP_LOG=1` escape, where a
-//! refusal is logged and the local head stands. Stage 10 removes the server
-//! half and this module with it.
+//! What survives is the request-shaping policy for `commit_op_heads`. No client
+//! path calls it any more: the compatibility escape that used to reach the
+//! server CAS was deleted (Stage 9), so this policy now only shapes a request
+//! the client never sends. Stage 10 removes the server half and this module
+//! with it.
 
 use std::sync::OnceLock;
 

@@ -61,8 +61,6 @@ use crate::simple_op_heads_store::SimpleOpHeadsStore;
 use crate::vex::VexClient;
 use crate::vex::VexRepoConfig;
 
-const ID_LENGTH: usize = 32;
-
 /// Subdirectory of the op-heads store where heads actually live. Its existence
 /// is the permanent guard on the one-time bootstrap: once it is there, nothing
 /// in this file may ever contact the backend for op heads again.
@@ -85,45 +83,6 @@ fn bootstrap_budget() -> Duration {
     Duration::from_millis(millis)
 }
 
-/// Compatibility escape (roadmap/088 §0.4). With `VEX_PUBLISH_OP_LOG=1` a
-/// successful *local* head write is additionally mirrored to the server's
-/// `CommitOperation` CAS, so a mixed fleet of old and new clients can share a
-/// repository during the rollout.
-///
-/// It restores *publishing*, nothing else: the deferred queue, the registration
-/// fold and the client-side conflict classifier are deleted outright, and a
-/// failed publish is logged rather than returned. Local storage stays
-/// authoritative in both modes.
-pub(crate) fn publish_op_log_escape() -> bool {
-    static ESCAPE: OnceLock<bool> = OnceLock::new();
-    *ESCAPE.get_or_init(|| {
-        matches!(
-            std::env::var("VEX_PUBLISH_OP_LOG").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        )
-    })
-}
-
-fn to_content_id(id: &OperationId) -> Result<jj_backend_types::ContentId, OpHeadsStoreError> {
-    let bytes = id.to_bytes();
-    if bytes.len() != ID_LENGTH {
-        return Err(OpHeadsStoreError::Write {
-            new_op_id: id.clone(),
-            source: Box::new(std::io::Error::other(format!(
-                "invalid operation id length: expected {ID_LENGTH}, got {}",
-                bytes.len()
-            ))),
-        });
-    }
-    let mut content_bytes = [0; ID_LENGTH];
-    content_bytes.copy_from_slice(&bytes);
-    Ok(jj_backend_types::ContentId::from_bytes(content_bytes))
-}
-
-fn is_root_operation_id(id: &OperationId) -> bool {
-    id.to_bytes().iter().all(|byte| *byte == 0)
-}
-
 fn read_error(err: impl std::error::Error + Send + Sync + 'static) -> OpHeadsStoreError {
     OpHeadsStoreError::Read(Box::new(err))
 }
@@ -139,7 +98,7 @@ pub struct VexOpHeadsStore {
     /// When true, local-write mode is active (READ_ONLY CI runner). Since
     /// Stage 7 every mode stores heads locally, so this no longer selects a
     /// storage scheme; it means "never contact the backend at all", which now
-    /// covers only the one-time bootstrap read and the compatibility escape.
+    /// covers only the one-time bootstrap read.
     local_writes: bool,
     /// Per-process memo for [`Self::ensure_heads_dir`], so the guard costs one
     /// `stat` per process rather than one per call.
@@ -336,70 +295,6 @@ impl VexOpHeadsStore {
         }
     }
 
-    /// Mirror a head that is already stored locally to the server's CAS, under
-    /// the `VEX_PUBLISH_OP_LOG=1` escape. Best effort by construction: the
-    /// caller logs any error and keeps the local head.
-    async fn publish_head_best_effort(
-        &self,
-        old_ids: &[OperationId],
-        new_id: &OperationId,
-    ) -> Result<(), OpHeadsStoreError> {
-        // The root operation is synthetic and never written to the remote
-        // object store, so there is nothing to publish for it.
-        if is_root_operation_id(new_id) {
-            return Ok(());
-        }
-        let expected = old_ids
-            .iter()
-            .filter(|id| !is_root_operation_id(id))
-            .map(to_content_id)
-            .collect::<Result<Vec<_>, _>>()?;
-        let new_content_id = to_content_id(new_id)?;
-        let response = self
-            .client
-            .commit_op_heads(&expected, &new_content_id, &new_content_id)
-            .await
-            .map_err(|err| OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                source: Box::new(err),
-            })?;
-        if response.ok {
-            Ok(())
-        } else {
-            Err(OpHeadsStoreError::Write {
-                new_op_id: new_id.clone(),
-                // The escape's publish is best effort: the caller logs this
-                // and keeps the local head, so the refusal only has to be
-                // readable. The structured classifier this used to build was
-                // deleted with the rest of the client CAS apparatus (Stage 7,
-                // D10) — nothing retries on it any more.
-                source: format!(
-                    "the server refused this op-head publish: {}",
-                    response.error_message
-                )
-                .into(),
-            })
-        }
-    }
-
-    /// The write path, with the escape decision passed in so it can be
-    /// exercised without mutating the process environment.
-    async fn update_op_heads_publishing(
-        &self,
-        old_ids: &[OperationId],
-        new_id: &OperationId,
-        publish: bool,
-    ) -> Result<(), OpHeadsStoreError> {
-        self.ensure_heads_dir().await?;
-        self.simple.update_op_heads(old_ids, new_id).await?;
-        if publish && let Err(err) = self.publish_head_best_effort(old_ids, new_id).await {
-            tracing::warn!(
-                error = %err,
-                "VEX_PUBLISH_OP_LOG publish failed; the local head stands"
-            );
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -424,12 +319,8 @@ impl OpHeadsStore for VexOpHeadsStore {
         old_ids: &[OperationId],
         new_id: &OperationId,
     ) -> Result<(), OpHeadsStoreError> {
-        self.update_op_heads_publishing(
-            old_ids,
-            new_id,
-            publish_op_log_escape() && !self.local_writes,
-        )
-        .await
+        self.ensure_heads_dir().await?;
+        self.simple.update_op_heads(old_ids, new_id).await
     }
 
     /// Read the heads out of `heads/`. Zero backend calls, in every mode.
@@ -498,6 +389,9 @@ mod tests {
         let client = VexClient::from_config(test_config(local_writes)).unwrap();
         VexOpHeadsStore::at(client, dir, local_writes)
     }
+
+    /// Length of a Vex operation/content id, used only to build test ids.
+    const ID_LENGTH: usize = 32;
 
     fn op_id(byte: u8) -> OperationId {
         OperationId::new(vec![byte; ID_LENGTH])
@@ -809,24 +703,6 @@ mod tests {
             assert_eq!(heads_of(&store), HashSet::from([next.clone()]));
             parent = next;
         }
-    }
-
-    /// The escape is off by default, and when on it can only ever add a server
-    /// round trip — it can never turn a durable local write into a failure.
-    #[test]
-    fn publish_op_log_escape_publishes_but_never_fails_the_write() {
-        assert!(
-            !publish_op_log_escape(),
-            "the escape must be opt-in; the fleet default is local-only"
-        );
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = store_at(temp.path(), false);
-        // `publish = true` against an unroutable endpoint: the publish attempt
-        // is made and fails, and the write still succeeds.
-        block_on(store.update_op_heads_publishing(&[], &op_id(1), true)).unwrap();
-        block_on(store.update_op_heads_publishing(&[op_id(1)], &op_id(2), true)).unwrap();
-        assert_eq!(heads_of(&store), HashSet::from([op_id(2)]));
     }
 
     /// The marker family is read for the bootstrap and never written again.
