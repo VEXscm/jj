@@ -122,6 +122,7 @@ pub mod vex_op_head_delta;
 pub mod vex_op_heads_store;
 pub mod vex_op_store;
 pub mod vex_publish;
+pub mod vex_ref_sync;
 pub mod view;
 pub mod virtual_working_copy;
 pub mod working_copy;

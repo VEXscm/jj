@@ -29,6 +29,12 @@
 //! run reports [`FreshnessState::Unknown`] rather than claiming currency. That
 //! distinction is the whole point of D7 — silence about staleness is what let a
 //! repository look fine while it was hours behind.
+//!
+//! [`FreshnessState::Behind`] is also the trigger for D9: a repository that is
+//! known to be behind may advance its **tracked bookmarks** — never its
+//! working state — by jj's own three-way merge. That lives in
+//! [`crate::vex_ref_sync`], which reads the state this module records and
+//! shares its opt-out ([`no_refresh_requested`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -332,9 +338,13 @@ pub fn refresh_once_as(
                     checked_unix: marker.updated_unix,
                 }
             } else {
-                // The confirmed token is genuinely stale. The ref sync that
-                // acts on it automatically is D9 (WP12); until that lands the
-                // report is the whole remedy, which is why it names `vex pull`.
+                // The confirmed token is genuinely stale. Recording it is all
+                // this probe does: acting on it is D9
+                // ([`crate::vex_ref_sync::sync_if_behind`]), which reads this
+                // very state, advances tracked bookmarks by jj's three-way
+                // merge, and then adopts the pending token. Until a caller
+                // runs it the report is the whole remedy, which is why it
+                // names `vex pull`.
                 let last_confirmed_unix = marker.updated_unix;
                 marker.record_behind(fetched);
                 FreshnessState::Behind {
