@@ -17,7 +17,6 @@ use std::cmp::max;
 use std::future;
 use std::io;
 use std::iter;
-use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -57,6 +56,7 @@ use jj_lib::diff_presentation::file_content_for_diff;
 use jj_lib::diff_presentation::unified::DiffLineType;
 use jj_lib::diff_presentation::unified::UnifiedDiffError;
 use jj_lib::diff_presentation::unified::git_diff_part;
+use jj_lib::diff_presentation::unified::hunk_header_line_number;
 use jj_lib::diff_presentation::unified::unified_diff_hunks;
 use jj_lib::diff_presentation::unzip_diff_hunks_to_lines;
 use jj_lib::files;
@@ -1654,28 +1654,15 @@ fn show_unified_diff_hunks(
     contents: Diff<&BStr>,
     options: &UnifiedDiffOptions,
 ) -> io::Result<()> {
-    // "If the chunk size is 0, the first number is one lower than one would
-    // expect." - https://www.artima.com/weblogs/viewpost.jsp?thread=164293
-    //
-    // The POSIX spec also states that "the ending line number of an empty range
-    // shall be the number of the preceding line, or 0 if the range is at the
-    // start of the file."
-    // - https://pubs.opengroup.org/onlinepubs/9799919799/utilities/diff.html
-    fn to_line_number(range: Range<usize>) -> usize {
-        if range.is_empty() {
-            range.start
-        } else {
-            range.start + 1
-        }
-    }
-
+    // The header's line-number convention lives with the hunks, in `jj_diff`,
+    // so this and jj-backend's `DiffCommits` number their headers identically.
     for hunk in unified_diff_hunks(contents, options.context, options.line_diff.compare_mode) {
         writeln!(
             formatter.labeled("hunk_header"),
             "@@ -{},{} +{},{} @@",
-            to_line_number(hunk.left_line_range.clone()),
+            hunk_header_line_number(&hunk.left_line_range),
             hunk.left_line_range.len(),
-            to_line_number(hunk.right_line_range.clone()),
+            hunk_header_line_number(&hunk.right_line_range),
             hunk.right_line_range.len()
         )?;
         for (line_type, tokens) in &hunk.lines {

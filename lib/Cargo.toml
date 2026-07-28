@@ -56,6 +56,9 @@ itertools = { workspace = true }
 jj-lib-proc-macros = { workspace = true }
 jj_backend_api = { path = "../../jj-backend/crates/jj_backend_api" }
 jj_backend_types = { path = "../../jj-backend/crates/jj_backend_types" }
+# JJ's own diff engine, moved into the `jj-backend` workspace so the backend can
+# run it without depending on all of `jj-lib`. See that crate's docs.
+jj_diff = { path = "../../jj-backend/crates/jj_diff" }
 maplit = { workspace = true }
 once_cell = { workspace = true }
 pest = { workspace = true }

@@ -13,29 +13,28 @@
 // limitations under the License.
 
 //! Utilities to compute unified (Git-style) diffs of 2 sides
+//!
+//! The hunk computation and formatting moved to the shared `jj_diff` crate and
+//! is re-exported below. `git_diff_part` stays here: it materializes
+//! conflicts and needs `BackendError`/`ObjectId`.
 
-use std::ops::Range;
-
-use bstr::BStr;
 use bstr::BString;
 use thiserror::Error;
 
-use super::DiffTokenType;
-use super::DiffTokenVec;
 use super::FileContent;
-use super::LineCompareMode;
-use super::diff_by_line;
 use super::file_content_for_diff;
-use super::unzip_diff_hunks_to_lines;
 use crate::backend::BackendError;
 use crate::conflicts::ConflictMaterializeOptions;
 use crate::conflicts::MaterializedTreeValue;
 use crate::conflicts::materialize_merge_result_to_bytes;
-use crate::diff::ContentDiff;
-use crate::diff::DiffHunkKind;
-use crate::merge::Diff;
 use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
+
+pub use jj_diff::diff_presentation::unified::DiffLineType;
+pub use jj_diff::diff_presentation::unified::NO_NEWLINE_MARKER;
+pub use jj_diff::diff_presentation::unified::UnifiedDiffHunk;
+pub use jj_diff::diff_presentation::unified::hunk_header_line_number;
+pub use jj_diff::diff_presentation::unified::unified_diff_hunks;
 
 #[derive(Clone, Debug)]
 pub struct GitDiffPart {
@@ -138,102 +137,4 @@ pub async fn git_diff_part(
         hash,
         content,
     })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiffLineType {
-    Context,
-    Removed,
-    Added,
-}
-
-pub struct UnifiedDiffHunk<'content> {
-    pub left_line_range: Range<usize>,
-    pub right_line_range: Range<usize>,
-    pub lines: Vec<(DiffLineType, DiffTokenVec<'content>)>,
-}
-
-impl<'content> UnifiedDiffHunk<'content> {
-    fn extend_context_lines(&mut self, lines: impl IntoIterator<Item = &'content [u8]>) {
-        let old_len = self.lines.len();
-        self.lines.extend(lines.into_iter().map(|line| {
-            let tokens = vec![(DiffTokenType::Matching, line)];
-            (DiffLineType::Context, tokens)
-        }));
-        self.left_line_range.end += self.lines.len() - old_len;
-        self.right_line_range.end += self.lines.len() - old_len;
-    }
-
-    fn extend_removed_lines(&mut self, lines: impl IntoIterator<Item = DiffTokenVec<'content>>) {
-        let old_len = self.lines.len();
-        self.lines
-            .extend(lines.into_iter().map(|line| (DiffLineType::Removed, line)));
-        self.left_line_range.end += self.lines.len() - old_len;
-    }
-
-    fn extend_added_lines(&mut self, lines: impl IntoIterator<Item = DiffTokenVec<'content>>) {
-        let old_len = self.lines.len();
-        self.lines
-            .extend(lines.into_iter().map(|line| (DiffLineType::Added, line)));
-        self.right_line_range.end += self.lines.len() - old_len;
-    }
-}
-
-pub fn unified_diff_hunks(
-    contents: Diff<&BStr>,
-    context: usize,
-    options: LineCompareMode,
-) -> Vec<UnifiedDiffHunk<'_>> {
-    let mut hunks = vec![];
-    let mut current_hunk = UnifiedDiffHunk {
-        left_line_range: 0..0,
-        right_line_range: 0..0,
-        lines: vec![],
-    };
-    let diff = diff_by_line(contents.into_array(), &options);
-    let mut diff_hunks = diff.hunks().peekable();
-    while let Some(hunk) = diff_hunks.next() {
-        match hunk.kind {
-            DiffHunkKind::Matching => {
-                // Just use the right (i.e. new) content. We could count the
-                // number of skipped lines separately, but the number of the
-                // context lines should match the displayed content.
-                let [_, right] = hunk.contents[..].try_into().unwrap();
-                let mut lines = right.split_inclusive(|b| *b == b'\n').fuse();
-                if !current_hunk.lines.is_empty() {
-                    // The previous hunk line should be either removed/added.
-                    current_hunk.extend_context_lines(lines.by_ref().take(context));
-                }
-                let before_lines = if diff_hunks.peek().is_some() {
-                    lines.by_ref().rev().take(context).collect()
-                } else {
-                    vec![] // No more hunks
-                };
-                let num_skip_lines = lines.count();
-                if num_skip_lines > 0 {
-                    let left_start = current_hunk.left_line_range.end + num_skip_lines;
-                    let right_start = current_hunk.right_line_range.end + num_skip_lines;
-                    if !current_hunk.lines.is_empty() {
-                        hunks.push(current_hunk);
-                    }
-                    current_hunk = UnifiedDiffHunk {
-                        left_line_range: left_start..left_start,
-                        right_line_range: right_start..right_start,
-                        lines: vec![],
-                    };
-                }
-                // The next hunk should be of DiffHunk::Different type if any.
-                current_hunk.extend_context_lines(before_lines.into_iter().rev());
-            }
-            DiffHunkKind::Different => {
-                let lines = unzip_diff_hunks_to_lines(ContentDiff::by_word(hunk.contents).hunks());
-                current_hunk.extend_removed_lines(lines.before);
-                current_hunk.extend_added_lines(lines.after);
-            }
-        }
-    }
-    if !current_hunk.lines.is_empty() {
-        hunks.push(current_hunk);
-    }
-    hunks
 }

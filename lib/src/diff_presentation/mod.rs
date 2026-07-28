@@ -13,38 +13,29 @@
 // limitations under the License.
 
 //! Utilities to present file diffs to the user
+//!
+//! The content-only half lives in the shared `jj_diff` crate so `jj-backend`
+//! can format the same hunks; it is re-exported below under its original
+//! names. What stays here is what needs the repository: reading a
+//! materialized file and materializing a conflict.
 
 #![expect(missing_docs)]
 
-use std::borrow::Borrow;
-use std::mem;
-
 use bstr::BString;
-use itertools::Itertools as _;
 
 use crate::backend::BackendResult;
 use crate::conflicts::MaterializedFileValue;
-use crate::diff::CompareBytesExactly;
-use crate::diff::CompareBytesIgnoreAllWhitespace;
-use crate::diff::CompareBytesIgnoreWhitespaceAmount;
-use crate::diff::ContentDiff;
-use crate::diff::DiffHunk;
-use crate::diff::DiffHunkKind;
-use crate::diff::find_line_ranges;
-use crate::merge::Diff;
 use crate::repo_path::RepoPath;
+
+pub use jj_diff::diff_presentation::DiffTokenType;
+pub use jj_diff::diff_presentation::DiffTokenVec;
+pub use jj_diff::diff_presentation::LineCompareMode;
+pub use jj_diff::diff_presentation::diff_by_line;
+pub use jj_diff::diff_presentation::unzip_diff_hunks_to_lines;
 
 pub mod unified;
 // TODO: colored_diffs utils should also be moved from `jj_cli::diff_utils` to
 // here.
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiffTokenType {
-    Matching,
-    Different,
-}
-
-type DiffTokenVec<'content> = Vec<(DiffTokenType, &'content [u8])>;
 
 #[derive(Clone, Debug)]
 pub struct FileContent<T> {
@@ -71,91 +62,4 @@ pub async fn file_content_for_diff<T>(
         is_binary: start.contains(&b'\0'),
         contents: map_resolved(contents),
     })
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum LineCompareMode {
-    /// Compares lines literally.
-    #[default]
-    Exact,
-    /// Compares lines ignoring any whitespace occurrences.
-    IgnoreAllSpace,
-    /// Compares lines ignoring changes in whitespace amount.
-    IgnoreSpaceChange,
-}
-
-pub fn diff_by_line<'input, T: AsRef<[u8]> + ?Sized + 'input>(
-    inputs: impl IntoIterator<Item = &'input T>,
-    options: &LineCompareMode,
-) -> ContentDiff<'input> {
-    // TODO: If we add --ignore-blank-lines, its tokenizer will have to attach
-    // blank lines to the preceding range. Maybe it can also be implemented as a
-    // post-process (similar to refine_changed_regions()) that expands unchanged
-    // regions across blank lines.
-    match options {
-        LineCompareMode::Exact => {
-            ContentDiff::for_tokenizer(inputs, find_line_ranges, CompareBytesExactly)
-        }
-        LineCompareMode::IgnoreAllSpace => {
-            ContentDiff::for_tokenizer(inputs, find_line_ranges, CompareBytesIgnoreAllWhitespace)
-        }
-        LineCompareMode::IgnoreSpaceChange => {
-            ContentDiff::for_tokenizer(inputs, find_line_ranges, CompareBytesIgnoreWhitespaceAmount)
-        }
-    }
-}
-
-/// Splits `[left, right]` hunk pairs into `[left_lines, right_lines]`.
-pub fn unzip_diff_hunks_to_lines<'content, I>(diff_hunks: I) -> Diff<Vec<DiffTokenVec<'content>>>
-where
-    I: IntoIterator,
-    I::Item: Borrow<DiffHunk<'content>>,
-{
-    let mut left_lines: Vec<DiffTokenVec<'content>> = vec![];
-    let mut right_lines: Vec<DiffTokenVec<'content>> = vec![];
-    let mut left_tokens: DiffTokenVec<'content> = vec![];
-    let mut right_tokens: DiffTokenVec<'content> = vec![];
-
-    for hunk in diff_hunks {
-        let hunk = hunk.borrow();
-        match hunk.kind {
-            DiffHunkKind::Matching => {
-                // TODO: add support for unmatched contexts
-                debug_assert!(hunk.contents.iter().all_equal());
-                for token in hunk.contents[0].split_inclusive(|b| *b == b'\n') {
-                    left_tokens.push((DiffTokenType::Matching, token));
-                    right_tokens.push((DiffTokenType::Matching, token));
-                    if token.ends_with(b"\n") {
-                        left_lines.push(mem::take(&mut left_tokens));
-                        right_lines.push(mem::take(&mut right_tokens));
-                    }
-                }
-            }
-            DiffHunkKind::Different => {
-                let [left, right] = hunk.contents[..]
-                    .try_into()
-                    .expect("hunk should have exactly two inputs");
-                for token in left.split_inclusive(|b| *b == b'\n') {
-                    left_tokens.push((DiffTokenType::Different, token));
-                    if token.ends_with(b"\n") {
-                        left_lines.push(mem::take(&mut left_tokens));
-                    }
-                }
-                for token in right.split_inclusive(|b| *b == b'\n') {
-                    right_tokens.push((DiffTokenType::Different, token));
-                    if token.ends_with(b"\n") {
-                        right_lines.push(mem::take(&mut right_tokens));
-                    }
-                }
-            }
-        }
-    }
-
-    if !left_tokens.is_empty() {
-        left_lines.push(left_tokens);
-    }
-    if !right_tokens.is_empty() {
-        right_lines.push(right_tokens);
-    }
-    Diff::new(left_lines, right_lines)
 }

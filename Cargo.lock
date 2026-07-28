@@ -2828,6 +2828,7 @@ dependencies = [
  "jj-lib-proc-macros",
  "jj_backend_api",
  "jj_backend_types",
+ "jj_diff",
  "maplit",
  "nix 0.31.3",
  "num_cpus",
@@ -2903,6 +2904,16 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "zstd",
+]
+
+[[package]]
+name = "jj_diff"
+version = "0.1.0"
+dependencies = [
+ "bstr",
+ "hashbrown 0.17.1",
+ "itertools 0.14.0",
+ "smallvec",
 ]
 
 [[package]]
