@@ -202,6 +202,49 @@ impl VexOpStore {
         }
     }
 
+    /// Upload an op-log object when the `VEX_PUBLISH_OP_LOG=1` compatibility
+    /// escape is on, so that escape actually works.
+    ///
+    /// Without this the escape is a control that silently does nothing, which is
+    /// worse than not having one. It restores the `CommitOperation` *call*, but
+    /// Stage 7 left `write_operation`/`write_view` writing locally only, while
+    /// the server's `publish_op_head` requires
+    /// `ensure_presence(repo, Op, new_op_content_id)` first. Every publish
+    /// therefore failed `FailedPrecondition: op object is not finalized`, and
+    /// `update_op_heads` swallows that refusal by design — so the command still
+    /// exited 0 and the operator saw a working rollback that had published
+    /// nothing. Measured in production 2026-07-28: three calls, three failures,
+    /// and the server-side op log did not move by a single object.
+    ///
+    /// Failure here is deliberately non-fatal for the same reason the CAS
+    /// refusal is: the local write already succeeded and the operation is
+    /// durable, so an unreachable backend must not fail a local command. A
+    /// failed upload simply leaves the subsequent CAS to refuse as before.
+    async fn publish_object_for_escape(
+        &self,
+        kind: jj_backend_types::ObjectKind,
+        hex: &str,
+        data: &[u8],
+    ) {
+        if !crate::vex_op_heads_store::publish_op_log_escape() || self.client.local_writes() {
+            return;
+        }
+        let content_id = match jj_backend_types::ContentId::from_hex(hex) {
+            Ok(content_id) => content_id,
+            Err(err) => {
+                tracing::warn!(error = %err, hex, "op-log escape: object id is not a content id");
+                return;
+            }
+        };
+        if let Err(err) = self.client.put_object(kind, &content_id, data.to_vec()).await {
+            tracing::warn!(
+                error = %err,
+                hex,
+                "op-log escape: could not publish the object; the op-head CAS will refuse"
+            );
+        }
+    }
+
     /// Fetch a pre-Stage-7 object from the backend and cache it locally, so the
     /// fallback heals itself instead of being paid again on every read.
     async fn fetch_and_cache(
@@ -287,6 +330,8 @@ impl OpStore for VexOpStore {
                 object_type: "view",
                 source: Box::new(err),
             })?;
+        self.publish_object_for_escape(jj_backend_types::ObjectKind::View, &id.hex(), &data)
+            .await;
         Ok(id)
     }
 
@@ -339,6 +384,8 @@ impl OpStore for VexOpStore {
                 object_type: "operation",
                 source: Box::new(err),
             })?;
+        self.publish_object_for_escape(jj_backend_types::ObjectKind::Op, &id.hex(), &data)
+            .await;
         Ok(id)
     }
 

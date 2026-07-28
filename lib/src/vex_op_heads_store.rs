@@ -94,7 +94,7 @@ fn bootstrap_budget() -> Duration {
 /// fold and the client-side conflict classifier are deleted outright, and a
 /// failed publish is logged rather than returned. Local storage stays
 /// authoritative in both modes.
-fn publish_op_log_escape() -> bool {
+pub(crate) fn publish_op_log_escape() -> bool {
     static ESCAPE: OnceLock<bool> = OnceLock::new();
     *ESCAPE.get_or_init(|| {
         matches!(
