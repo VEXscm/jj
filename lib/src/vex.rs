@@ -50,7 +50,7 @@ use jj_backend_api::ResolveRefsRequest;
 use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
-    CloneManifest, ContentId, ObjectKind, ObjectPackEntry, SnapshotPackSet, decode_object_pack,
+    CloneManifest, ContentId, ObjectKind, ObjectPackEntry, decode_object_pack,
     decode_object_pack_reader, decode_object_pack_with_visitor, decode_pack_chunk_entries,
     parse_pack_header,
 };
@@ -368,10 +368,6 @@ pub struct VexClientStats {
     /// Bytes fetched via direct HTTP (see [`Self::presigned_fetches`] for
     /// exactly what "presigned" covers).
     pub presigned_bytes: AtomicU64,
-    /// Snapshot packs fetched (roadmap/032 snapshot-pack consumption).
-    pub snapshot_packs_fetched: AtomicU64,
-    /// Encoded snapshot pack bytes transferred.
-    pub snapshot_pack_bytes: AtomicU64,
     /// Objects unpacked from packs into the local cache.
     pub objects_unpacked: AtomicU64,
     /// Objects unpacked pack-resident — indexed into a `.packs` payload file
@@ -390,8 +386,6 @@ pub struct VexClientStats {
     /// Working-copy files materialized via reflink/clonefile instead of a copy.
     pub files_reflinked: AtomicU64,
     /// Pre-checkout hydration tree walks skipped because a fully-unpacked
-    /// snapshot pack chain already covered the start commit (roadmap/032).
-    pub snapshot_walk_skips: AtomicU64,
     /// Successful native trunk selections: the server-advertised default
     /// branch resolved through native local/remote-tracking bookmark state
     /// during `vex clone` (roadmap/066).
@@ -479,8 +473,6 @@ macro_rules! for_each_vex_client_stat {
             pack_bytes_fetched,
             presigned_fetches,
             presigned_bytes,
-            snapshot_packs_fetched,
-            snapshot_pack_bytes,
             objects_unpacked,
             objects_pack_resident,
             loose_writes_avoided,
@@ -489,7 +481,6 @@ macro_rules! for_each_vex_client_stat {
             files_written,
             bytes_written,
             files_reflinked,
-            snapshot_walk_skips,
             native_trunk_resolutions,
             native_trunk_missing,
             git_compat_commit_decodes,
@@ -539,8 +530,6 @@ pub struct VexClientStatsSnapshot {
     pub pack_bytes_fetched: u64,
     pub presigned_fetches: u64,
     pub presigned_bytes: u64,
-    pub snapshot_packs_fetched: u64,
-    pub snapshot_pack_bytes: u64,
     pub objects_unpacked: u64,
     pub objects_pack_resident: u64,
     pub loose_writes_avoided: u64,
@@ -549,7 +538,6 @@ pub struct VexClientStatsSnapshot {
     pub files_written: u64,
     pub bytes_written: u64,
     pub files_reflinked: u64,
-    pub snapshot_walk_skips: u64,
     pub native_trunk_resolutions: u64,
     pub native_trunk_missing: u64,
     pub git_compat_commit_decodes: u64,
@@ -1109,16 +1097,6 @@ pub fn clone_chunk_concurrency() -> usize {
 /// refetched.
 const TRANSFER_STATE_SAVE_INTERVAL: usize = 8;
 
-/// Whether the client consumes precomputed snapshot packs from the clone
-/// manifest (roadmap/032). On by default; `VEX_CLONE_SNAPSHOT_PACKS=0` (or
-/// `false`/`no`) disables consumption (rollback / bench control).
-fn snapshot_packs_client_enabled() -> bool {
-    !matches!(
-        std::env::var("VEX_CLONE_SNAPSHOT_PACKS").ok().as_deref(),
-        Some("0") | Some("false") | Some("no")
-    )
-}
-
 /// Whether unpacked metadata objects (commit/tree/op/view) are kept
 /// pack-resident — one decompressed payload file plus a `(offset, len)`
 /// sidecar index per pack under `<cache_root>/.packs/` — instead of exploded
@@ -1156,7 +1134,7 @@ fn unpack_loose_writer_count() -> usize {
 static PACK_INDEXES: OnceLock<Mutex<HashMap<PathBuf, Arc<PackResidentIndex>>>> = OnceLock::new();
 
 /// In-memory overlay of the pack-resident metadata cache (roadmap/032
-/// follow-up). Unpacking a clone/snapshot pack appends the metadata entries'
+/// follow-up). Unpacking a clone pack appends the metadata entries'
 /// bytes to `<cache_root>/.packs/<pack_hex>.payload` and records
 /// `content_id → (pack, offset, len)` both here and in an atomically-written
 /// `<pack_hex>.idx` sidecar (one idx file per pack, so concurrent clones
@@ -1687,56 +1665,6 @@ impl VexClient {
             .map(|root| root.join(format!("{pack_content_id}.part")))
     }
 
-    /// Directory of snapshot-set markers: `<cache_root>/.snapshots/<commit_hex>`
-    /// marks that the full working-tree closure of that commit has been
-    /// unpacked into this cache (roadmap/032). Excluded from LRU pruning, but
-    /// whenever a prune evicts any object file *all* markers are dropped (see
-    /// [`Self::prune_cache_if_needed`]): the evicted objects may belong to a
-    /// closure a marker vouches for, and a stale marker would otherwise
-    /// permanently suppress both snapshot serving (markers are sent as haves,
-    /// trimming the served chain) and the hydration walk skip — and propagate
-    /// across trunk advances via deltas marked complete on top of it.
-    fn snapshot_marker_root(&self) -> Option<PathBuf> {
-        self.cache_root.as_ref().map(|root| root.join(".snapshots"))
-    }
-
-    /// Whether the snapshot set for `commit_hex` (64-char lowercase hex) is
-    /// recorded as fully unpacked into the local cache.
-    pub fn has_unpacked_snapshot(&self, commit_hex: &str) -> bool {
-        if !is_snapshot_commit_hex(commit_hex) {
-            return false;
-        }
-        self.snapshot_marker_root()
-            .is_some_and(|root| root.join(commit_hex).exists())
-    }
-
-    /// Record that the snapshot set for `commit_hex` is fully unpacked.
-    fn write_snapshot_marker(&self, commit_hex: &str) -> Result<(), VexClientError> {
-        let Some(root) = self.snapshot_marker_root() else {
-            return Ok(());
-        };
-        fs::create_dir_all(&root)?;
-        fs::write(root.join(commit_hex), b"")?;
-        Ok(())
-    }
-
-    /// Commit ids (64-char lowercase hex) of every snapshot set fully unpacked
-    /// into this cache. Sent as `have_snapshot_commit_ids` so the server can
-    /// trim the served snapshot chain to the delta above what we already hold.
-    pub fn cached_snapshot_commit_ids(&self) -> Vec<String> {
-        let Some(root) = self.snapshot_marker_root() else {
-            return Vec::new();
-        };
-        let Ok(entries) = fs::read_dir(root) else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| is_snapshot_commit_hex(name))
-            .collect()
-    }
-
     fn load_pack_transfer_state(
         &self,
         pack_content_id: &ContentId,
@@ -2013,10 +1941,9 @@ impl VexClient {
             return Ok(());
         };
         let mut entries = Vec::new();
-        // Skip bookkeeping dirs at the cache root (`.snapshots` set markers,
-        // `.transfer-state` resumable pack state): they are tiny, and pruning
-        // them would silently forfeit snapshot negotiation or break an
-        // in-flight resumable transfer.
+        // Skip bookkeeping dirs at the cache root (`.transfer-state`
+        // resumable pack state): they are tiny, and pruning them would break
+        // an in-flight resumable transfer.
         for entry in fs::read_dir(cache_root)? {
             let entry = entry?;
             if entry.file_name().to_string_lossy().starts_with('.') {
@@ -2065,20 +1992,11 @@ impl VexClient {
                 reclaimed_bytes += entry.size_bytes;
             }
         }
-        // Evicted object files may belong to closures our `.snapshots`
-        // markers vouch for; a stale marker would permanently suppress both
-        // snapshot serving (markers are sent as haves, so the server trims
-        // the chain) and the hydration walk skip, and new deltas marked
-        // complete on top of it would keep the degradation alive across trunk
-        // advances. Markers are cheap to regenerate — drop them all.
         if removed_files > 0 {
-            if let Some(marker_root) = self.snapshot_marker_root() {
-                drop(fs::remove_dir_all(marker_root));
-            }
             // The `.packs` payload/index files are excluded from the LRU scan
             // above (dot-dir), so a capped cache bounds their growth here
             // instead: any prune that evicts object files also drops the
-            // pack-resident store wholesale, mirroring the marker rule. The
+            // pack-resident store wholesale. The
             // removal runs even with `VEX_CACHE_PACK_RESIDENT=0` — nothing
             // reads or writes `.packs` while the kill switch is on, so a
             // cache dir that previously ran enabled would otherwise keep its
@@ -3170,13 +3088,11 @@ impl VexClient {
         &self,
         pack: &jj_backend_types::PackDescriptor,
         hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         prefetched_objects: &AtomicU64,
     ) -> Result<bool, VexClientError> {
         self.prefetch_pack_via_chunks_with_concurrency(
             pack,
             hints,
-            snapshot,
             prefetched_objects,
             clone_chunk_concurrency(),
         )
@@ -3190,19 +3106,12 @@ impl VexClient {
         &self,
         pack: &jj_backend_types::PackDescriptor,
         hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         prefetched_objects: &AtomicU64,
         concurrency: usize,
     ) -> Result<bool, VexClientError> {
         if pack.chunk_frames {
             return self
-                .prefetch_chunk_framed_pack_via_chunks(
-                    pack,
-                    hints,
-                    snapshot,
-                    prefetched_objects,
-                    concurrency,
-                )
+                .prefetch_chunk_framed_pack_via_chunks(pack, hints, prefetched_objects, concurrency)
                 .await;
         }
         let Some(chunks) = normalized_valid_pack_chunks(pack) else {
@@ -3267,7 +3176,6 @@ impl VexClient {
                 pack,
                 &chunks,
                 hints,
-                snapshot,
                 concurrency,
                 &mut state,
                 &mut partial_file,
@@ -3324,12 +3232,10 @@ impl VexClient {
     /// it only in the journal. Per-object cache writes already tolerate either
     /// case, and every prefix entry is therefore made available before the
     /// transfer is declared complete.
-    #[expect(clippy::too_many_arguments)]
     async fn prefetch_chunk_framed_pack_via_chunks(
         &self,
         pack: &jj_backend_types::PackDescriptor,
         hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         prefetched_objects: &AtomicU64,
         concurrency: usize,
     ) -> Result<bool, VexClientError> {
@@ -3419,7 +3325,6 @@ impl VexClient {
                 pack,
                 &chunks,
                 hints,
-                snapshot,
                 concurrency,
                 &mut state,
                 &mut partial_file,
@@ -3524,7 +3429,6 @@ impl VexClient {
         pack: &jj_backend_types::PackDescriptor,
         chunks: &[jj_backend_types::PackChunkDescriptor],
         hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         concurrency: usize,
         state: &mut PackTransferState,
         partial_file: &mut File,
@@ -3593,12 +3497,9 @@ impl VexClient {
             *decoded_entries += entry_count;
             let stats = vex_client_stats();
             stats.pack_chunks_fetched.fetch_add(1, Ordering::Relaxed);
-            let bytes_counter = if snapshot {
-                &stats.snapshot_pack_bytes
-            } else {
-                &stats.pack_bytes_fetched
-            };
-            bytes_counter.fetch_add(chunk_bytes.len() as u64, Ordering::Relaxed);
+            stats
+                .pack_bytes_fetched
+                .fetch_add(chunk_bytes.len() as u64, Ordering::Relaxed);
             partial_file.write_all(&chunk_bytes)?;
             state.next_chunk_index = index + 1;
             chunks_since_save += 1;
@@ -3620,13 +3521,11 @@ impl VexClient {
     /// input order — it *is* the reorder buffer. The single writer below
     /// therefore appends strictly in chunk order and the contiguous-prefix
     /// resume invariant of [`PackTransferState`] is untouched.
-    #[expect(clippy::too_many_arguments)]
     async fn fetch_chunks_into_partial(
         &self,
         pack: &jj_backend_types::PackDescriptor,
         chunks: &[jj_backend_types::PackChunkDescriptor],
         hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         concurrency: usize,
         state: &mut PackTransferState,
         partial_file: &mut File,
@@ -3662,12 +3561,9 @@ impl VexClient {
             }
             let stats = vex_client_stats();
             stats.pack_chunks_fetched.fetch_add(1, Ordering::Relaxed);
-            let bytes_counter = if snapshot {
-                &stats.snapshot_pack_bytes
-            } else {
-                &stats.pack_bytes_fetched
-            };
-            bytes_counter.fetch_add(chunk_bytes.len() as u64, Ordering::Relaxed);
+            stats
+                .pack_bytes_fetched
+                .fetch_add(chunk_bytes.len() as u64, Ordering::Relaxed);
             partial_file.write_all(&chunk_bytes)?;
             state.next_chunk_index = index + 1;
             chunks_since_save += 1;
@@ -3999,7 +3895,6 @@ impl VexClient {
         }
         Ok(ids.len())
     }
-
 
     pub async fn put_object(
         &self,
@@ -4912,7 +4807,6 @@ impl VexClient {
     pub async fn get_clone_manifest(
         &self,
         blob_mode: CloneBlobMode,
-        extra_have_snapshot_commit_ids: &[String],
         progress: Option<&CloneProgressFn>,
     ) -> Result<CloneManifest, VexClientError> {
         let clone_view_kind = proto_clone_view_kind(self.config.repository_scope_kind.as_deref());
@@ -4922,16 +4816,6 @@ impl VexClient {
             .iter()
             .map(proto_virtual_repository_mount)
             .collect();
-        // Snapshot negotiation (roadmap/032): declare every snapshot set we
-        // already hold fully unpacked (shared-cache `.snapshots` markers) plus
-        // any caller-supplied haves, so the server trims the served
-        // `snapshot_packs` chain to the delta above them. Unknown ids are
-        // ignored server-side (full chain returned), so a stale marker is
-        // harmless here.
-        let have_snapshot_commit_ids = assemble_snapshot_haves(
-            self.cached_snapshot_commit_ids(),
-            extra_have_snapshot_commit_ids,
-        );
         // Building a clone manifest for a large repo can take minutes (it packs
         // tens of thousands of objects). We send `accept_pending = true` so the
         // server returns `building = true` immediately on a cache miss (and warms
@@ -4962,7 +4846,6 @@ impl VexClient {
                 .into());
             }
             let virtual_mounts = virtual_mounts.clone();
-            let have_snapshot_commit_ids = have_snapshot_commit_ids.clone();
             // One (non-retrying) attempt per iteration; the loop itself rides
             // both a still-`building` manifest *and* transient backend errors up
             // to `max_wait`, reporting each through `progress` so a slow/cold
@@ -4970,7 +4853,6 @@ impl VexClient {
             // 0%.
             let attempt = Self::block_on_grpc(&self.config.endpoint, |mut client| {
                 let virtual_mounts = virtual_mounts.clone();
-                let have_snapshot_commit_ids = have_snapshot_commit_ids.clone();
                 async move {
                     client
                         .get_clone_manifest(Self::auth_request(
@@ -4989,7 +4871,9 @@ impl VexClient {
                                     .unwrap_or_default(),
                                 virtual_mounts,
                                 accept_pending: true,
-                                have_snapshot_commit_ids,
+                                // Roadmap 032's snapshot packs are retired; the
+                                // proto field survives for wire compatibility.
+                                have_snapshot_commit_ids: Vec::new(),
                             },
                             self.config.access_token.as_deref(),
                         )?)
@@ -5069,12 +4953,9 @@ impl VexClient {
     pub async fn prefetch_clone_manifest(
         &self,
         manifest: &CloneManifest,
-        fetch_snapshot_packs: bool,
         progress: Option<&CloneProgressFn>,
     ) -> Result<(), VexClientError> {
-        let result = self
-            .prefetch_clone_manifest_impl(manifest, fetch_snapshot_packs, progress)
-            .await;
+        let result = self.prefetch_clone_manifest_impl(manifest, progress).await;
         // The pack-unpack and loose-object writes in the impl all bypass the
         // per-write prune (quadratic during a bulk unpack); settle the cache
         // size once now — even when the prefetch failed partway through its
@@ -5086,44 +4967,14 @@ impl VexClient {
     async fn prefetch_clone_manifest_impl(
         &self,
         manifest: &CloneManifest,
-        fetch_snapshot_packs: bool,
         progress: Option<&CloneProgressFn>,
     ) -> Result<(), VexClientError> {
         let prefetch_started = std::time::Instant::now();
         let prefetched_objects = AtomicU64::new(0);
 
-        // Snapshot sets to consume (roadmap/032): the manifest's trunk
-        // snapshot chain, minus sets already fully unpacked here (marker
-        // present). Only meaningful with a cache to unpack into, and only when
-        // the caller wants blobs at all — lazy local clones pass `true`;
-        // virtual working copies and eager clones pass `false`.
-        // `VEX_CLONE_SNAPSHOT_PACKS=0` is the kill switch.
-        let snapshot_sets: Vec<&SnapshotPackSet> =
-            if fetch_snapshot_packs && snapshot_packs_client_enabled() && self.cache_root.is_some()
-            {
-                manifest
-                    .snapshot_packs
-                    .iter()
-                    .filter(|set| !self.has_unpacked_snapshot(&set.commit_id.to_string()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        // Flatten to (set index, pack) so per-set completeness is recoverable
-        // after the parallel fetch. Zero-pack sets ("head alias" recorded for
-        // a tree-identical trunk advance) contribute nothing here and are
-        // marked purely off their base's completeness in
-        // `record_snapshot_markers`.
-        let snapshot_pack_refs: Vec<(usize, &jj_backend_types::PackDescriptor)> = snapshot_sets
-            .iter()
-            .enumerate()
-            .flat_map(|(set_idx, set)| set.packs.iter().map(move |pack| (set_idx, pack)))
-            .collect();
-
         let hinted_pack_ids = manifest
             .packs
             .iter()
-            .chain(snapshot_pack_refs.iter().map(|(_, pack)| *pack))
             .flat_map(|pack| {
                 std::iter::once(pack.content_id)
                     .chain(pack.chunks.iter().map(|chunk| chunk.content_id))
@@ -5139,9 +4990,7 @@ impl VexClient {
             )
             .await?;
 
-        // One continuous `PackFetched` sequence across the metadata and
-        // snapshot phases, so progress totals stay monotonic.
-        let total_packs = (manifest.packs.len() + snapshot_pack_refs.len()) as u64;
+        let total_packs = manifest.packs.len() as u64;
         let packs_done = AtomicU64::new(0);
 
         // Metadata packs: any failure fails the clone (the jj state is
@@ -5152,7 +5001,6 @@ impl VexClient {
             .prefetch_packs_parallel(
                 &metadata_packs,
                 &pack_hints,
-                false,
                 &prefetched_objects,
                 &packs_done,
                 total_packs,
@@ -5162,47 +5010,6 @@ impl VexClient {
             .flatten()
         {
             result?;
-        }
-
-        // Snapshot packs: best-effort — checkout falls back to Stage-1
-        // hydration / per-file reads for anything missing, so a failure here
-        // only costs speed, never the clone.
-        if !snapshot_sets.is_empty() {
-            let packs: Vec<&jj_backend_types::PackDescriptor> =
-                snapshot_pack_refs.iter().map(|(_, pack)| *pack).collect();
-            let results = self.prefetch_packs_parallel(
-                &packs,
-                &pack_hints,
-                true,
-                &prefetched_objects,
-                &packs_done,
-                total_packs,
-                progress,
-            );
-            let mut fetched_ok: HashMap<String, bool> = snapshot_sets
-                .iter()
-                .map(|set| (set.commit_id.to_string(), true))
-                .collect();
-            for ((set_idx, pack), result) in snapshot_pack_refs.iter().zip(results) {
-                match result {
-                    Some(Ok(())) => {}
-                    Some(Err(err)) => {
-                        tracing::warn!(
-                            pack_content_id = %pack.content_id,
-                            snapshot_commit_id = %snapshot_sets[*set_idx].commit_id,
-                            // Redacted: the error may embed a signed URL.
-                            error = %redact_url_queries(&err.to_string()),
-                            "snapshot pack fetch failed; continuing without it"
-                        );
-                        fetched_ok.insert(snapshot_sets[*set_idx].commit_id.to_string(), false);
-                    }
-                    // Never started (an earlier pack failed): incomplete set.
-                    None => {
-                        fetched_ok.insert(snapshot_sets[*set_idx].commit_id.to_string(), false);
-                    }
-                }
-            }
-            self.record_snapshot_markers(&manifest.snapshot_packs, &fetched_ok);
         }
 
         let total_loose = manifest.objects.len() as u64;
@@ -5259,9 +5066,6 @@ impl VexClient {
             repo_id = %self.config.repo_id,
             blob_mode = ?manifest.blob_mode,
             pack_count = manifest.packs.len(),
-            snapshot_set_count = manifest.snapshot_packs.len(),
-            snapshot_sets_fetched = snapshot_sets.len(),
-            snapshot_packs_fetched = snapshot_pack_refs.len(),
             deferred_object_count = manifest.deferred_object_count,
             deferred_object_bytes = manifest.deferred_object_bytes,
             prefetched_objects = prefetched_objects.load(Ordering::Relaxed),
@@ -5288,18 +5092,15 @@ impl VexClient {
     /// that must never run on the shared runtime's own workers.
     ///
     /// Emits [`CloneProgress::PackFetched`] per completed pack, with `done`
-    /// accumulated in the caller-shared `packs_done` so the metadata and
-    /// snapshot phases report one continuous sequence out of `total_packs`.
+    /// accumulated in the caller-shared `packs_done`.
     ///
     /// Returns one slot per input pack, in input order: `Some(result)` for
     /// packs that ran, `None` for packs never started because an earlier pack
     /// failed (workers stop scheduling on the first failure and drain).
-    #[expect(clippy::too_many_arguments)]
     fn prefetch_packs_parallel(
         &self,
         packs: &[&jj_backend_types::PackDescriptor],
         pack_hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         prefetched_objects: &AtomicU64,
         packs_done: &AtomicU64,
         total_packs: u64,
@@ -5333,7 +5134,6 @@ impl VexClient {
                         let result = futures::executor::block_on(self.prefetch_one_pack(
                             pack,
                             pack_hints,
-                            snapshot,
                             prefetched_objects,
                         ));
                         if result.is_ok() {
@@ -5359,67 +5159,22 @@ impl VexClient {
             .collect()
     }
 
-    /// Write `.snapshots/<commit>` markers for every chain set whose full
-    /// working-tree closure is now locally present (see
-    /// [`snapshot_sets_now_complete`]). Best-effort: a marker write failure
-    /// only forfeits future negotiation, never the clone.
-    fn record_snapshot_markers(
-        &self,
-        chain: &[SnapshotPackSet],
-        fetched_ok: &HashMap<String, bool>,
-    ) {
-        let mut already_marked: HashSet<String> = HashSet::new();
-        for set in chain {
-            for id in std::iter::once(&set.commit_id).chain(set.base_commit_id.as_ref()) {
-                let hex = id.to_string();
-                if self.has_unpacked_snapshot(&hex) {
-                    already_marked.insert(hex);
-                }
-            }
-        }
-        for commit_hex in snapshot_sets_now_complete(chain, &already_marked, fetched_ok) {
-            match self.write_snapshot_marker(&commit_hex) {
-                Ok(()) => {
-                    debug!(commit_id = %commit_hex, "recorded unpacked snapshot set marker");
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        commit_id = %commit_hex,
-                        error = %err,
-                        "failed to write snapshot set marker"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Fetch and unpack a single clone/snapshot pack into the local object
-    /// cache, trying the chunked path first and falling back to streamed and
-    /// then whole-pack reads. `snapshot` routes the pack/byte counters to the
-    /// snapshot stats (`snapshot_packs_fetched`/`snapshot_pack_bytes`).
-    /// `prefetched_objects` is incremented per object written. Cache writes
-    /// skip the per-write prune; the caller prunes once after the whole
-    /// prefetch.
+    /// Fetch and unpack a single clone pack into the local object cache,
+    /// trying the chunked path first and falling back to streamed and then
+    /// whole-pack reads. `prefetched_objects` is incremented per object
+    /// written. Cache writes skip the per-write prune; the caller prunes once
+    /// after the whole prefetch.
     async fn prefetch_one_pack(
         &self,
         pack: &jj_backend_types::PackDescriptor,
         pack_hints: &[jj_backend_api::PresignedGet],
-        snapshot: bool,
         prefetched_objects: &AtomicU64,
     ) -> Result<(), VexClientError> {
         let stats = vex_client_stats();
-        let packs_counter = if snapshot {
-            &stats.snapshot_packs_fetched
-        } else {
-            &stats.packs_fetched
-        };
-        let bytes_counter = if snapshot {
-            &stats.snapshot_pack_bytes
-        } else {
-            &stats.pack_bytes_fetched
-        };
+        let packs_counter = &stats.packs_fetched;
+        let bytes_counter = &stats.pack_bytes_fetched;
         match self
-            .prefetch_pack_via_chunks(pack, pack_hints, snapshot, prefetched_objects)
+            .prefetch_pack_via_chunks(pack, pack_hints, prefetched_objects)
             .await
         {
             Ok(true) => {
@@ -5532,62 +5287,6 @@ fn collect_cache_entries(root: &Path, entries: &mut Vec<CacheEntry>) -> Result<(
         }
     }
     Ok(())
-}
-
-/// Whether `id` is a well-formed snapshot commit id: 64 chars of lowercase
-/// hex (the wire format of `have_snapshot_commit_ids` and the `.snapshots`
-/// marker file names). Also guards marker paths against traversal — anything
-/// else is silently ignored.
-fn is_snapshot_commit_hex(id: &str) -> bool {
-    id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// Merge locally-marked snapshot ids with caller-supplied haves into the
-/// deduplicated, validated list sent as `have_snapshot_commit_ids` on the
-/// clone manifest request. Sorted so requests are deterministic.
-fn assemble_snapshot_haves(marker_ids: Vec<String>, extra: &[String]) -> Vec<String> {
-    let mut haves: Vec<String> = marker_ids
-        .into_iter()
-        .chain(extra.iter().cloned())
-        .filter(|id| is_snapshot_commit_hex(id))
-        .collect();
-    haves.sort_unstable();
-    haves.dedup();
-    haves
-}
-
-/// Which sets of a snapshot chain are *newly* complete — i.e. should get
-/// `.snapshots` markers — after a fetch pass, in chain (base-first) order.
-///
-/// A set is complete when its own packs all unpacked (`fetched_ok`, keyed by
-/// commit hex; zero-pack "head alias" sets are trivially `true`) AND — for
-/// delta sets — its base's closure is covered, either by an earlier element
-/// of this walk or by a pre-existing marker (`already_marked`, which also
-/// covers a chain the server trimmed above our declared haves). A broken
-/// link therefore stops marker propagation to every delta above it, while
-/// the already-cached objects remain usable for hydration fallback.
-fn snapshot_sets_now_complete(
-    chain: &[SnapshotPackSet],
-    already_marked: &HashSet<String>,
-    fetched_ok: &HashMap<String, bool>,
-) -> Vec<String> {
-    let mut covered: HashSet<String> = already_marked.clone();
-    let mut newly_complete = Vec::new();
-    for set in chain {
-        let commit_hex = set.commit_id.to_string();
-        if covered.contains(&commit_hex) {
-            continue;
-        }
-        let base_covered = set
-            .base_commit_id
-            .as_ref()
-            .is_none_or(|base| covered.contains(&base.to_string()));
-        if base_covered && fetched_ok.get(&commit_hex).copied().unwrap_or(false) {
-            covered.insert(commit_hex.clone());
-            newly_complete.push(commit_hex);
-        }
-    }
-    newly_complete
 }
 
 /// Split objects into `GetObjectsInline` batches bounded by object count and
@@ -6130,182 +5829,6 @@ mod tests {
         ContentId::from_bytes([byte; 32])
     }
 
-    fn snapshot_set(
-        commit: ContentId,
-        base: Option<ContentId>,
-        pack_count: usize,
-    ) -> SnapshotPackSet {
-        let packs = (0..pack_count)
-            .map(|index| PackDescriptor {
-                content_id: ContentId::hash_bytes(&[commit.as_bytes()[0], index as u8]),
-                size_bytes: 10,
-                scope: ClonePackScope::Full,
-                chunk_frames: false,
-                chunks: vec![],
-                objects: vec![],
-            })
-            .collect();
-        SnapshotPackSet {
-            commit_id: commit,
-            base_commit_id: base,
-            packs,
-            object_count: pack_count as u64,
-            total_bytes: 10 * pack_count as u64,
-        }
-    }
-
-    #[test]
-    fn snapshot_marker_round_trip_and_listing() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut client = sample_client();
-        client.cache_root = Some(temp_dir.path().to_path_buf());
-        let commit_hex = hex_id(7).to_string();
-        assert!(!client.has_unpacked_snapshot(&commit_hex));
-        assert!(client.cached_snapshot_commit_ids().is_empty());
-
-        client.write_snapshot_marker(&commit_hex).unwrap();
-        assert!(client.has_unpacked_snapshot(&commit_hex));
-        assert_eq!(
-            client.cached_snapshot_commit_ids(),
-            vec![commit_hex.clone()]
-        );
-
-        // Junk in the marker dir (short names, uppercase, non-hex) is ignored
-        // rather than sent to the server as a bogus have.
-        let marker_root = temp_dir.path().join(".snapshots");
-        fs::write(marker_root.join("not-a-commit"), b"").unwrap();
-        fs::write(marker_root.join(commit_hex.to_uppercase()), b"").unwrap();
-        assert_eq!(client.cached_snapshot_commit_ids(), vec![commit_hex]);
-
-        // A client without a cache root (from_config) has no markers.
-        let cacheless = sample_client();
-        assert!(!cacheless.has_unpacked_snapshot(&hex_id(7).to_string()));
-        assert!(cacheless.cached_snapshot_commit_ids().is_empty());
-    }
-
-    /// A prune that evicts object files must drop every `.snapshots` marker:
-    /// the evicted objects may belong to a closure a marker vouches for, and
-    /// a stale marker would permanently suppress snapshot serving (sent as a
-    /// have, trimming the served chain) and the hydration walk skip.
-    #[test]
-    fn prune_cache_drops_snapshot_markers_when_objects_are_evicted() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut client = sample_client();
-        client.cache_root = Some(temp_dir.path().to_path_buf());
-        client.cache_max_bytes = Some(8);
-        let commit_hex = hex_id(3).to_string();
-        client.write_snapshot_marker(&commit_hex).unwrap();
-
-        // Under the cap: nothing evicted, markers survive.
-        client
-            .write_cached_object_no_prune(ObjectKind::Blob, &ContentId::hash_bytes(b"a"), b"a")
-            .unwrap();
-        client.prune_cache_if_needed().unwrap();
-        assert!(client.has_unpacked_snapshot(&commit_hex));
-
-        // Over the cap: the eviction invalidates every marker.
-        client
-            .write_cached_object_no_prune(
-                ObjectKind::Blob,
-                &ContentId::hash_bytes(b"big"),
-                &[0_u8; 64],
-            )
-            .unwrap();
-        client.prune_cache_if_needed().unwrap();
-        assert!(!client.has_unpacked_snapshot(&commit_hex));
-        assert!(client.cached_snapshot_commit_ids().is_empty());
-    }
-
-    #[test]
-    fn assemble_snapshot_haves_merges_validates_and_dedupes() {
-        let a = hex_id(1).to_string();
-        let b = hex_id(2).to_string();
-        let haves = assemble_snapshot_haves(
-            vec![b.clone(), a.clone()],
-            &[
-                a.clone(),             // duplicate of a marker
-                "not-hex".to_string(), // invalid: rejected
-                a.to_uppercase(),      // invalid: uppercase rejected
-                "abc123".to_string(),  // invalid: too short
-            ],
-        );
-        let mut expected = vec![a, b];
-        expected.sort_unstable();
-        assert_eq!(haves, expected);
-    }
-
-    #[test]
-    fn snapshot_sets_now_complete_marks_full_chain_including_zero_pack_sets() {
-        // base -> delta -> zero-pack head alias (tree-identical trunk advance).
-        let base = snapshot_set(hex_id(1), None, 2);
-        let delta = snapshot_set(hex_id(2), Some(hex_id(1)), 1);
-        let alias = snapshot_set(hex_id(3), Some(hex_id(2)), 0);
-        let chain = vec![base, delta, alias];
-        let fetched_ok: HashMap<String, bool> = chain
-            .iter()
-            .map(|set| (set.commit_id.to_string(), true))
-            .collect();
-        let newly = snapshot_sets_now_complete(&chain, &HashSet::new(), &fetched_ok);
-        assert_eq!(
-            newly,
-            vec![
-                hex_id(1).to_string(),
-                hex_id(2).to_string(),
-                hex_id(3).to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn snapshot_sets_now_complete_stops_at_a_broken_link() {
-        let base = snapshot_set(hex_id(1), None, 1);
-        let delta = snapshot_set(hex_id(2), Some(hex_id(1)), 1);
-        let head = snapshot_set(hex_id(3), Some(hex_id(2)), 1);
-        let chain = vec![base, delta, head];
-        // The middle delta's packs failed: the head must not be marked even
-        // though its own packs unpacked, because its base closure is missing.
-        let fetched_ok: HashMap<String, bool> = [
-            (hex_id(1).to_string(), true),
-            (hex_id(2).to_string(), false),
-            (hex_id(3).to_string(), true),
-        ]
-        .into_iter()
-        .collect();
-        let newly = snapshot_sets_now_complete(&chain, &HashSet::new(), &fetched_ok);
-        assert_eq!(newly, vec![hex_id(1).to_string()]);
-    }
-
-    #[test]
-    fn snapshot_sets_now_complete_builds_on_prior_markers() {
-        // Server trimmed the chain above our declared have: the served chain
-        // starts at a delta whose base is covered by an existing marker.
-        let delta = snapshot_set(hex_id(2), Some(hex_id(1)), 1);
-        let chain = vec![delta];
-        let already_marked: HashSet<String> = [hex_id(1).to_string()].into_iter().collect();
-        let fetched_ok: HashMap<String, bool> =
-            [(hex_id(2).to_string(), true)].into_iter().collect();
-        let newly = snapshot_sets_now_complete(&chain, &already_marked, &fetched_ok);
-        assert_eq!(newly, vec![hex_id(2).to_string()]);
-
-        // Same chain with no marker for the base: nothing gets marked.
-        let newly = snapshot_sets_now_complete(&chain, &HashSet::new(), &fetched_ok);
-        assert!(newly.is_empty());
-    }
-
-    #[test]
-    fn is_snapshot_commit_hex_accepts_only_64_char_lowercase_hex() {
-        assert!(is_snapshot_commit_hex(&hex_id(0xab).to_string()));
-        assert!(!is_snapshot_commit_hex(""));
-        assert!(!is_snapshot_commit_hex("abcd"));
-        assert!(!is_snapshot_commit_hex(
-            &hex_id(0xab).to_string().to_uppercase()
-        ));
-        assert!(!is_snapshot_commit_hex(&format!(
-            "{}z",
-            &hex_id(0xab).to_string()[..63]
-        )));
-    }
-
     #[test]
     fn direct_fetch_pack_bytes_uses_http_hint() {
         // Bumps the global presigned-fetch counters.
@@ -6654,7 +6177,6 @@ mod tests {
         let ok = futures::executor::block_on(client.prefetch_pack_via_chunks_with_concurrency(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
             concurrency,
         ))
@@ -6778,7 +6300,6 @@ mod tests {
             futures::executor::block_on(client.prefetch_pack_via_chunks(
                 &fixture.pack,
                 &fixture.hints,
-                false,
                 &counter,
             ))
             .unwrap()
@@ -6844,7 +6365,6 @@ mod tests {
         futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &corrupt_hints,
-            false,
             &counter,
         ))
         .unwrap_err();
@@ -6869,7 +6389,6 @@ mod tests {
             futures::executor::block_on(client.prefetch_pack_via_chunks(
                 &fixture.pack,
                 &fixture.hints,
-                false,
                 &counter,
             ))
             .unwrap()
@@ -6912,7 +6431,6 @@ mod tests {
         let err = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap_err();
@@ -6958,7 +6476,6 @@ mod tests {
         let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap();
@@ -7020,7 +6537,6 @@ mod tests {
         let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap();
@@ -7086,7 +6602,6 @@ mod tests {
         futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &corrupt_hints,
-            false,
             &counter,
         ))
         .unwrap_err();
@@ -7122,7 +6637,6 @@ mod tests {
         let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap();
@@ -7175,7 +6689,6 @@ mod tests {
         let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap();
@@ -7223,7 +6736,6 @@ mod tests {
         let err = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap_err();
@@ -7242,7 +6754,6 @@ mod tests {
         let ok = futures::executor::block_on(client.prefetch_pack_via_chunks(
             &fixture.pack,
             &fixture.hints,
-            false,
             &counter,
         ))
         .unwrap();

@@ -732,14 +732,7 @@ impl Workspace {
         // the local cache before checkout (lazy clones only). Callers pass
         // `false` for virtual working copies, which materialize nothing — the
         // factory itself can't tell us (no identity on `WorkingCopyFactory`).
-        // Also gates snapshot-pack consumption (roadmap/032): a clone that
-        // won't materialize files must not download working-tree snapshots.
         hydrate_blobs: bool,
-        // Extra snapshot commit ids (64-char hex) the caller already holds
-        // fully unpacked, sent as `have_snapshot_commit_ids` on the clone
-        // manifest request on top of the shared cache's `.snapshots` markers
-        // (`vex bench clone --have`).
-        have_snapshot_commit_ids: &[String],
         // Whether to publish the workspace operation to the server during the
         // clone. When false, the workspace operation is committed locally only
         // and published transparently by the first mutating operation. Ignored
@@ -818,7 +811,7 @@ impl Workspace {
                 // client checks which kind it has.
                 prefetch_client.mark_fresh_clone_cache();
                 let clone_manifest = prefetch_client
-                    .get_clone_manifest(blob_mode, have_snapshot_commit_ids, progress)
+                    .get_clone_manifest(blob_mode, progress)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
                 if let Some(progress) = progress {
@@ -845,13 +838,8 @@ impl Workspace {
                         deferred_objects: clone_manifest.deferred_object_count,
                     });
                 }
-                // Snapshot packs carry the trunk working tree's blob closure;
-                // they are only worth downloading when this clone will
-                // materialize files from the cache (lazy + non-virtual — the
-                // same conditions as the hydration step below).
-                let fetch_snapshot_packs = hydrate_blobs && blob_mode == CloneBlobMode::Lazy;
                 prefetch_client
-                    .prefetch_clone_manifest(&clone_manifest, fetch_snapshot_packs, progress)
+                    .prefetch_clone_manifest(&clone_manifest, progress)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             }
@@ -1613,8 +1601,7 @@ async fn clone_vex_legacy_start_commit(
 /// hydrating the remaining files on demand exactly as before.
 /// Returns the number of file/symlink tree entries in the start commit when
 /// the hydration walk ran (used as the materializing-progress total), or
-/// `None` when the walk was skipped (snapshot packs already cover the commit)
-/// or failed.
+/// `None` when the walk was skipped or failed.
 async fn hydrate_start_commit_blobs(
     repo: &Arc<ReadonlyRepo>,
     store_path: &Path,
@@ -1632,21 +1619,6 @@ async fn hydrate_start_commit_blobs(
             return None;
         }
     };
-    // Snapshot fast path (roadmap/032 Stage 4): a fully-unpacked snapshot set
-    // covering the start commit means every blob/symlink in its tree is
-    // already in the local cache — skip the hydration tree walk entirely.
-    // Recorded in the `snapshot_walk_skips` counter so `vex bench clone` can
-    // tell which path ran.
-    if client.has_unpacked_snapshot(&start_commit.id().hex()) {
-        crate::vex::vex_client_stats()
-            .snapshot_walk_skips
-            .fetch_add(1, AtomicOrdering::Relaxed);
-        tracing::debug!(
-            commit_id = %start_commit.id().hex(),
-            "clone hydration: snapshot packs cover the start commit; skipping hydration walk"
-        );
-        return None;
-    }
     let (ids, file_count) = match clone_vex_hydration_ids(repo, start_commit).await {
         Ok(walk) => walk,
         Err(err) => {
