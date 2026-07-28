@@ -249,6 +249,79 @@ fn grpc_authority_override() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The gRPC metadata key carrying the running client's version.
+///
+/// PRD 088 **D14** condition 3 ("no org is pinned to a CLI older than the
+/// reference release") was literally unmeasurable while the client sent nothing
+/// but an `authorization` header: the server's release registry lists *published*
+/// builds, not running ones. This header is the smallest honest fix — the client
+/// states what it is, once, on every request it already makes, and the server
+/// records a last-seen version per tenant off the request path.
+pub const CLIENT_VERSION_METADATA_KEY: &str = "x-vex-cli-version";
+
+/// Process-wide running-client version, reported as `x-vex-cli-version`.
+///
+/// Set once at startup by the binary that knows it — `vex-cli` passes
+/// `env!("VEX_VERSION")`, the same string `vex --version` prints. `jj_lib` is a
+/// library and deliberately does not guess: an embedder that never calls
+/// [`set_client_version`] and sets no `VEX_CLI_VERSION` simply sends no header,
+/// and the server reports it as unknown rather than as a version it made up.
+static CLIENT_VERSION: OnceLock<String> = OnceLock::new();
+
+/// Declare the running client's version for every subsequent Vex gRPC request in
+/// this process. Returns `false` (and changes nothing) if a version was already
+/// set or `version` is blank.
+///
+/// The value is sent **verbatim**, including a dev build's `-<commit>` suffix.
+/// That suffix is information — it distinguishes a source build from the clean
+/// release of the same semver — and stripping it would make a locally built
+/// client indistinguishable from a shipped one in the compatibility gate.
+pub fn set_client_version(version: &str) -> bool {
+    let version = version.trim();
+    if version.is_empty() {
+        return false;
+    }
+    CLIENT_VERSION.set(version.to_string()).is_ok()
+}
+
+/// The `x-vex-cli-version` value to send, or `None` to send no header.
+///
+/// Resolution: the programmatic setter wins, then the `VEX_CLI_VERSION` env var
+/// (which lets a wrapper or a test declare a version without linking the CLI).
+/// A value that is not printable ASCII, or is longer than the server stores, is
+/// dropped rather than sent — the server would reject it anyway, and a header
+/// this client cannot vouch for is worse than no header.
+fn client_version_metadata() -> Option<MetadataValue<tonic::metadata::Ascii>> {
+    let raw = CLIENT_VERSION.get().cloned().or_else(|| {
+        std::env::var("VEX_CLI_VERSION")
+            .ok()
+            .map(|value| value.trim().to_string())
+    })?;
+    validated_client_version_metadata(&raw)
+}
+
+/// The validation half, split out so it is testable without touching the
+/// process-wide [`CLIENT_VERSION`] cell.
+///
+/// A value that is not printable ASCII, or is longer than the server stores, is
+/// dropped rather than sent: the server would reject it anyway, and a header
+/// this client cannot vouch for is worse than no header — the gate reads a
+/// missing header as *unknown*, which is the honest answer.
+fn validated_client_version_metadata(raw: &str) -> Option<MetadataValue<tonic::metadata::Ascii>> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.len() > MAX_CLIENT_VERSION_METADATA_LEN
+        || !raw.chars().all(|ch| ch.is_ascii_graphic())
+    {
+        return None;
+    }
+    MetadataValue::try_from(raw).ok()
+}
+
+/// Mirrors the server's `jj_client_version_sightings.cli_version VARCHAR(64)`.
+/// The longest legitimate value is a dev build's `X.Y.Z-<40-char commit>`.
+const MAX_CLIENT_VERSION_METADATA_LEN: usize = 64;
+
 /// Whether `VEX_RPC_TIMING` is set — enables per-RPC wall-time logging to stderr
 /// for latency attribution. Cached so the env lookup happens once.
 fn rpc_timing_enabled() -> bool {
@@ -2133,6 +2206,15 @@ impl VexClient {
             let metadata = MetadataValue::try_from(format!("Bearer {access_token}"))
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
             request.metadata_mut().insert("authorization", metadata);
+        }
+        // Every Vex gRPC request is built here, so this is the one place the
+        // client version needs to be attached. Doing it per call site would
+        // guarantee that a future RPC forgets it and silently reappears as an
+        // "unknown version" tenant in the compatibility gate.
+        if let Some(version) = client_version_metadata() {
+            request
+                .metadata_mut()
+                .insert(CLIENT_VERSION_METADATA_KEY, version);
         }
         Ok(request)
     }
@@ -5387,6 +5469,93 @@ mod tests {
     /// Shared with `vex_backend`'s tests via [`crate::vex::test_stats_lock`].
     fn stats_lock() -> &'static Mutex<()> {
         test_stats_lock()
+    }
+
+    #[test]
+    fn a_client_version_is_sent_verbatim_including_a_dev_build_suffix() {
+        for version in ["1.0.0", "0.12.0-3ce9e572", &format!("1.2.3-{}", "a".repeat(40))] {
+            assert_eq!(
+                validated_client_version_metadata(version)
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok()),
+                Some(version),
+                "{version} must reach the server unchanged; the commit suffix is information"
+            );
+        }
+        assert_eq!(
+            validated_client_version_metadata("  1.0.0  ")
+                .as_ref()
+                .and_then(|value| value.to_str().ok()),
+            Some("1.0.0"),
+        );
+    }
+
+    #[test]
+    fn an_unsendable_client_version_yields_no_header_at_all() {
+        // No header is the honest signal: the gate reads it as *unknown*. A
+        // mangled or truncated one would be read as a real version.
+        for bad in [
+            "",
+            "   ",
+            "1.0.0-café",
+            "1.0.0\r\nx-injected: 1",
+            "1.0.0 dev",
+            &"9".repeat(MAX_CLIENT_VERSION_METADATA_LEN + 1),
+        ] {
+            assert!(
+                validated_client_version_metadata(bad).is_none(),
+                "must send no header for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_client_version_ignores_a_blank_declaration() {
+        assert!(!set_client_version(""));
+        assert!(!set_client_version("   "));
+    }
+
+    #[test]
+    fn every_request_carries_the_client_version_alongside_the_auth_token() {
+        // `auth_request` is the single construction point for every Vex gRPC
+        // request, which is what stops a future RPC from silently omitting the
+        // header and reappearing as an "unknown version" tenant in the gate.
+        set_client_version("1.4.2-deadbeef");
+        let request = VexClient::auth_request((), Some("token-abc")).expect("build request");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token-abc"),
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get(CLIENT_VERSION_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            client_version_metadata()
+                .as_ref()
+                .and_then(|value| value.to_str().ok()),
+            "the header must be whatever this process resolved, on every request"
+        );
+        assert!(
+            client_version_metadata().is_some(),
+            "a version was declared, so one must be sent"
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_request_still_declares_its_version() {
+        set_client_version("1.4.2-deadbeef");
+        let request = VexClient::auth_request((), None).expect("build request");
+
+        assert!(request.metadata().get("authorization").is_none());
+        assert!(request
+            .metadata()
+            .get(CLIENT_VERSION_METADATA_KEY)
+            .is_some());
     }
 
     fn sample_client() -> VexClient {
