@@ -813,6 +813,12 @@ pub enum VexClientError {
     Http(#[from] reqwest::Error),
     #[error("ref update rejected: {0}")]
     RefUpdateRejected(String),
+    /// A staged-upload marker names an object whose bytes are no longer in the
+    /// local cache, so the work it belongs to cannot be published from this
+    /// workspace. Its own variant because it is not an IO or transport failure:
+    /// nothing is retryable, and the fix is a human one.
+    #[error("{0}")]
+    StagedObjectsMissing(String),
 }
 
 /// Object decode policy for the Vex backend read path (roadmap/066).
@@ -1030,12 +1036,17 @@ fn proto_virtual_repository_mount(
     }
 }
 
-/// Max buffered upload bytes before an inline flush during a snapshot. Bounds
-/// peak memory for very large snapshots while still letting a normal snapshot
-/// (a handful of small objects) coalesce into a single batched upload.
+/// Max bytes per staged-upload `PutObjects` batch. Bounds peak memory for a
+/// push that publishes a very large staged set while still letting a normal
+/// push (a handful of small objects) go out as a single batch.
 const PENDING_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 /// Companion object-count cap to [`PENDING_FLUSH_BYTES`].
 const PENDING_FLUSH_OBJECTS: usize = 256;
+/// Concurrent in-flight `PutObjects` batches while publishing staged objects,
+/// and — because the batches of one wave are read into memory together — the
+/// number of batches held at once. Peak upload memory is therefore bounded at
+/// roughly `STAGED_UPLOAD_CONCURRENCY * PENDING_FLUSH_BYTES`.
+const STAGED_UPLOAD_CONCURRENCY: usize = 16;
 
 /// Max objects per `GetObjectsInline` batch (read-side analogue of
 /// [`PENDING_FLUSH_OBJECTS`]).
@@ -1137,48 +1148,11 @@ fn unpack_loose_writer_count() -> usize {
         .clamp(1, 4)
 }
 
-/// Objects written this process that have not yet been uploaded, keyed by repo
-/// (`endpoint` + `repo_id`) so the three Vex stores of one repo — object
-/// backend, op store, op heads store — share a single buffer even though each
-/// holds its own [`VexClient`].
-///
-/// Snapshotting the working copy writes a dependency chain — the file blob, the
-/// trees above it, the working-copy commit, then the operation and view — whose
-/// ids are all content hashes computed locally. Uploading them one blocking
-/// `put_object` round trip at a time makes `vex status` after an edit pay the
-/// backend latency several times over; buffering them here lets a single
-/// pipelined `put_objects` batch publish the whole set just before the op-head
-/// CAS references it (see [`VexClient::commit_op_heads`]).
-///
-/// Invariant: an object is written to the on-disk cache only *after* it has been
-/// uploaded, so the content-addressed "cached ⟹ present on server" short circuit
-/// in [`VexClient::put_object`] stays sound across processes even if this one
-/// dies mid-snapshot. Reads consult this buffer before the network so a
-/// within-process read of a just-written object still resolves.
-static PENDING_UPLOADS: OnceLock<Mutex<HashMap<String, PendingUploads>>> = OnceLock::new();
-
-#[derive(Default)]
-struct PendingUploads {
-    objects: HashMap<(ObjectKind, ContentId), Vec<u8>>,
-    bytes: usize,
-}
-
-/// Objects [`VexClient::stage_pending_uploads`] wrote to the on-disk cache
-/// *without* uploading them, keyed like [`PENDING_UPLOADS`]. Deferred-publish
-/// durability modes (roadmap/088) break the "cached ⟹ uploaded" invariant on
-/// purpose: an operation's objects must survive process exit before its
-/// op-head CAS has run, and the cache is the only crash-durable place for
-/// them. The debt is repaid by recording every staged id in the operation's
-/// `vex-pending-publish` entry, which the publisher uploads unconditionally
-/// (`put_objects` is create-if-missing, so re-uploading is free).
-static STAGED_OBJECTS: OnceLock<Mutex<HashMap<String, Vec<(ObjectKind, ContentId)>>>> =
-    OnceLock::new();
-
-/// Process-wide pack-resident indexes, keyed by cache root. Process-global for
-/// the same reason as [`PENDING_UPLOADS`]: the three Vex stores of one repo —
-/// object backend, op store, op heads store — each hold their own
-/// [`VexClient`], and all of them must see one coherent view of the index
-/// (including self-heal drops and prune invalidation).
+/// Process-wide pack-resident indexes, keyed by cache root. Process-global
+/// because the three Vex stores of one repo — object backend, op store, op
+/// heads store — each hold their own [`VexClient`], and all of them must see
+/// one coherent view of the index (including self-heal drops and prune
+/// invalidation).
 static PACK_INDEXES: OnceLock<Mutex<HashMap<PathBuf, Arc<PackResidentIndex>>>> = OnceLock::new();
 
 /// In-memory overlay of the pack-resident metadata cache (roadmap/032
@@ -1468,6 +1442,23 @@ impl VexClient {
         Self::from_store_path_and_config(store_path, config)
     }
 
+    /// Repository *initialization*: use the caller's in-memory config (nothing
+    /// is on disk to load yet) but bind the object cache to `store_path`, the
+    /// same place every later process will look.
+    ///
+    /// [`Self::from_config`] deliberately has no cache, which was harmless
+    /// while every write also uploaded. Since roadmap/088 Stage 7 the cache is
+    /// where a write's *only* copy lives until `vex push` publishes it, so an
+    /// `init` whose backend had no cache would drop the repository's very first
+    /// commit and tree on the floor: nothing local to read them back from, and
+    /// nothing staged for a push to publish.
+    pub fn from_config_at(
+        config: VexRepoConfig,
+        store_path: &Path,
+    ) -> Result<Self, VexConfigError> {
+        Self::from_store_path_and_config(store_path, config)
+    }
+
     /// Like [`Self::from_store_path`], but forces `object_read_mode` after
     /// loading `vex.json`. Needed because the mode field is never serialized
     /// (`#[serde(skip_serializing)]`), so disk-backed loads always see
@@ -1480,6 +1471,33 @@ impl VexClient {
         let mut config = VexRepoConfig::load_from_store_path(store_path)?;
         config.object_read_mode = object_read_mode;
         Self::from_store_path_and_config(store_path, config)
+    }
+
+    /// Like [`Self::from_store_path`], but talks to `endpoint` with
+    /// `access_token` instead of whatever `vex.json` recorded at clone time.
+    ///
+    /// `vex push` resolves auth for the command it is running (which may be a
+    /// freshly minted token, or a different endpoint than the clone used) and
+    /// then has to publish this workspace's staged objects with it. Everything
+    /// else — repo id, tenant id, and therefore the object cache the staged
+    /// markers live in — still comes from the workspace on disk, because that
+    /// is the repository whose work is being published.
+    pub fn from_store_path_with_auth(
+        store_path: &Path,
+        endpoint: &str,
+        access_token: Option<&str>,
+    ) -> Result<Self, VexConfigError> {
+        let mut config = VexRepoConfig::load_from_store_path(store_path)?;
+        config.endpoint = endpoint.to_string();
+        config.access_token = access_token.map(ToOwned::to_owned);
+        Self::from_store_path_and_config(store_path, config)
+    }
+
+    /// This client's repository as the catalog names it: `(tenant, repo)`
+    /// slugs, so a caller can check that a workspace on disk really is the
+    /// repository a command is targeting before acting on its behalf.
+    pub fn repo_slugs(&self) -> (&str, &str) {
+        (&self.config.tenant_slug, &self.config.repo_slug)
     }
 
     fn from_store_path_and_config(
@@ -2023,9 +2041,23 @@ impl VexClient {
         let target_bytes = limit_bytes.saturating_mul(9).saturating_div(10);
         let mut removed_files = 0_u64;
         let mut reclaimed_bytes = 0_u64;
+        // Staged objects are the *only* copy of work that has not been pushed
+        // yet, so they are not evictable — a prune that dropped one would leave
+        // a marker naming bytes nobody holds, and `vex push` would have to
+        // refuse. Read once: the set is empty on the overwhelmingly common
+        // path, and it is bounded by what one session has left unpushed.
+        let staged: HashSet<PathBuf> = self
+            .staged_objects()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(kind, content_id)| self.cache_path(kind, &content_id))
+            .collect();
         for entry in entries {
             if total_bytes <= target_bytes {
                 break;
+            }
+            if staged.contains(&entry.path) {
+                continue;
             }
             if fs::remove_file(&entry.path).is_ok() {
                 total_bytes = total_bytes.saturating_sub(entry.size_bytes);
@@ -3721,18 +3753,17 @@ impl VexClient {
         })
     }
 
-    /// Buffer key for [`PENDING_UPLOADS`]: one entry per repo, shared by every
-    /// `VexClient` (backend / op store / op heads store) pointing at it.
-    fn pending_key(&self) -> String {
-        format!("{}\u{0}{}", self.config.endpoint, self.config.repo_id)
-    }
-
-    /// Whether snapshot writes should be buffered and uploaded in one batch
-    /// rather than one blocking round trip per object. On by default; set
+    /// Whether object writes are *staged* on disk for a later `vex push`
+    /// rather than uploaded inline, one blocking round trip per object.
+    ///
+    /// On by default. Since roadmap/088 Stage 7 `vex push` is the only
+    /// publication verb, so this is the normal path: a `vex commit` must be
+    /// able to finish without contacting the backend at all, and the objects it
+    /// wrote must still be uploadable by a *later* process. Set
     /// `VEX_BATCH_SNAPSHOT_UPLOADS=0` (or `false`/`no`) to fall back to
-    /// immediate per-object PUTs. Never batches in local-write mode, where puts
-    /// already stay local and there is no backend round trip to coalesce.
-    fn defer_uploads_enabled(&self) -> bool {
+    /// immediate per-object PUTs. Never staged in local-write mode, where puts
+    /// stay local by design and are never published at all.
+    fn stage_writes_enabled(&self) -> bool {
         if self.local_writes {
             return false;
         }
@@ -3742,113 +3773,200 @@ impl VexClient {
         )
     }
 
-    /// Buffer one object for later batched upload. Returns `true` when the
-    /// buffer has reached its byte/object cap and the caller should flush. A
-    /// no-op (returns `false`) if the object is already buffered.
-    fn buffer_pending_object(
+    /// Directory of staged-upload markers: `<cache_root>/.staged/<kind>/<id>`
+    /// is an empty file meaning "this object's bytes are in the cache but have
+    /// not been uploaded yet".
+    ///
+    /// This is the one thing that keeps the "cached ⟹ present on server" short
+    /// circuit in [`Self::put_object`] sound now that writes no longer upload:
+    /// a cached object is on the server **unless** it carries a marker. The
+    /// markers are what a later `vex push` — in a later process — reads to know
+    /// what to publish, which is why they must be on disk and not in a
+    /// process-local buffer.
+    fn staged_marker_root(&self) -> Option<PathBuf> {
+        self.cache_root.as_ref().map(|root| root.join(".staged"))
+    }
+
+    fn staged_marker_path(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PathBuf> {
+        self.staged_marker_root()
+            .map(|root| root.join(kind_to_str(kind)).join(content_id.to_string()))
+    }
+
+    /// Whether this object is staged for upload (cached but not yet published).
+    #[cfg(test)]
+    fn has_staged_object(&self, kind: ObjectKind, content_id: &ContentId) -> bool {
+        self.staged_marker_path(kind, content_id)
+            .is_some_and(|path| path.exists())
+    }
+
+    /// Persist one object locally and record that it still owes an upload.
+    ///
+    /// **The marker is written before the bytes.** A crash between the two
+    /// leaves a marker for an object the cache does not hold, which the next
+    /// push refuses on, loudly and by name (the marker stays, so the refusal
+    /// repeats rather than decaying into silence); the reverse order would
+    /// leave cached bytes that
+    /// no marker names, and [`Self::put_object`]'s cache short circuit would
+    /// then skip them forever — a silently dangling ref. Both writes are
+    /// temp-file-plus-rename, matching the marker discipline in
+    /// [`crate::vex_publish`].
+    ///
+    /// Deliberately skips the cache prune pass: staged objects are the only
+    /// copy of unpublished work (see [`Self::prune_cache_if_needed`], which
+    /// refuses to evict them for the same reason).
+    fn stage_object(
         &self,
         kind: ObjectKind,
         content_id: &ContentId,
-        data: Vec<u8>,
-    ) -> bool {
-        let map = PENDING_UPLOADS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut guard = map.lock().unwrap();
-        let pending = guard.entry(self.pending_key()).or_default();
-        if pending.objects.contains_key(&(kind, *content_id)) {
-            return false;
+        data: &[u8],
+    ) -> Result<(), VexClientError> {
+        if let Some(path) = self.staged_marker_path(kind, content_id) {
+            let dir = path.parent().expect("staged marker has a parent");
+            fs::create_dir_all(dir)?;
+            let temp = NamedTempFile::new_in(dir)?;
+            temp.as_file().sync_all()?;
+            temp.persist(&path).map_err(|err| err.error)?;
         }
-        pending.bytes += data.len();
-        pending.objects.insert((kind, *content_id), data);
-        pending.bytes >= PENDING_FLUSH_BYTES || pending.objects.len() >= PENDING_FLUSH_OBJECTS
+        self.write_cached_object_no_prune(kind, content_id, data)
     }
 
-    /// Whether `content_id` is already buffered for upload by this process.
-    fn has_pending_object(&self, kind: ObjectKind, content_id: &ContentId) -> bool {
-        PENDING_UPLOADS
-            .get()
-            .map(|map| {
-                map.lock()
-                    .unwrap()
-                    .get(&self.pending_key())
-                    .is_some_and(|pending| pending.objects.contains_key(&(kind, *content_id)))
-            })
-            .unwrap_or(false)
-    }
-
-    /// Read a buffered-but-not-yet-uploaded object — lets a within-process read
-    /// of an object just written this snapshot resolve before it is flushed.
-    fn read_pending_object(&self, kind: ObjectKind, content_id: &ContentId) -> Option<Vec<u8>> {
-        PENDING_UPLOADS.get().and_then(|map| {
-            map.lock()
-                .unwrap()
-                .get(&self.pending_key())
-                .and_then(|pending| pending.objects.get(&(kind, *content_id)).cloned())
-        })
-    }
-
-    /// Upload every buffered object for this repo in one pipelined set of
-    /// `put_objects` batches, then record them in the on-disk cache. Called
-    /// before the op-head CAS (and when the in-memory buffer hits its cap) so
-    /// every object an operation references is durable on the server first, and
-    /// so the cache only ever names objects that are already uploaded.
-    ///
-    /// This is a blocking call (it drives the shared gRPC runtime) intended for
-    /// the same single-threaded executor that drives the other `VexClient`
-    /// methods; it must not be invoked from within the shared runtime.
-    pub fn flush_pending_uploads(&self) -> Result<(), VexClientError> {
-        let drained: Vec<(ObjectKind, ContentId, Vec<u8>)> = {
-            let Some(map) = PENDING_UPLOADS.get() else {
-                return Ok(());
-            };
-            let mut guard = map.lock().unwrap();
-            match guard.get_mut(&self.pending_key()) {
-                Some(pending) if !pending.objects.is_empty() => {
-                    pending.bytes = 0;
-                    pending
-                        .objects
-                        .drain()
-                        .map(|((kind, id), data)| (kind, id, data))
-                        .collect()
-                }
-                _ => return Ok(()),
-            }
+    /// Every object currently staged for upload, read off disk. Includes work
+    /// staged by earlier processes, which is the whole point.
+    fn staged_objects(&self) -> Result<Vec<(ObjectKind, ContentId)>, VexClientError> {
+        let Some(root) = self.staged_marker_root() else {
+            return Ok(Vec::new());
         };
-        let _t = RpcTimer::start(|| format!("flush_pending_uploads/{}", drained.len()));
-
-        // Split into size/count-bounded batches and upload them concurrently
-        // over the one cached connection.
-        let mut batches: Vec<Vec<InlineObject>> = Vec::new();
-        let mut current: Vec<InlineObject> = Vec::new();
-        let mut current_bytes = 0usize;
-        for (kind, id, data) in &drained {
-            current_bytes += data.len();
-            current.push(InlineObject {
-                object: Some(ObjectId {
-                    kind: kind_to_str(*kind).to_string(),
-                    content_id: id.to_string(),
-                }),
-                data: data.clone(),
-            });
-            if current.len() >= PENDING_FLUSH_OBJECTS || current_bytes >= PENDING_FLUSH_BYTES {
-                batches.push(std::mem::take(&mut current));
-                current_bytes = 0;
+        let mut staged = Vec::new();
+        let kind_dirs = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        for kind_dir in kind_dirs {
+            let kind_dir = kind_dir?;
+            let Some(kind) = kind_dir
+                .file_name()
+                .to_str()
+                .and_then(|name| kind_from_str(name))
+            else {
+                continue;
+            };
+            for marker in fs::read_dir(kind_dir.path())? {
+                let marker = marker?;
+                let Some(content_id) = marker
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| ContentId::from_hex(name).ok())
+                else {
+                    continue;
+                };
+                staged.push((kind, content_id));
             }
         }
-        if !current.is_empty() {
-            batches.push(current);
-        }
+        // Deterministic order so a failed upload retries the same way and so
+        // logs of two runs are comparable.
+        staged.sort_by_key(|(kind, id)| (kind_to_str(*kind), id.to_hex()));
+        Ok(staged)
+    }
 
+    /// Upload everything staged for this repo, then drop its markers.
+    ///
+    /// This is the publication half of `vex push`: it must run **before** any
+    /// ref advances, so the ref never names a commit whose closure is missing
+    /// server-side (roadmap/056's presence-before-publish invariant). Returns
+    /// the number of objects uploaded.
+    ///
+    /// Safe to replay in every direction. `PutObjects` is content-addressed
+    /// create-if-missing, so re-uploading an object a previous attempt already
+    /// landed is a no-op; markers are removed only after their batch is
+    /// acknowledged, so a crash mid-push re-uploads rather than forgets.
+    ///
+    /// This is a blocking call (it drives the shared gRPC runtime) and must not
+    /// be invoked from within that runtime.
+    pub fn upload_staged_objects(&self) -> Result<usize, VexClientError> {
+        let staged = self.staged_objects()?;
+        if staged.is_empty() {
+            return Ok(0);
+        }
+        let _t = RpcTimer::start(|| format!("upload_staged_objects/{}", staged.len()));
+
+        // Size/count-bounded batches, uploaded a wave at a time so peak memory
+        // is bounded by the wave rather than by everything ever staged.
+        let mut uploaded = 0usize;
+        let mut missing = Vec::new();
+        let mut wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> = Vec::new();
+        let mut batch: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::new();
+        let mut batch_bytes = 0usize;
+        for (kind, content_id) in staged {
+            let Some(data) = self.read_cached_object(kind, &content_id) else {
+                // The bytes are gone (a cache wiped behind our back). Say so
+                // rather than advancing a ref over a hole.
+                missing.push((kind, content_id));
+                continue;
+            };
+            batch_bytes += data.len();
+            batch.push((kind, content_id, data));
+            if batch.len() >= PENDING_FLUSH_OBJECTS || batch_bytes >= PENDING_FLUSH_BYTES {
+                wave.push(std::mem::take(&mut batch));
+                batch_bytes = 0;
+            }
+            if wave.len() >= STAGED_UPLOAD_CONCURRENCY {
+                uploaded += self.upload_staged_wave(std::mem::take(&mut wave))?;
+            }
+        }
+        if !batch.is_empty() {
+            wave.push(batch);
+        }
+        if !wave.is_empty() {
+            uploaded += self.upload_staged_wave(wave)?;
+        }
+        if !missing.is_empty() {
+            return Err(VexClientError::StagedObjectsMissing(format!(
+                "{} staged object(s) are recorded as unpublished but their bytes are no longer \
+                 in the local cache (first: {}/{}); the local cache was cleared before these \
+                 changes were pushed, so they cannot be published from this workspace",
+                missing.len(),
+                kind_to_str(missing[0].0),
+                missing[0].1,
+            )));
+        }
+        Ok(uploaded)
+    }
+
+    /// Upload one wave of batches concurrently over the shared connection and
+    /// drop the markers of everything it acknowledged.
+    fn upload_staged_wave(
+        &self,
+        wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
+    ) -> Result<usize, VexClientError> {
+        let ids: Vec<(ObjectKind, ContentId)> = wave
+            .iter()
+            .flatten()
+            .map(|(kind, content_id, _)| (*kind, *content_id))
+            .collect();
+        let batches: Vec<Vec<InlineObject>> = wave
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(|(kind, content_id, data)| InlineObject {
+                        object: Some(ObjectId {
+                            kind: kind_to_str(kind).to_string(),
+                            content_id: content_id.to_string(),
+                        }),
+                        data,
+                    })
+                    .collect()
+            })
+            .collect();
         let channel = Self::cached_channel(&self.config.endpoint)?;
         let repo_id = self.config.repo_id.clone();
         let token = self.config.access_token.clone();
-        // This flush is the first half of the synchronous publish, so it takes
-        // the same per-attempt deadline as the CAS that follows it: a wedged
-        // upload must not hold the working-copy lock indefinitely.
         let per_batch = publish_request_timeout();
         Self::shared_grpc_runtime().block_on(with_output_cancel(async move {
             use futures::stream::TryStreamExt as _;
             futures::stream::iter(batches.into_iter().map(Ok::<_, VexClientError>))
-                .try_for_each_concurrent(16, |objects| {
+                .try_for_each_concurrent(STAGED_UPLOAD_CONCURRENCY, |objects| {
                     let channel = channel.clone();
                     let repo_id = repo_id.clone();
                     let token = token.clone();
@@ -3871,60 +3989,17 @@ impl VexClient {
                 })
                 .await
         }))?;
-
-        // Now — and only now — is "cached ⟹ uploaded" true for these objects.
-        for (kind, id, data) in &drained {
-            self.write_cached_object(*kind, id, data)?;
-        }
-        Ok(())
-    }
-
-    /// Deferred-publish counterpart of [`Self::flush_pending_uploads`]: write
-    /// every buffered object straight to the on-disk cache and remember its id
-    /// instead of uploading it. The operation that triggered this claims the
-    /// ids through [`Self::take_staged_objects`] and records them in its
-    /// pending-publish entry, so the publisher can upload exactly this set
-    /// later — including from a later process, since the bytes are on disk.
-    ///
-    /// Deliberately skips the cache prune pass: staged objects are the only
-    /// copy of unpublished work, and evicting one would strand the operation
-    /// that references it.
-    pub fn stage_pending_uploads(&self) -> Result<(), VexClientError> {
-        let drained: Vec<(ObjectKind, ContentId, Vec<u8>)> = {
-            let Some(map) = PENDING_UPLOADS.get() else {
-                return Ok(());
-            };
-            let mut guard = map.lock().unwrap();
-            match guard.get_mut(&self.pending_key()) {
-                Some(pending) if !pending.objects.is_empty() => {
-                    pending.bytes = 0;
-                    pending
-                        .objects
-                        .drain()
-                        .map(|((kind, id), data)| (kind, id, data))
-                        .collect()
-                }
-                _ => return Ok(()),
+        // Now — and only now — is "cached ⟹ uploaded" true for these objects
+        // again, so the markers may go. A failure to unlink is harmless: the
+        // next push re-uploads, which is free.
+        for (kind, content_id) in &ids {
+            if let Some(path) = self.staged_marker_path(*kind, content_id) {
+                drop(fs::remove_file(path));
             }
-        };
-        for (kind, id, data) in &drained {
-            self.write_cached_object_no_prune(*kind, id, data)?;
         }
-        let map = STAGED_OBJECTS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut guard = map.lock().unwrap();
-        let staged = guard.entry(self.pending_key()).or_default();
-        staged.extend(drained.into_iter().map(|(kind, id, _)| (kind, id)));
-        Ok(())
+        Ok(ids.len())
     }
 
-    /// Take the ids staged for this repo since the last call. Returned in
-    /// staging order; the caller owns publishing them.
-    pub fn take_staged_objects(&self) -> Vec<(ObjectKind, ContentId)> {
-        STAGED_OBJECTS
-            .get()
-            .and_then(|map| map.lock().unwrap().remove(&self.pending_key()))
-            .unwrap_or_default()
-    }
 
     pub async fn put_object(
         &self,
@@ -3944,25 +4019,20 @@ impl VexClient {
             return Ok(());
         }
         // Content-addressed short circuit: if this object is already cached it
-        // was already uploaded, so skip the round trip. This is the hot path
-        // during working-copy snapshots (`vex status`), where unchanged or
-        // recurring blob/tree/commit content would otherwise be re-PUT.
+        // was already uploaded *or* is already staged for upload, so there is
+        // nothing new to record. This is the hot path during working-copy
+        // snapshots (`vex status`), where unchanged or recurring
+        // blob/tree/commit content would otherwise be re-written.
         if self.has_cached_object(kind, content_id) {
             return Ok(());
         }
-        // Snapshot batching: buffer the object instead of uploading it inline,
-        // so the blob/tree/commit/op/view chain a snapshot writes is published
-        // in one pipelined `put_objects` batch at the op-head CAS rather than
-        // one blocking round trip each (see [`PENDING_UPLOADS`]). Already-buffered
-        // objects are deduplicated by `buffer_pending_object`.
-        if self.defer_uploads_enabled() {
-            if !self.has_pending_object(kind, content_id) {
-                let over_cap = self.buffer_pending_object(kind, content_id, data);
-                if over_cap {
-                    self.flush_pending_uploads()?;
-                }
-            }
-            return Ok(());
+        // The default path: stage the object durably and return without
+        // touching the network. `vex push` is the only publication verb
+        // (roadmap/088 Stage 7), and it uploads what this staged — including
+        // what *earlier processes* staged, which an in-memory buffer could
+        // never deliver.
+        if self.stage_writes_enabled() {
+            return self.stage_object(kind, content_id, &data);
         }
         let cache_bytes = data.clone();
         Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
@@ -4209,12 +4279,6 @@ impl VexClient {
     ) -> Result<Vec<u8>, VexClientError> {
         let _t = RpcTimer::start(|| format!("get_object/{}", kind_to_str(kind)));
         if let Some(bytes) = self.read_cached_object(kind, content_id) {
-            vex_client_stats().record_get_object_cache_hit(kind);
-            return Ok(bytes);
-        }
-        // An object written earlier this process may still be buffered for batch
-        // upload (not yet on disk or the server); serve it from the buffer.
-        if let Some(bytes) = self.read_pending_object(kind, content_id) {
             vex_client_stats().record_get_object_cache_hit(kind);
             return Ok(bytes);
         }
@@ -4675,11 +4739,11 @@ impl VexClient {
         new_view: &ContentId,
     ) -> Result<jj_backend_api::CommitOperationResponse, VexClientError> {
         let _t = RpcTimer::start(|| "commit_op_heads".to_string());
-        // Publish every object buffered this process before advancing the op
-        // head, so the operation the CAS installs never references an object
-        // that is missing on the server. A flush failure aborts here, leaving
-        // the head unchanged (the un-uploaded objects are simply unreferenced).
-        self.flush_pending_uploads()?;
+        // Publish every staged object before advancing the op head, so the
+        // operation the CAS installs never references an object that is missing
+        // on the server. An upload failure aborts here, leaving the head
+        // unchanged (the un-uploaded objects are simply unreferenced).
+        self.upload_staged_objects()?;
         let response = Self::block_on_commit_operation_maintenance_retry(
             &self.config.endpoint,
             |mut client| async move {
@@ -7568,8 +7632,6 @@ mod tests {
         let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let mut client = pack_resident_client(temp_dir.path(), true);
-        // Isolate this test's slice of the process-global pending-upload
-        // buffer (keyed by endpoint + repo id).
         client.config.repo_id = "repo-pack-resident-put-skip".to_string();
         let entries = hybrid_pack_entries();
         unpack_hybrid_pack(&client, &entries);
@@ -7584,19 +7646,84 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            !client.has_pending_object(commit.kind, &commit.content_id),
-            "an index hit must skip the upload entirely, not buffer it"
+            !client.has_staged_object(commit.kind, &commit.content_id),
+            "an index hit must skip the write entirely, not stage it for upload"
         );
-        // A genuinely uncached object takes the normal (buffered) upload path.
+        // A genuinely uncached object takes the normal (staged) path.
         let missing_data = b"never-packed".to_vec();
         let missing_id = ContentId::hash_bytes(&missing_data);
         futures::executor::block_on(client.put_object(
             ObjectKind::Commit,
             &missing_id,
-            missing_data,
+            missing_data.clone(),
         ))
         .unwrap();
-        assert!(client.has_pending_object(ObjectKind::Commit, &missing_id));
+        assert!(client.has_staged_object(ObjectKind::Commit, &missing_id));
+        // ... and staging is durable: the bytes are on disk, so a *later*
+        // process can publish them.
+        assert_eq!(
+            client.read_cached_object(ObjectKind::Commit, &missing_id),
+            Some(missing_data)
+        );
+    }
+
+    /// An orphaned marker — recorded as unpublished, but its bytes are gone —
+    /// must stop the push with a diagnosis, not be skipped. Advancing a ref
+    /// over the hole is the one outcome that silently corrupts the repository.
+    ///
+    /// No backend is needed: the only staged object here has no bytes, so
+    /// there is nothing to upload and the check is reached before any RPC.
+    #[test]
+    fn upload_refuses_when_a_staged_object_lost_its_bytes() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), false);
+        client.config.repo_id = "repo-staged-orphan".to_string();
+        let data = b"bytes that will be deleted".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        futures::executor::block_on(client.put_object(ObjectKind::Commit, &content_id, data))
+            .unwrap();
+        // Simulate a cache cleared behind our back: the marker survives, the
+        // object does not.
+        std::fs::remove_file(client.cache_path(ObjectKind::Commit, &content_id).unwrap()).unwrap();
+
+        let error = client.upload_staged_objects().unwrap_err();
+        assert!(
+            matches!(error, VexClientError::StagedObjectsMissing(_)),
+            "expected a staged-objects-missing refusal, got: {error}"
+        );
+        assert!(
+            error.to_string().contains(&content_id.to_hex()),
+            "the refusal must name the object that cannot be published: {error}"
+        );
+        // The marker is deliberately left in place: dropping it would turn a
+        // loud failure into a silent one on the next push.
+        assert!(client.has_staged_object(ObjectKind::Commit, &content_id));
+    }
+
+    /// Staged objects are the only copy of unpushed work, so a prune must not
+    /// evict them however far over its cap the cache is.
+    #[test]
+    fn prune_never_evicts_staged_objects() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), false);
+        client.config.repo_id = "repo-staged-prune".to_string();
+        client.cache_max_bytes = Some(1);
+        let data = b"unpushed-commit-object".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        futures::executor::block_on(client.put_object(
+            ObjectKind::Commit,
+            &content_id,
+            data.clone(),
+        ))
+        .unwrap();
+        client.prune_cache_if_needed().unwrap();
+        assert!(client.has_staged_object(ObjectKind::Commit, &content_id));
+        assert_eq!(
+            client.read_cached_object(ObjectKind::Commit, &content_id),
+            Some(data)
+        );
     }
 
     /// A prune that evicts loose object files must drop the pack-resident

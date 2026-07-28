@@ -42,6 +42,12 @@ use crate::merged_tree::MergedTree;
 use crate::object_id::ObjectId as _;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store::OperationId;
+use crate::op_store::RefTarget;
+use crate::op_store::RemoteRef;
+use crate::op_store::RemoteRefState;
+use crate::ref_name::RefNameBuf;
+use crate::ref_name::RemoteName;
+use crate::ref_name::RemoteRefSymbol;
 use crate::ref_name::WorkspaceName;
 use crate::ref_name::WorkspaceNameBuf;
 use crate::repo::BackendInitializer;
@@ -651,8 +657,11 @@ impl Workspace {
             let repo = ReadonlyRepo::init(
                 user_settings,
                 &repo_dir,
-                &move |_settings, _store_path| {
-                    Ok(Box::new(VexBackend::init(backend_config.clone())?))
+                &move |_settings, store_path| {
+                    Ok(Box::new(VexBackend::init_at(
+                        backend_config.clone(),
+                        store_path,
+                    )?))
                 },
                 signer,
                 &move |_settings, store_path, root_data| {
@@ -877,6 +886,11 @@ impl Workspace {
             }
             .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
+            // A clone starts a *fresh local* operation log rooted at the
+            // synthetic root operation, whose view is empty. Refs are the only
+            // thing a clone inherits from the server, so the bookmarks have to
+            // be read back out of them before anything can resolve a trunk.
+            let repo = seed_clone_view_from_refs(repo, &store_path).await?;
             let (start_commit, resolved_trunk) =
                 clone_vex_checkout_target(&repo, target_commit, server_trunk).await?;
             // Pre-checkout hydration: a lazy manifest defers every blob and
@@ -1253,6 +1267,110 @@ async fn clone_vex_bookmark_head(
         }
     }
     Ok(selected_commit)
+}
+
+/// Rebuild a fresh clone's view from the server's refs (roadmap/088 Stage 7).
+///
+/// Before Stage 7 a clone inherited the server's operation log, and the view —
+/// which bookmarks exist and where they point — came with it. The log is local
+/// now and a clone's is empty, so **refs are the only inheritance**: without
+/// this, `clone_vex_checkout_target` looks at a view with no bookmarks in it,
+/// fails to resolve the server's trunk, and the clone materializes nothing.
+///
+/// For each server bookmark this writes both the local bookmark and the
+/// `name@vex` remote-tracking bookmark, exactly as `vex pull` and `vex push`
+/// do — so the clone is immediately a valid base for the three-way merge in
+/// [`crate::vex_ref_sync`] rather than looking like a repository that has never
+/// heard of the server.
+///
+/// Zero `get_op_heads` calls, by construction: the only RPCs are `list_refs`
+/// and the commit reads it implies. That is what makes a repository whose
+/// `jj_op_heads` rows have all been deleted still clone (roadmap/088 metric
+/// S2).
+async fn seed_clone_view_from_refs(
+    repo: Arc<ReadonlyRepo>,
+    store_path: &Path,
+) -> Result<Arc<ReadonlyRepo>, WorkspaceInitError> {
+    let client = crate::vex::VexClient::from_store_path(store_path)
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+    let refs = client
+        .list_refs(crate::vex::REF_FRESHNESS_PREFIX)
+        .await
+        .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+    let mut targets: Vec<(RefNameBuf, CommitId)> = Vec::new();
+    for value in refs {
+        let Some(name) = value.name.strip_prefix(crate::vex::REF_FRESHNESS_PREFIX) else {
+            continue;
+        };
+        // An unparsable target is not information. Skipping the bookmark leaves
+        // it absent, which is honest; inventing a target would not be.
+        let Some(id) = CommitId::try_from_hex(&value.target_commit_id) else {
+            tracing::warn!(
+                ref_name = %value.name,
+                target = %value.target_commit_id,
+                "skipping a server bookmark with an unparsable target while seeding the clone view"
+            );
+            continue;
+        };
+        targets.push((RefNameBuf::from(name), id));
+    }
+    if targets.is_empty() {
+        // A repository with no bookmarks yet (a fresh `vex init` that has never
+        // been pushed). Nothing to seed, and nothing is wrong.
+        return Ok(repo);
+    }
+    targets.sort();
+
+    let remote = RemoteName::new(crate::vex_ref_sync::VEX_REMOTE);
+    let mut tx = repo.start_transaction();
+    let mut seeded = 0_usize;
+    for (name, id) in targets {
+        // Hydrate before pointing anything at the commit: an unindexed target
+        // would fail the whole transaction rather than the one bookmark it
+        // belongs to.
+        let commit = match tx.repo().store().get_commit_async(&id).await {
+            Ok(commit) => commit,
+            Err(err) => {
+                tracing::warn!(
+                    bookmark = name.as_str(),
+                    error = %err,
+                    "skipping a server bookmark whose target commit could not be read"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = tx.repo_mut().add_head(&commit).await {
+            tracing::warn!(
+                bookmark = name.as_str(),
+                error = %err,
+                "skipping a server bookmark whose target could not be indexed"
+            );
+            continue;
+        }
+        let target = RefTarget::normal(id);
+        tx.repo_mut()
+            .set_local_bookmark_target(name.as_ref(), target.clone());
+        tx.repo_mut().set_remote_bookmark(
+            RemoteRefSymbol {
+                name: name.as_ref(),
+                remote,
+            },
+            RemoteRef {
+                target,
+                state: RemoteRefState::Tracked,
+            },
+        );
+        seeded += 1;
+    }
+    if !tx.repo().has_changes() {
+        return Ok(repo);
+    }
+    let repo = tx
+        .commit("seed bookmarks from the server's refs")
+        .await
+        .map_err(WorkspaceInitError::TransactionCommit)?;
+    tracing::debug!(bookmarks = seeded, "seeded the clone view from server refs");
+    Ok(repo)
 }
 
 /// A native bookmark resolved as the `vex clone` checkout target: the bookmark

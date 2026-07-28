@@ -239,6 +239,20 @@ impl VexBackend {
         Ok(Self::new(client))
     }
 
+    /// Initialize a backend whose object cache lives at `store_path`, the same
+    /// place [`Self::load`] will look in every later process.
+    ///
+    /// `vex init` must use this rather than [`Self::init`]: since roadmap/088
+    /// Stage 7 a write's only copy lives in that cache until `vex push`
+    /// publishes it, so a cache-less backend would lose the repository's first
+    /// commit and tree entirely. The config is taken as given (nothing is on
+    /// disk to load at init time).
+    pub fn init_at(config: VexRepoConfig, store_path: &Path) -> Result<Self, BackendInitError> {
+        let client = VexClient::from_config_at(config, store_path)
+            .map_err(|err| BackendInitError(err.into()))?;
+        Ok(Self::new(client))
+    }
+
     pub fn load(store_path: &Path) -> Result<Self, BackendLoadError> {
         let client =
             VexClient::from_store_path(store_path).map_err(|err| BackendLoadError(err.into()))?;
