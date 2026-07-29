@@ -309,13 +309,35 @@ fn client_version_metadata() -> Option<MetadataValue<tonic::metadata::Ascii>> {
 /// missing header as *unknown*, which is the honest answer.
 fn validated_client_version_metadata(raw: &str) -> Option<MetadataValue<tonic::metadata::Ascii>> {
     let raw = raw.trim();
-    if raw.is_empty()
-        || raw.len() > MAX_CLIENT_VERSION_METADATA_LEN
-        || !raw.chars().all(|ch| ch.is_ascii_graphic())
-    {
+    if raw.is_empty() || !raw.chars().all(|ch| ch.is_ascii_graphic()) {
         return None;
     }
-    MetadataValue::try_from(raw).ok()
+    let shortened;
+    let value = if raw.len() > MAX_CLIENT_VERSION_METADATA_LEN {
+        // A dev build reports `X.Y.Z-<full 64-char commit>` — 70 characters,
+        // over the server's 64. Dropping it silently made every source-built
+        // client invisible to the compatibility gate, which is exactly
+        // backwards: developers and agents run dev builds, so the population
+        // most likely to be on old code was the one the telemetry could not
+        // see. Observed 2026-07-29, when a 1.1.0 dev build produced no sighting
+        // at all while CI runners on the clean release build did.
+        //
+        // Shorten the commit suffix rather than dropping the header. The
+        // suffix's job is to distinguish a source build from the shipped
+        // release of the same semver and to identify the commit; 12 hex
+        // characters do both, and match the short-sha convention used for
+        // image tags and the CLI release registry. The semver core — the part
+        // the gate actually compares — is never touched.
+        let (core, suffix) = raw.split_once('-')?;
+        shortened = format!("{core}-{}", &suffix[..suffix.len().min(12)]);
+        if shortened.len() > MAX_CLIENT_VERSION_METADATA_LEN {
+            return None;
+        }
+        shortened.as_str()
+    } else {
+        raw
+    };
+    MetadataValue::try_from(value).ok()
 }
 
 /// Mirrors the server's `jj_client_version_sightings.cli_version VARCHAR(64)`.
@@ -5507,6 +5529,39 @@ mod tests {
                 "must send no header for {bad:?}"
             );
         }
+    }
+
+    /// A dev build reports `X.Y.Z-<full 64-char commit>` = 70 characters, over
+    /// the server's 64-character column. That used to drop the header entirely,
+    /// making every source-built client invisible to the D14 gate — the exact
+    /// population most likely to be running old code. The suffix is shortened
+    /// instead, so the build is still reported and still distinguishable from
+    /// the clean release of the same semver.
+    #[test]
+    fn a_dev_build_version_is_shortened_rather_than_dropped() {
+        let sha = "09d948a1d1322130c26c281fa2c2e709bde791532550d088cf0908db3d8d0702";
+        assert_eq!(sha.len(), 64, "a real commit id");
+        let raw = format!("1.1.0-{sha}");
+        assert!(
+            raw.len() > MAX_CLIENT_VERSION_METADATA_LEN,
+            "the case only exists because the dev version overflows: {}",
+            raw.len()
+        );
+
+        let sent = validated_client_version_metadata(&raw)
+            .expect("a dev build must still report a version");
+        let sent = sent.to_str().expect("ascii");
+        assert_eq!(sent, "1.1.0-09d948a1d132");
+        assert!(sent.len() <= MAX_CLIENT_VERSION_METADATA_LEN);
+
+        // The semver core is what the gate compares, so it must survive intact,
+        // and the result must remain distinguishable from the clean release.
+        assert!(sent.starts_with("1.1.0-"));
+        assert_ne!(sent, "1.1.0");
+
+        // A clean release version is still sent verbatim, untouched.
+        let release = validated_client_version_metadata("1.1.0").expect("release version");
+        assert_eq!(release.to_str().expect("ascii"), "1.1.0");
     }
 
     #[test]
