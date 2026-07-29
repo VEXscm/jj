@@ -294,7 +294,6 @@ impl VexOpHeadsStore {
             Err(err) => Err(read_error(err)),
         }
     }
-
 }
 
 #[async_trait]

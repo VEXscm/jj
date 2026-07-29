@@ -151,7 +151,9 @@ fn test_vex_sibling_operation_lockup_is_unreachable() {
     // then branch the repository off that operation's *parent* from the main
     // workspace. The two operations are siblings: neither is an ancestor of the
     // other.
-    secondary_dir.run_jj(["describe", "-m", "secondary work"]).success();
+    secondary_dir
+        .run_jj(["describe", "-m", "secondary work"])
+        .success();
     secondary_dir.write_file("file", "secondary edit\n");
     main_dir
         .run_jj(["describe", "-m", "main work", "--at-op", "@-"])

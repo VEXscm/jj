@@ -118,7 +118,8 @@ fn write_state(state_path: &Path, state: &RecoveryState) {
         return;
     };
     let temporary_path = state_path.with_extension(format!("json.{}", std::process::id()));
-    if fs::write(&temporary_path, contents).is_ok() && fs::rename(&temporary_path, state_path).is_err()
+    if fs::write(&temporary_path, contents).is_ok()
+        && fs::rename(&temporary_path, state_path).is_err()
     {
         drop(fs::remove_file(temporary_path));
     }
