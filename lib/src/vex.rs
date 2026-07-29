@@ -36,6 +36,7 @@ use std::time::SystemTime;
 use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
 use jj_backend_api::CloneViewKind as ProtoCloneViewKind;
 use jj_backend_api::GetCloneManifestRequest;
+use jj_backend_api::GetHydrationPacksRequest;
 use jj_backend_api::GetObjectRequest;
 use jj_backend_api::GetObjectsInlineRequest;
 use jj_backend_api::GetObjectsRequest;
@@ -50,9 +51,9 @@ use jj_backend_api::ResolveRefsRequest;
 use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
-    CloneManifest, ContentId, ObjectKind, ObjectPackEntry, decode_object_pack,
-    decode_object_pack_reader, decode_object_pack_with_visitor, decode_pack_chunk_entries,
-    parse_pack_header,
+    CloneManifest, ContentId, HydrationPackManifest, ObjectKind, ObjectPackEntry,
+    decode_object_pack, decode_object_pack_reader, decode_object_pack_with_visitor,
+    decode_pack_chunk_entries, parse_pack_header,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -112,6 +113,7 @@ where
             }
         }
     }
+
 }
 
 /// Sleep usable from a non-tokio (pollster-style) executor: the timer runs as
@@ -1138,8 +1140,27 @@ const INLINE_FETCH_BATCH_OBJECTS: usize = 256;
 /// object bodies and must stay under [`MAX_GRPC_MESSAGE_BYTES`]; sizes are only
 /// hints (tree entries don't record them), so leave generous headroom.
 const INLINE_FETCH_BATCH_BYTES: u64 = 24 * 1024 * 1024;
-/// Concurrent in-flight `GetObjectsInline` batches.
-const INLINE_FETCH_CONCURRENCY: usize = 8;
+/// Default concurrent in-flight `GetObjectsInline` batches. Overridable via
+/// `VEX_CLONE_HYDRATION_CONCURRENCY` for clone benchmarking and tuning.
+/// A 2026-07-29 production sweep on `vex/home` measured median hydration at
+/// 14.37s (8), 11.77s (12), and 12.70s (16), so 12 keeps the object store busy
+/// without the contention seen at the wider setting.
+const INLINE_FETCH_CONCURRENCY: usize = 12;
+
+fn parse_inline_fetch_concurrency(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(INLINE_FETCH_CONCURRENCY)
+}
+
+fn inline_fetch_concurrency() -> usize {
+    parse_inline_fetch_concurrency(
+        std::env::var("VEX_CLONE_HYDRATION_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Default number of clone packs fetched+unpacked in parallel during
 /// [`VexClient::prefetch_clone_manifest`]. Overridable via
@@ -2580,6 +2601,31 @@ impl VexClient {
                     Err(status) => return Err(status.into()),
                 }
             }
+        }));
+        match handle.await {
+            Ok(result) => result,
+            Err(join_err) => Err(VexClientError::Io(std::io::Error::other(format!(
+                "grpc worker task failed: {join_err}"
+            )))),
+        }
+    }
+
+    /// Run one optional-capability gRPC call on the shared runtime without the
+    /// general retry ladder. Feature probes such as `GetHydrationPacks` must
+    /// fall back immediately when an older edge reports the unknown method as
+    /// `Unknown` instead of the more specific `Unimplemented` status.
+    async fn grpc_once_async<T, F, Fut>(endpoint: &str, f: F) -> Result<T, VexClientError>
+    where
+        F: FnOnce(JjBackendClient<Channel>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, tonic::Status>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let channel = Self::cached_channel(endpoint)?;
+        let handle = Self::shared_grpc_runtime().spawn(with_output_cancel(async move {
+            let client = JjBackendClient::new(channel)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+            f(client).await.map_err(Into::into)
         }));
         match handle.await {
             Ok(result) => result,
@@ -4353,7 +4399,7 @@ impl VexClient {
     /// size (unknown from jj tree entries, known from manifest descriptors) only
     /// tightens batch splitting. Already-cached and duplicate ids are skipped.
     /// Batches are bounded by [`INLINE_FETCH_BATCH_OBJECTS`] /
-    /// [`INLINE_FETCH_BATCH_BYTES`] and run [`INLINE_FETCH_CONCURRENCY`]-wide
+    /// [`INLINE_FETCH_BATCH_BYTES`] and run [`inline_fetch_concurrency`]-wide
     /// via the `grpc_retry_async` spawned-task pattern, so the single-threaded
     /// clone executor keeps several requests in flight. Response objects are
     /// verified (kind + SHA-256) before entering the cache; ids the response
@@ -4394,7 +4440,7 @@ impl VexClient {
                 .into_iter()
                 .map(|batch| self.hydrate_one_batch(batch)),
         )
-        .buffer_unordered(INLINE_FETCH_CONCURRENCY);
+        .buffer_unordered(inline_fetch_concurrency());
         let mut done = 0_u64;
         let mut first_err: Option<VexClientError> = None;
         while let Some(result) = results.next().await {
@@ -5054,6 +5100,93 @@ impl VexClient {
         Ok(response.get_instructions)
     }
 
+    /// Ask the backend to pack the exact blob-like objects needed by the
+    /// selected clone checkout. This is intentionally separate from the
+    /// reusable clone manifest: the checkout target is resolved from live refs
+    /// after that immutable metadata seed has been consumed.
+    pub async fn get_hydration_packs(
+        &self,
+        objects: &[(ObjectKind, ContentId)],
+    ) -> Result<HydrationPackManifest, VexClientError> {
+        let object_ids: Vec<ObjectId> = objects
+            .iter()
+            .map(|(kind, content_id)| ObjectId {
+                kind: kind_to_str(*kind).to_string(),
+                content_id: content_id.to_string(),
+            })
+            .collect();
+        let repo_id = self.config.repo_id.clone();
+        let access_token = self.config.access_token.clone();
+        let response = Self::grpc_once_async(&self.config.endpoint, move |mut client| async move {
+            client
+                .get_hydration_packs(Self::auth_request(
+                    GetHydrationPacksRequest {
+                        repo_id,
+                        objects: object_ids,
+                    },
+                    access_token.as_deref(),
+                )?)
+                .await
+                .map(|response| response.into_inner())
+        })
+        .await?;
+        serde_json::from_slice(&response.manifest_json)
+            .map_err(VexConfigError::Json)
+            .map_err(Into::into)
+    }
+
+    /// Fetch and unpack a hydration-pack response into the clone's local
+    /// cache. Blob and symlink entries remain loose, as required by checkout.
+    pub async fn prefetch_hydration_packs(
+        &self,
+        manifest: &HydrationPackManifest,
+        progress: Option<&CloneProgressFn>,
+    ) -> Result<(), VexClientError> {
+        let prefetched_objects = AtomicU64::new(0);
+        let hinted_pack_ids = manifest
+            .packs
+            .iter()
+            .flat_map(|pack| {
+                std::iter::once(pack.content_id)
+                    .chain(pack.chunks.iter().map(|chunk| chunk.content_id))
+            })
+            .collect::<HashSet<_>>();
+        let pack_hints = self
+            .get_object_fetch_hints(
+                &hinted_pack_ids
+                    .into_iter()
+                    .map(|content_id| (ObjectKind::Pack, content_id))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let total_packs = manifest.packs.len() as u64;
+        let packs_done = AtomicU64::new(0);
+        let packs = manifest.packs.iter().collect::<Vec<_>>();
+        let result = self
+            .prefetch_packs_parallel(
+                &packs,
+                &pack_hints,
+                &prefetched_objects,
+                &packs_done,
+                total_packs,
+                progress,
+            )
+            .into_iter()
+            .flatten()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|_| ());
+        result.and(self.prune_cache_if_needed())?;
+        debug!(
+            repo_id = %self.config.repo_id,
+            pack_count = manifest.packs.len(),
+            object_count = manifest.object_count,
+            total_bytes = manifest.total_bytes,
+            prefetched_objects = prefetched_objects.load(Ordering::Relaxed),
+            "prefetched clone hydration packs"
+        );
+        Ok(())
+    }
+
     pub async fn prefetch_clone_manifest(
         &self,
         manifest: &CloneManifest,
@@ -5495,7 +5628,11 @@ mod tests {
 
     #[test]
     fn a_client_version_is_sent_verbatim_including_a_dev_build_suffix() {
-        for version in ["1.0.0", "0.12.0-3ce9e572", &format!("1.2.3-{}", "a".repeat(40))] {
+        for version in [
+            "1.0.0",
+            "0.12.0-3ce9e572",
+            &format!("1.2.3-{}", "a".repeat(40)),
+        ] {
             assert_eq!(
                 validated_client_version_metadata(version)
                     .as_ref()
@@ -5607,10 +5744,12 @@ mod tests {
         let request = VexClient::auth_request((), None).expect("build request");
 
         assert!(request.metadata().get("authorization").is_none());
-        assert!(request
-            .metadata()
-            .get(CLIENT_VERSION_METADATA_KEY)
-            .is_some());
+        assert!(
+            request
+                .metadata()
+                .get(CLIENT_VERSION_METADATA_KEY)
+                .is_some()
+        );
     }
 
     fn sample_client() -> VexClient {
@@ -5959,6 +6098,28 @@ mod tests {
             batches.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![4, 4, 2]
         );
+    }
+
+    #[test]
+    fn inline_fetch_concurrency_parser_uses_default_for_missing_or_invalid_values() {
+        assert_eq!(
+            parse_inline_fetch_concurrency(None),
+            INLINE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            parse_inline_fetch_concurrency(Some("not-a-number")),
+            INLINE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            parse_inline_fetch_concurrency(Some("0")),
+            INLINE_FETCH_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn inline_fetch_concurrency_parser_accepts_positive_values() {
+        assert_eq!(parse_inline_fetch_concurrency(Some("1")), 1);
+        assert_eq!(parse_inline_fetch_concurrency(Some("16")), 16);
     }
 
     #[test]

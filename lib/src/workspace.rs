@@ -1595,8 +1595,9 @@ async fn clone_vex_legacy_start_commit(
 }
 
 /// Bulk-fetch the file/symlink contents of `start_commit` into the local
-/// vex-cache before checkout, replacing thousands of per-file `GetObject` RPCs
-/// during materialization with a few batched `GetObjectsInline` reads.
+/// vex-cache before checkout. Prefer dedicated hydration packs for sequential
+/// transfer and unpack, falling back to batched `GetObjectsInline` reads when
+/// the server does not implement the pack RPC or any pack step fails.
 /// Best-effort: on any failure it logs and returns, and checkout falls back to
 /// hydrating the remaining files on demand exactly as before.
 /// Returns the number of file/symlink tree entries in the start commit when
@@ -1633,6 +1634,63 @@ async fn hydrate_start_commit_blobs(
         return Some(file_count);
     }
     let total = ids.len();
+    let hydration_objects = ids
+        .iter()
+        .map(|(kind, content_id, _)| (*kind, *content_id))
+        .collect::<Vec<_>>();
+    if let Some(progress) = progress {
+        progress(crate::vex::CloneProgress::Hydrating {
+            done: 0,
+            total: total as u64,
+        });
+    }
+    let packs_started = std::time::Instant::now();
+    match client.get_hydration_packs(&hydration_objects).await {
+        Ok(manifest) if hydration_pack_manifest_covers(&manifest, &hydration_objects) => {
+            match client.prefetch_hydration_packs(&manifest, progress).await {
+                Ok(()) => {
+                    if let Some(progress) = progress {
+                        progress(crate::vex::CloneProgress::Hydrating {
+                            done: total as u64,
+                            total: total as u64,
+                        });
+                    }
+                    tracing::debug!(
+                        total,
+                        packs = manifest.packs.len(),
+                        pack_bytes = manifest.total_bytes,
+                        elapsed_ms = packs_started.elapsed().as_millis(),
+                        "clone hydration packs complete"
+                    );
+                    return Some(file_count);
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "clone hydration pack prefetch failed; falling back to inline hydration"
+                    );
+                }
+            }
+        }
+        Ok(manifest) => {
+            tracing::debug!(
+                expected_objects = total,
+                manifest_objects = manifest.object_count,
+                described_objects = manifest
+                    .packs
+                    .iter()
+                    .map(|pack| pack.objects.len())
+                    .sum::<usize>(),
+                "clone hydration pack manifest did not cover the request; falling back to inline hydration"
+            );
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "clone hydration packs unavailable; falling back to inline hydration"
+            );
+        }
+    }
     match client.get_objects_inline_batched(ids, progress).await {
         Ok(hydrated) => {
             tracing::debug!(
@@ -1650,6 +1708,22 @@ async fn hydrate_start_commit_blobs(
         }
     }
     Some(file_count)
+}
+
+fn hydration_pack_manifest_covers(
+    manifest: &jj_backend_types::HydrationPackManifest,
+    requested: &[(jj_backend_types::ObjectKind, jj_backend_types::ContentId)],
+) -> bool {
+    if manifest.object_count != requested.len() as u64 {
+        return false;
+    }
+    let described = manifest
+        .packs
+        .iter()
+        .flat_map(|pack| pack.objects.iter())
+        .map(|object| (object.kind, object.content_id))
+        .collect::<HashSet<_>>();
+    described.len() == requested.len() && requested.iter().all(|object| described.contains(object))
 }
 
 /// Result of the hydration tree walk: the object ids to hydrate and the
@@ -1929,6 +2003,10 @@ pub fn default_working_copy_factory() -> Box<dyn WorkingCopyFactory> {
 
 #[cfg(test)]
 mod tests {
+    use jj_backend_types::ClonePackScope;
+    use jj_backend_types::HydrationPackManifest;
+    use jj_backend_types::ObjectDescriptor;
+    use jj_backend_types::PackDescriptor;
     use pollster::FutureExt as _;
     use tempfile::TempDir;
 
@@ -1977,6 +2055,68 @@ mod tests {
             RepoInitError::Path(err) => WorkspaceInitError::Path(err),
         })?;
         Ok((temp_dir, repo))
+    }
+
+    fn hydration_object(byte: u8) -> (jj_backend_types::ObjectKind, jj_backend_types::ContentId) {
+        (
+            jj_backend_types::ObjectKind::Blob,
+            jj_backend_types::ContentId::from_bytes([byte; 32]),
+        )
+    }
+
+    #[test]
+    fn hydration_pack_manifest_must_describe_every_requested_object() {
+        let first = hydration_object(1);
+        let second = hydration_object(2);
+        let manifest = HydrationPackManifest {
+            packs: vec![PackDescriptor {
+                content_id: jj_backend_types::ContentId::from_bytes([3; 32]),
+                size_bytes: 42,
+                scope: ClonePackScope::Full,
+                chunk_frames: false,
+                chunks: Vec::new(),
+                objects: vec![
+                    ObjectDescriptor {
+                        kind: first.0,
+                        content_id: first.1,
+                        size_bytes: Some(10),
+                    },
+                    ObjectDescriptor {
+                        kind: second.0,
+                        content_id: second.1,
+                        size_bytes: Some(20),
+                    },
+                ],
+            }],
+            object_count: 2,
+            total_bytes: 42,
+        };
+
+        assert!(hydration_pack_manifest_covers(&manifest, &[first, second]));
+    }
+
+    #[test]
+    fn hydration_pack_manifest_rejects_missing_descriptor_even_when_count_matches() {
+        let first = hydration_object(1);
+        let second = hydration_object(2);
+        let manifest = HydrationPackManifest {
+            packs: vec![PackDescriptor {
+                content_id: jj_backend_types::ContentId::from_bytes([3; 32]),
+                size_bytes: 42,
+                scope: ClonePackScope::Full,
+                chunk_frames: false,
+                chunks: Vec::new(),
+                objects: vec![ObjectDescriptor {
+                    kind: first.0,
+                    content_id: first.1,
+                    size_bytes: Some(10),
+                }],
+            }],
+            object_count: 2,
+            total_bytes: 42,
+        };
+
+        assert!(!hydration_pack_manifest_covers(&manifest, &[first, second]));
     }
 
     #[test]
