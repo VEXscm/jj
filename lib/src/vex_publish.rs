@@ -42,7 +42,6 @@ use std::fmt;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -89,82 +88,6 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default()
-}
-
-/// When the op-head CAS runs relative to the command that produced the
-/// operation.
-///
-/// **Transitional.** Since Stage 7 of roadmap/088 the operation log is local
-/// and nothing is ever published from a command's critical path, so there is
-/// only one behaviour: [`Self::resolve`] returns [`Self::Sync`] unconditionally
-/// and `VEX_DURABILITY` is ignored. The enum survives only so an already-cloned
-/// repository whose `vex.json` carries `"durability": "local-first"` still
-/// deserializes. Removed in Stage 9 (C9).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum VexDurability {
-    /// Objects flush and the operation is durable before the command returns.
-    Sync,
-    /// Historical: operations were recorded locally and drained before the
-    /// process exited. Read-compat only.
-    FlushOnExit,
-    /// Historical: operations were recorded locally and drained out of band.
-    /// Still the serialized default, so `vex.json` files written by either
-    /// generation of the CLI round-trip unchanged. Read-compat only.
-    #[default]
-    LocalFirst,
-}
-
-impl VexDurability {
-    pub fn is_sync(&self) -> bool {
-        matches!(self, Self::Sync)
-    }
-
-    /// Whether this is the serialized default. `vex.json` omits the field at
-    /// the default so a clone written by a newer CLI stays readable by an
-    /// older one; any non-default mode is written explicitly.
-    pub fn is_serialized_default(&self) -> bool {
-        matches!(self, Self::LocalFirst)
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Sync => "sync",
-            Self::FlushOnExit => "flush-on-exit",
-            Self::LocalFirst => "local-first",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "sync" => Some(Self::Sync),
-            "flush-on-exit" => Some(Self::FlushOnExit),
-            "local-first" => Some(Self::LocalFirst),
-            _ => None,
-        }
-    }
-
-    /// The effective mode, which is always [`Self::Sync`].
-    ///
-    /// The configured value is deliberately ignored rather than honoured: with
-    /// a local op log there is no queue for a deferred mode to defer into, so
-    /// honouring `local-first` would be a lie about durability. `VEX_DURABILITY`
-    /// is ignored for the same reason — a repo whose config still names a
-    /// deferred mode warns once instead of silently behaving differently from
-    /// what it says.
-    pub fn resolve(configured: Self) -> Self {
-        if !configured.is_sync() {
-            static WARNED: OnceLock<()> = OnceLock::new();
-            WARNED.get_or_init(|| {
-                tracing::debug!(
-                    configured = configured.as_str(),
-                    "deferred durability modes are retired; the operation log is local and \
-                     every operation is durable before the command returns"
-                );
-            });
-        }
-        Self::Sync
-    }
 }
 
 /// A marker file could not be understood. Callers treat this as "this repo has
@@ -512,30 +435,6 @@ mod tests {
 
     fn id(byte: u8) -> ContentId {
         ContentId::from_bytes([byte; ID_LENGTH])
-    }
-
-    #[test]
-    fn durability_always_resolves_to_sync() {
-        assert_eq!(
-            VexDurability::resolve(VexDurability::LocalFirst),
-            VexDurability::Sync
-        );
-        assert_eq!(
-            VexDurability::resolve(VexDurability::FlushOnExit),
-            VexDurability::Sync
-        );
-        assert_eq!(
-            VexDurability::resolve(VexDurability::Sync),
-            VexDurability::Sync
-        );
-        // Still parses and serializes, so a `vex.json` written by either
-        // generation of the CLI round-trips.
-        assert_eq!(
-            VexDurability::parse("local-first"),
-            Some(VexDurability::LocalFirst)
-        );
-        assert_eq!(VexDurability::parse("nonsense"), None);
-        assert!(VexDurability::LocalFirst.is_serialized_default());
     }
 
     #[test]

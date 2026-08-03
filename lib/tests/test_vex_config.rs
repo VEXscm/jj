@@ -21,7 +21,6 @@ fn sample_config() -> VexRepoConfig {
         virtual_mounts: Vec::new(),
         access_token: None,
         local_writes: false,
-        durability: jj_lib::vex_publish::VexDurability::Sync,
         object_read_mode: VexObjectReadMode::NativeOnly,
     }
 }
@@ -151,6 +150,73 @@ fn test_vex_repo_config_explicit_object_read_mode_field_deserializes() {
     )
     .unwrap();
     assert!(VexRepoConfig::load_from_repo_path(&repo_dir).is_err());
+}
+
+/// The `durability` key is **retired but tolerated**.
+///
+/// Roadmap/088 Stage 9 (C9) removed the `VexDurability` lattice: since Stage 7
+/// the operation log is local, so there is no queue for a deferred mode to
+/// defer into and the field controlled nothing. But `vex.json` files in the
+/// wild still carry `"durability": "sync" | "flush-on-exit" | "local-first"`,
+/// and `local-first` was the *serialized* default, so many files omit the key
+/// entirely. All four shapes must keep deserializing.
+///
+/// This works only because serde ignores unknown fields by default. Do **not**
+/// add `#[serde(deny_unknown_fields)]` to `VexRepoConfig`: it would make every
+/// pre-Stage-9 clone fail to load, and the failure surfaces to users as
+/// "repository config is corrupt", not as an obvious regression. This test is
+/// the pin that catches that.
+#[test]
+fn test_vex_repo_config_tolerates_retired_durability_key() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    let payload = |durability: Option<&str>| {
+        let line = durability
+            .map(|value| format!("\n  \"durability\": \"{value}\","))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+  "endpoint": "http://127.0.0.1:50051",
+  "tenant_id": "tenant-id",
+  "tenant_slug": "acme",
+  "repo_id": "repo-id",{line}
+  "repo_slug": "widget"
+}}"#
+        )
+    };
+
+    for durability in [
+        Some("sync"),
+        Some("flush-on-exit"),
+        Some("local-first"),
+        None,
+    ] {
+        let json = payload(durability);
+        std::fs::write(repo_dir.join("vex.json"), &json).unwrap();
+        let config = VexRepoConfig::load_from_repo_path(&repo_dir).unwrap_or_else(|err| {
+            panic!("durability={durability:?} must still deserialize, got {err}: {json}")
+        });
+        assert_eq!(config.repo_slug, "widget");
+        assert_eq!(config.tenant_id, "tenant-id");
+    }
+
+    // Rewriting a config loaded from a legacy file is safe: the file is
+    // replaced wholesale with the current shape, which simply no longer
+    // carries the retired key. Nothing is left half-written or ambiguous.
+    std::fs::write(repo_dir.join("vex.json"), payload(Some("local-first"))).unwrap();
+    let config = VexRepoConfig::load_from_repo_path(&repo_dir).unwrap();
+    config.write_to_repo_path(&repo_dir).unwrap();
+    let rewritten = std::fs::read_to_string(repo_dir.join("vex.json")).unwrap();
+    assert!(
+        !rewritten.contains("durability"),
+        "the retired key must not be written back: {rewritten}"
+    );
+    assert_eq!(
+        VexRepoConfig::load_from_repo_path(&repo_dir).unwrap(),
+        config
+    );
 }
 
 #[test]

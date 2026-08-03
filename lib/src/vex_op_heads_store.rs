@@ -349,7 +349,6 @@ mod tests {
     use super::*;
     use crate::vex::VexObjectReadMode;
     use crate::vex_publish::ServerHeadsMarker;
-    use crate::vex_publish::VexDurability;
 
     /// The configured endpoint is unroutable, so any backend round trip either
     /// fails outright or costs a connection refusal — a test that succeeds
@@ -368,7 +367,6 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes,
-            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         }
     }

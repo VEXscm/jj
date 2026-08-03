@@ -68,7 +68,6 @@ use crate::repo::StoreFactories;
 use crate::vex_backend::VexBackend;
 use crate::vex_op_heads_store::VexOpHeadsStore;
 use crate::vex_op_store::VexOpStore;
-use crate::vex_publish::VexDurability;
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
 
@@ -360,9 +359,9 @@ fn rpc_timing_enabled() -> bool {
 /// Guard held for the duration of one server RPC.
 ///
 /// Every RPC constructs one, so this is the single place that knows a command
-/// blocked on the server. It does three things: counts the call (always, so
-/// durability modes can be checked by a number rather than by inspection),
-/// and prints a line when `rpc_timing_enabled()`.
+/// blocked on the server. It does two things: counts the call (always, so how
+/// much a command leans on the server can be checked by a number rather than by
+/// inspection), and prints a line when `rpc_timing_enabled()`.
 ///
 /// It deliberately does NOT hold a tracing span: an `EnteredSpan` kept across an
 /// await makes the enclosing future `!Send`. Span coverage of the round trip
@@ -412,10 +411,8 @@ pub struct VexClientStats {
     /// Server RPCs issued on the calling command's critical path — every call
     /// the command blocked on, whatever its kind.
     ///
-    /// This is the number that answers "did a deferred durability mode actually
-    /// defer anything". A `VEX_DURABILITY=local-first` commit that still
-    /// reports a non-zero count here has not taken the server off the critical
-    /// path, however its op-head publication is scheduled.
+    /// This is the number that answers "did this command take the server off
+    /// its critical path": a non-zero count means it did not.
     pub blocking_rpcs: AtomicU64,
     /// `GetObject` RPCs issued for blob objects.
     pub get_object_rpcs_blob: AtomicU64,
@@ -963,15 +960,6 @@ pub struct VexRepoConfig {
     /// continue to persist to the backend.
     #[serde(default)]
     pub local_writes: bool,
-    /// Historical durability mode (see [`VexDurability`]). **Transitional,
-    /// read-compat only:** since roadmap/088 Stage 7 the operation log is
-    /// local, every operation is durable before the command returns, and
-    /// [`VexClient::durability`] always reports [`VexDurability::Sync`]
-    /// whatever this says. The field survives so a repository cloned before
-    /// Stage 7, whose `vex.json` carries `"durability": "local-first"`, still
-    /// deserializes. Removed in Stage 9 (C9).
-    #[serde(default, skip_serializing_if = "VexDurability::is_serialized_default")]
-    pub durability: VexDurability,
     /// Object decode policy for backend reads (see [`VexObjectReadMode`]).
     /// Never serialized: a normal clone's `vex.json` carries no mode field and
     /// old files without one deserialize to [`VexObjectReadMode::NativeOnly`],
@@ -1625,15 +1613,6 @@ impl VexClient {
     /// [`crate::vex_op_heads_store::VexOpHeadsStore`].
     pub fn local_writes(&self) -> bool {
         self.local_writes
-    }
-
-    /// The effective durability mode, which since roadmap/088 Stage 7 is
-    /// always [`VexDurability::Sync`]: the operation log is local, so an
-    /// operation is durable the moment its files are on disk and there is
-    /// nothing left for a deferred mode to defer. Transitional — removed in
-    /// Stage 9 (C9).
-    pub fn durability(&self) -> VexDurability {
-        VexDurability::resolve(self.config.durability)
     }
 
     /// Read this repository's opaque ref-freshness token (D8) under a hard
@@ -3757,7 +3736,6 @@ impl VexClient {
             virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
-            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
     }
@@ -3794,7 +3772,6 @@ impl VexClient {
             virtual_mounts: Vec::new(),
             access_token: access_token.map(ToOwned::to_owned),
             local_writes: false,
-            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
     }
@@ -5766,7 +5743,6 @@ mod tests {
             virtual_mounts: Vec::new(),
             access_token: None,
             local_writes: false,
-            durability: VexDurability::Sync,
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
         .unwrap()

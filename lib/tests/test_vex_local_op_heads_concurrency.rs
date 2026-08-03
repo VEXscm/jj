@@ -78,7 +78,6 @@ use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::vex::VexObjectReadMode;
 use jj_lib::vex::VexRepoConfig;
 use jj_lib::vex_op_heads_store::VexOpHeadsStore;
-use jj_lib::vex_publish::VexDurability;
 use pollster::FutureExt as _;
 
 /// Readers in assertion (c) and hammering writers in assertion (d).
@@ -127,7 +126,6 @@ fn test_config() -> VexRepoConfig {
         virtual_mounts: Vec::new(),
         access_token: None,
         local_writes: false,
-        durability: VexDurability::Sync,
         object_read_mode: VexObjectReadMode::NativeOnly,
     }
 }
