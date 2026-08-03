@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What this client would ask of the server's op-head CAS.
+//! What this client would ask of the server's op-head publication.
 //!
 //! Op heads are stored locally now (roadmap/088 Stage 7): `update_op_heads` is
 //! a directory write under a real file lock, so two writers branching from the
@@ -22,31 +22,24 @@
 //! that sat on top of them — they were deleted with the rest of the client CAS
 //! apparatus (Stage 7, D10/S11).
 //!
-//! What survives is the request-shaping policy for `commit_op_heads`. No client
-//! path calls it any more: the compatibility escape that used to reach the
-//! server CAS was deleted (Stage 9), so this policy now only shapes a request
-//! the client never sends. Stage 10 removes the server half and this module
-//! with it.
+//! Stage 10 then retired the server's set-equality path, so there is nothing
+//! left to opt into or out of either: every `CommitOperation` gets jj's
+//! remove-and-add delta whatever the request says. `VEX_OP_HEADS_DELTA_CAS` is
+//! gone from both halves rather than left as a knob that reads as live
+//! configuration and turns nothing.
+//!
+//! What survives is the request-shaping policy for `commit_op_heads`, which no
+//! client path calls: the compatibility escape that used to reach the server
+//! publication was deleted (Stage 9). This module goes with the RPC itself.
 
-use std::sync::OnceLock;
-
-/// Whether this client asks the backend for the delta semantics. On by default;
-/// `VEX_OP_HEADS_DELTA_CAS=0` (or `false`/`off`/`no`) opts back out onto the
-/// server's set-equality path without a new release. The server has its own
-/// kill switch that overrides this one.
+/// Whether this client asks the backend for the delta semantics.
+///
+/// Constant since roadmap 088 Stage 10. The server ignores the field — it has
+/// only the delta contract left — and it is still set truthfully rather than
+/// dropped so an older server, if one were ever rolled back to, still takes the
+/// path this client expects.
 pub(crate) fn divergence_ok() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| divergence_ok_from(std::env::var("VEX_OP_HEADS_DELTA_CAS").ok()))
-}
-
-/// [`divergence_ok`] over an explicit value, so the policy is testable without
-/// mutating the process environment (the cached read above happens once per
-/// process and cannot be re-observed).
-fn divergence_ok_from(value: Option<impl AsRef<str>>) -> bool {
-    !matches!(
-        value.as_ref().map(AsRef::as_ref),
-        Some("0") | Some("false") | Some("off") | Some("no")
-    )
+    true
 }
 
 /// The head-set bound this client advertises. Zero means "use whatever bound
@@ -61,19 +54,11 @@ pub(crate) fn max_op_heads() -> u32 {
 mod tests {
     use super::*;
 
+    /// The field is no longer a choice: there is no server path left for a
+    /// `false` to select, so nothing may reintroduce one.
     #[test]
-    fn divergence_is_requested_by_default() {
-        assert!(divergence_ok_from(None::<&str>));
-        assert!(divergence_ok_from(Some("1")));
-        assert!(divergence_ok_from(Some("")));
-    }
-
-    #[test]
-    fn the_kill_switch_values_opt_out() {
-        assert!(!divergence_ok_from(Some("0")));
-        assert!(!divergence_ok_from(Some("false")));
-        assert!(!divergence_ok_from(Some("off")));
-        assert!(!divergence_ok_from(Some("no")));
+    fn divergence_is_always_requested() {
+        assert!(divergence_ok());
     }
 
     #[test]
