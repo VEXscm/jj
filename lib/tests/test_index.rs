@@ -1078,6 +1078,42 @@ fn test_changed_path_segments() -> TestResult {
     Ok(())
 }
 
+/// Vex selects the Repo a submission belongs to from a commit's changed paths,
+/// and two Repo roots are two directories in one physical repository. A file
+/// moved between them therefore has to report both sides: the removal in the
+/// old Repo and the addition in the new one. The index is a tree comparison,
+/// so it does — a selection built on it cannot silently ignore the Repo the
+/// file left.
+#[test]
+fn test_changed_paths_report_both_sides_of_a_move_between_directories() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = enable_changed_path_index(&test_repo.repo);
+    let root_commit_id = repo.store().root_commit_id().clone();
+
+    let before = create_tree(&repo, &[(repo_path("gooey-rails/app.rb"), "contents")]);
+    let after = create_tree(&repo, &[(repo_path("zinc-rails/app.rb"), "contents")]);
+
+    let mut tx = repo.start_transaction();
+    let original = tx
+        .repo_mut()
+        .new_commit(vec![root_commit_id], before)
+        .write_unwrap();
+    let moved = tx
+        .repo_mut()
+        .new_commit(vec![original.id().clone()], after)
+        .write_unwrap();
+    let repo = tx.commit("test").block_on()?;
+
+    assert_eq!(
+        collect_changed_paths(&repo, moved.id()),
+        Some(vec![
+            repo_path_buf("gooey-rails/app.rb"),
+            repo_path_buf("zinc-rails/app.rb")
+        ])
+    );
+    Ok(())
+}
+
 #[test]
 fn test_build_changed_path_segments() -> TestResult {
     let test_repo = TestRepo::init();
