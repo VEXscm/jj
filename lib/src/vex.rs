@@ -7573,6 +7573,47 @@ mod tests {
         assert!(client.has_staged_object(ObjectKind::Commit, &content_id));
     }
 
+    /// Whoever publishes a repository's staged objects has to bind to the same
+    /// store path the backend that staged them did — the markers live in the
+    /// object cache derived from it, and a client built with
+    /// [`VexClient::from_config`] has no cache at all, so it would report
+    /// "nothing staged" and let a ref advance over objects the backend never
+    /// received.
+    ///
+    /// `vex materialize` (`convert_native::publish_staged_objects`) depends on
+    /// exactly this: it publishes through [`VexClient::from_config_at`] at the
+    /// throwaway backing repo's store path, while the objects were staged by
+    /// the `VexBackend` that [`VexClient::from_store_path`] opened there
+    /// (VEX-308).
+    #[test]
+    fn a_client_opened_at_a_store_path_shares_its_staging_area() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().join("repo");
+        let store_path = repo_path.join("store");
+        fs::create_dir_all(&store_path).unwrap();
+        let mut config = sample_client().config;
+        config.repo_id = "repo-staged-shared".to_string();
+        config.write_to_repo_path(&repo_path).unwrap();
+
+        // What the repo's backend does: open from the store path on disk and
+        // write an object, which stages it.
+        let staging = VexClient::from_store_path(&store_path).unwrap();
+        let data = b"a merge commit only this run has".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        futures::executor::block_on(staging.put_object(ObjectKind::Commit, &content_id, data))
+            .unwrap();
+
+        // What the publisher does: build from an in-memory config (carrying a
+        // freshly rotated token) bound to the same store path.
+        let publisher = VexClient::from_config_at(config, &store_path).unwrap();
+
+        assert!(
+            publisher.has_staged_object(ObjectKind::Commit, &content_id),
+            "the publisher must see what the repository's own backend staged"
+        );
+    }
+
     /// Staged objects are the only copy of unpushed work, so a prune must not
     /// evict them however far over its cap the cache is.
     #[test]
