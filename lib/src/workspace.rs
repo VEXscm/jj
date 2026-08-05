@@ -27,10 +27,14 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use sha2::Digest as _;
+use sha2::Sha256;
 use thiserror::Error;
 
 use crate::backend::BackendInitError;
+use crate::backend::ChangeId;
 use crate::backend::CommitId;
+use crate::backend::TreeValue;
 use crate::commit::Commit;
 use crate::file_util;
 use crate::file_util::BadPathEncoding;
@@ -38,6 +42,7 @@ use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
 use crate::local_working_copy::LocalWorkingCopy;
 use crate::local_working_copy::LocalWorkingCopyFactory;
+use crate::merge::Merge;
 use crate::merged_tree::MergedTree;
 use crate::object_id::ObjectId as _;
 use crate::op_heads_store::OpHeadsStoreError;
@@ -63,13 +68,17 @@ use crate::repo::StoreFactories;
 use crate::repo::StoreLoadError;
 use crate::repo::SubmoduleStoreInitializer;
 use crate::repo::read_store_type;
+use crate::repo_path::RepoPathBuf;
 use crate::rewrite::merge_commit_trees;
 use crate::settings::UserSettings;
 use crate::signing::SignInitError;
 use crate::signing::Signer;
 use crate::simple_backend::SimpleBackend;
 use crate::transaction::TransactionCommitError;
+use crate::tree_builder::TreeBuilder;
 use crate::vex::CloneBlobMode;
+use crate::vex::VexContentId;
+use crate::vex::VexFederatedHomeConfig;
 use crate::vex::VexRepoConfig;
 use crate::vex::create_store_factories;
 use crate::vex_backend::VexBackend;
@@ -123,6 +132,13 @@ pub enum WorkspaceInitError {
          or use `vex git clone` for a Git-protocol clone."
     )]
     NativeTrunkMissing { trunk: String },
+}
+
+fn federated_home_init_error(message: impl Into<String>) -> WorkspaceInitError {
+    WorkspaceInitError::Backend(BackendInitError(Box::new(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid Home checkout: {}", message.into()),
+    ))))
 }
 
 #[derive(Error, Debug)]
@@ -741,6 +757,81 @@ impl Workspace {
         working_copy_factory: &dyn WorkingCopyFactory,
         progress: Option<&crate::vex::CloneProgressFn>,
     ) -> Result<(Self, Arc<ReadonlyRepo>, Option<String>), WorkspaceInitError> {
+        Self::clone_vex_inner(
+            user_settings,
+            workspace_root,
+            config,
+            blob_mode,
+            target_commit,
+            server_trunk,
+            hydrate_blobs,
+            register_workspace,
+            None,
+            working_copy_factory,
+            progress,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub async fn clone_federated_home(
+        user_settings: &UserSettings,
+        workspace_root: &Path,
+        config: VexRepoConfig,
+        blob_mode: CloneBlobMode,
+        target_commit: Option<&CommitId>,
+        server_trunk: Option<&str>,
+        hydrate_blobs: bool,
+        register_workspace: bool,
+        federated_home: VexFederatedHomeConfig,
+        working_copy_factory: &dyn WorkingCopyFactory,
+        progress: Option<&crate::vex::CloneProgressFn>,
+    ) -> Result<(Self, Arc<ReadonlyRepo>, Option<String>), WorkspaceInitError> {
+        Self::clone_vex_inner(
+            user_settings,
+            workspace_root,
+            config,
+            blob_mode,
+            target_commit,
+            server_trunk,
+            hydrate_blobs,
+            register_workspace,
+            Some(federated_home),
+            working_copy_factory,
+            progress,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn clone_vex_inner(
+        user_settings: &UserSettings,
+        workspace_root: &Path,
+        config: VexRepoConfig,
+        blob_mode: CloneBlobMode,
+        target_commit: Option<&CommitId>,
+        server_trunk: Option<&str>,
+        hydrate_blobs: bool,
+        register_workspace: bool,
+        federated_home: Option<VexFederatedHomeConfig>,
+        working_copy_factory: &dyn WorkingCopyFactory,
+        progress: Option<&crate::vex::CloneProgressFn>,
+    ) -> Result<(Self, Arc<ReadonlyRepo>, Option<String>), WorkspaceInitError> {
+        if let Some(federated_home) = federated_home.as_ref() {
+            federated_home
+                .validate()
+                .map_err(|error| federated_home_init_error(error.to_string()))?;
+            if register_workspace {
+                return Err(federated_home_init_error(
+                    "a synthesized flat Home snapshot cannot register a backend workspace during clone",
+                ));
+            }
+            if skip_vex_clone_prefetch() {
+                return Err(federated_home_init_error(
+                    "Home clone requires snapshot prefetch; VEX_SKIP_CLONE_PREFETCH is not supported",
+                ));
+            }
+        }
         if let Some(progress) = progress {
             progress(crate::vex::CloneProgress::Connecting);
         }
@@ -751,7 +842,6 @@ impl Workspace {
             config
                 .write_to_repo_path(&repo_dir)
                 .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
-
             let store_path = repo_dir.join("store");
             std::fs::create_dir(&store_path).context(&store_path)?;
             fs::write(store_path.join("type"), VexBackend::name_static())
@@ -842,6 +932,41 @@ impl Workspace {
                     .prefetch_clone_manifest(&clone_manifest, progress)
                     .await
                     .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+                if let Some(federated_home) = federated_home.as_ref() {
+                    let cache_root = prefetch_client
+                        .cache_root()
+                        .ok_or_else(|| {
+                            federated_home_init_error(
+                                "flat Home clone did not initialize its single object cache",
+                            )
+                        })?
+                        .to_path_buf();
+                    for repository in federated_home.repositories.iter().skip(1) {
+                        let component_config =
+                            federated_home.repository_config(&config, repository);
+                        let mut component_client =
+                            crate::vex::VexClient::from_config_with_cache_root(
+                                component_config,
+                                cache_root.clone(),
+                            )
+                            .map_err(|err| {
+                                WorkspaceInitError::Backend(BackendInitError(err.into()))
+                            })?;
+                        component_client.mark_fresh_clone_cache();
+                        let component_manifest = component_client
+                            .get_clone_manifest(CloneBlobMode::Eager, progress)
+                            .await
+                            .map_err(|err| {
+                                WorkspaceInitError::Backend(BackendInitError(err.into()))
+                            })?;
+                        component_client
+                            .prefetch_clone_manifest(&component_manifest, progress)
+                            .await
+                            .map_err(|err| {
+                                WorkspaceInitError::Backend(BackendInitError(err.into()))
+                            })?;
+                    }
+                }
             }
 
             if let Some(progress) = progress {
@@ -876,13 +1001,30 @@ impl Workspace {
             }
             .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
             let workspace_store = SimpleWorkspaceStore::load(&repo_dir)?;
-            // A clone starts a *fresh local* operation log rooted at the
-            // synthetic root operation, whose view is empty. Refs are the only
-            // thing a clone inherits from the server, so the bookmarks have to
-            // be read back out of them before anything can resolve a trunk.
-            let repo = seed_clone_view_from_refs(repo, &store_path).await?;
-            let (start_commit, resolved_trunk) =
-                clone_vex_checkout_target(&repo, target_commit, server_trunk).await?;
+            let repo = match federated_home.as_ref() {
+                Some(flat_home) => seed_federated_home_clone_view(repo, flat_home).await?,
+                None => seed_clone_view_from_refs(repo, &store_path).await?,
+            };
+            let checkout_trunk = federated_home
+                .as_ref()
+                .map(|flat_home| flat_home.manifest.home_bookmark.as_str())
+                .or(server_trunk);
+            let (mut start_commit, mut resolved_trunk) =
+                clone_vex_checkout_target(&repo, target_commit, checkout_trunk).await?;
+            if let Some(mut flat_home) = federated_home.clone() {
+                start_commit =
+                    synthesize_federated_home_base(&repo, &flat_home, &start_commit).await?;
+                flat_home.aggregate_base_commit_id = Some(content_id_from_commit_id(
+                    start_commit.id(),
+                    "flat Home base commit",
+                )?);
+                // Persist routing only after the selected physical snapshots
+                // have produced a real, readable aggregate native commit.
+                flat_home
+                    .write_to_repo_path(&repo_dir)
+                    .map_err(|err| WorkspaceInitError::Backend(BackendInitError(err.into())))?;
+                resolved_trunk = Some(flat_home.manifest.home_bookmark.clone());
+            }
             // Pre-checkout hydration: a lazy manifest defers every blob and
             // symlink, so materialization would otherwise pay one RPC per
             // file. Batch-fetch the start commit's contents into the cache
@@ -1177,6 +1319,152 @@ impl LockedWorkspace<'_> {
     }
 }
 
+async fn synthesize_federated_home_base(
+    repo: &Arc<ReadonlyRepo>,
+    config: &VexFederatedHomeConfig,
+    home_commit: &Commit,
+) -> Result<Commit, WorkspaceInitError> {
+    if home_commit.id().hex() != config.manifest.home_revision.to_hex() {
+        return Err(federated_home_init_error(format!(
+            "selected Home revision {} does not match manifest revision {}",
+            home_commit.id().hex(),
+            config.manifest.home_revision
+        )));
+    }
+    let mut selected_ids = Vec::with_capacity(config.manifest.components.len() + 1);
+    selected_ids.push(home_commit.id().clone());
+    selected_ids.extend(
+        config
+            .manifest
+            .components
+            .iter()
+            .map(|component| CommitId::new(component.selected_revision.as_bytes().to_vec())),
+    );
+    // This walk proves every selected snapshot is an ordinary native tree and
+    // rejects gitlinks and nested repository artifacts before checkout.
+    crate::vex_backend::collect_commit_object_closure(repo.store(), &selected_ids)
+        .await
+        .map_err(|error| federated_home_init_error(error.to_string()))?;
+
+    let home_root_tree_id = home_commit
+        .tree_ids()
+        .as_resolved()
+        .cloned()
+        .ok_or_else(|| {
+            federated_home_init_error("the selected Home revision has a conflicted root tree")
+        })?;
+    let home_tree = home_commit.tree();
+    let mut builder = TreeBuilder::new(repo.store().clone(), home_root_tree_id);
+    for component in &config.manifest.components {
+        let root =
+            RepoPathBuf::from_internal_string(component.root_path.clone()).map_err(|error| {
+                federated_home_init_error(format!(
+                    "invalid Home manifest path {}: {error}",
+                    component.root_path
+                ))
+            })?;
+        for ancestor in component_root_ancestors(&component.root_path)? {
+            let value = home_tree
+                .path_value(&ancestor)
+                .await
+                .map_err(|error| federated_home_init_error(error.to_string()))?
+                .into_resolved()
+                .map_err(|_| {
+                    federated_home_init_error(format!(
+                        "Home tree has a conflict above manifest path {}",
+                        component.root_path
+                    ))
+                })?;
+            if value.is_some_and(|value| !matches!(value, TreeValue::Tree(_))) {
+                return Err(federated_home_init_error(format!(
+                    "Home tree entry above manifest path {} is not a directory",
+                    component.root_path
+                )));
+            }
+        }
+        let occupied = home_tree
+            .path_value(&root)
+            .await
+            .map_err(|error| federated_home_init_error(error.to_string()))?
+            .into_resolved()
+            .map_err(|_| {
+                federated_home_init_error(format!(
+                    "Home tree has a conflict at manifest path {}",
+                    component.root_path
+                ))
+            })?;
+        if occupied.is_some() {
+            return Err(federated_home_init_error(format!(
+                "Home tree already occupies manifest path {}",
+                component.root_path
+            )));
+        }
+        let component_id = CommitId::new(component.selected_revision.as_bytes().to_vec());
+        let component_commit =
+            repo.store()
+                .get_commit_async(&component_id)
+                .await
+                .map_err(|error| {
+                    federated_home_init_error(format!(
+                        "cannot read a selected Home snapshot: {error}"
+                    ))
+                })?;
+        let component_tree_id = component_commit
+            .tree_ids()
+            .as_resolved()
+            .cloned()
+            .ok_or_else(|| {
+                federated_home_init_error("a selected Home snapshot has a conflicted root tree")
+            })?;
+        builder.set(root, TreeValue::Tree(component_tree_id));
+    }
+    let flat_tree_id = builder.write_tree().await.map_err(|error| {
+        federated_home_init_error(format!("cannot synthesize flat Home tree: {error}"))
+    })?;
+    let mut change_hasher = Sha256::new();
+    change_hasher.update(b"vex-flat-home-base-v1\0");
+    change_hasher.update(config.manifest_content_sha256.as_bytes());
+    let change_digest = change_hasher.finalize();
+    let mut commit = home_commit.store_commit().as_ref().clone();
+    commit.parents = vec![home_commit.id().clone()];
+    commit.predecessors.clear();
+    commit.root_tree = Merge::resolved(flat_tree_id);
+    commit.conflict_labels = Merge::resolved(String::new());
+    commit.change_id = ChangeId::from_bytes(&change_digest[..repo.store().change_id_length()]);
+    commit.description = format!(
+        "Vex flat Home base {}\n",
+        &config.manifest_content_sha256[..12]
+    );
+    commit.secure_sig = None;
+    repo.store()
+        .write_commit(commit, None)
+        .await
+        .map_err(|error| {
+            federated_home_init_error(format!("cannot write flat Home base commit: {error}"))
+        })
+}
+
+fn component_root_ancestors(root: &str) -> Result<Vec<RepoPathBuf>, WorkspaceInitError> {
+    let segments = root.split('/').collect::<Vec<_>>();
+    (1..segments.len())
+        .map(|end| {
+            RepoPathBuf::from_internal_string(segments[..end].join("/")).map_err(|error| {
+                federated_home_init_error(format!("invalid Home manifest path {root}: {error}"))
+            })
+        })
+        .collect()
+}
+
+fn content_id_from_commit_id(
+    commit_id: &CommitId,
+    label: &str,
+) -> Result<VexContentId, WorkspaceInitError> {
+    let bytes: [u8; 32] = commit_id.as_bytes().try_into().map_err(|_| {
+        federated_home_init_error(format!("{label} is not a 32-byte native content id"))
+    })?;
+    Ok(VexContentId::from_bytes(bytes))
+}
+
 // Factory trait to build WorkspaceLoaders given the workspace root.
 pub trait WorkspaceLoaderFactory {
     fn create(&self, workspace_root: &Path)
@@ -1361,6 +1649,49 @@ async fn seed_clone_view_from_refs(
         .map_err(WorkspaceInitError::TransactionCommit)?;
     tracing::debug!(bookmarks = seeded, "seeded the clone view from server refs");
     Ok(repo)
+}
+
+/// Seed a flat Home clone from its signed selection without reading raw refs.
+async fn seed_federated_home_clone_view(
+    repo: Arc<ReadonlyRepo>,
+    config: &VexFederatedHomeConfig,
+) -> Result<Arc<ReadonlyRepo>, WorkspaceInitError> {
+    let bookmark = RefNameBuf::from(config.manifest.home_bookmark.as_str());
+    let revision = CommitId::new(config.manifest.home_revision.as_bytes().to_vec());
+    let commit = repo
+        .store()
+        .get_commit_async(&revision)
+        .await
+        .map_err(|error| {
+            federated_home_init_error(format!(
+                "cannot read selected Home revision {}: {error}",
+                config.manifest.home_revision
+            ))
+        })?;
+
+    let mut tx = repo.start_transaction();
+    tx.repo_mut().add_head(&commit).await.map_err(|error| {
+        federated_home_init_error(format!(
+            "cannot index selected Home revision {}: {error}",
+            config.manifest.home_revision
+        ))
+    })?;
+    let target = RefTarget::normal(revision);
+    tx.repo_mut()
+        .set_local_bookmark_target(bookmark.as_ref(), target.clone());
+    tx.repo_mut().set_remote_bookmark(
+        RemoteRefSymbol {
+            name: bookmark.as_ref(),
+            remote: RemoteName::new(crate::vex_ref_sync::VEX_REMOTE),
+        },
+        RemoteRef {
+            target,
+            state: RemoteRefState::Tracked,
+        },
+    );
+    tx.commit("seed Home bookmark from the signed manifest")
+        .await
+        .map_err(WorkspaceInitError::TransactionCommit)
 }
 
 /// A native bookmark resolved as the `vex clone` checkout target: the bookmark
@@ -2004,13 +2335,21 @@ pub fn default_working_copy_factory() -> Box<dyn WorkingCopyFactory> {
 #[cfg(test)]
 mod tests {
     use jj_backend_types::ClonePackScope;
+    use jj_backend_types::ContentId;
+    use jj_backend_types::FederatedHomeComponent;
+    use jj_backend_types::FederatedHomeManifest;
+    use jj_backend_types::FederatedHomePathOwner;
+    use jj_backend_types::FederatedHomePathOwnerKind;
     use jj_backend_types::HydrationPackManifest;
     use jj_backend_types::ObjectDescriptor;
+    use jj_backend_types::ObjectKind;
     use jj_backend_types::PackDescriptor;
     use pollster::FutureExt as _;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::backend::CopyId;
+    use crate::backend::FileId;
     use crate::config::ConfigLayer;
     use crate::config::ConfigSource;
     use crate::config::StackedConfig;
@@ -2057,11 +2396,474 @@ mod tests {
         Ok((temp_dir, repo))
     }
 
+    fn init_test_vex_repo(
+        settings: &UserSettings,
+    ) -> Result<(TempDir, Arc<ReadonlyRepo>), WorkspaceInitError> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("jj-vex-test-")
+            .tempdir()
+            .unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        let signer = Signer::from_settings(settings)?;
+        let config = VexRepoConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            tenant_id: "tenant-backend".to_string(),
+            tenant_slug: "acme".to_string(),
+            repo_id: "9001".to_string(),
+            repo_slug: "home".to_string(),
+            repository_scope_kind: Some("repository".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
+            access_token: Some("vexrt_test".to_string()),
+            local_writes: false,
+            object_read_mode: crate::vex::VexObjectReadMode::NativeOnly,
+        };
+        let repo = ReadonlyRepo::init(
+            settings,
+            &repo_dir,
+            &move |_settings, store_path| {
+                Ok(Box::new(VexBackend::init_at(config.clone(), store_path)?))
+            },
+            signer,
+            ReadonlyRepo::default_op_store_initializer(),
+            ReadonlyRepo::default_op_heads_store_initializer(),
+            ReadonlyRepo::default_index_store_initializer(),
+            ReadonlyRepo::default_submodule_store_initializer(),
+        )
+        .block_on()
+        .map_err(|repo_init_err| match repo_init_err {
+            RepoInitError::Backend(err) => WorkspaceInitError::Backend(err),
+            RepoInitError::OpHeadsStore(err) => WorkspaceInitError::OpHeadsStore(err),
+            RepoInitError::Path(err) => WorkspaceInitError::Path(err),
+        })?;
+        Ok((temp_dir, repo))
+    }
+
     fn hydration_object(byte: u8) -> (jj_backend_types::ObjectKind, jj_backend_types::ContentId) {
         (
             jj_backend_types::ObjectKind::Blob,
             jj_backend_types::ContentId::from_bytes([byte; 32]),
         )
+    }
+
+    fn repo_path(path: &str) -> RepoPathBuf {
+        RepoPathBuf::from_internal_string(path.to_string()).unwrap()
+    }
+
+    fn content_id(bytes: &[u8]) -> ContentId {
+        ContentId::from_bytes(bytes.try_into().expect("native ids are 32 bytes"))
+    }
+
+    fn flat_home_config(
+        home: &Commit,
+        components: &[(&str, &str, &Commit)],
+    ) -> VexFederatedHomeConfig {
+        let manifest = FederatedHomeManifest {
+            format_version: 1,
+            home_repository_id: "9001".to_string(),
+            home_bookmark: "main".to_string(),
+            home_revision: content_id(home.id().as_bytes()),
+            components: components
+                .iter()
+                .map(
+                    |(repository_id, root_path, commit)| FederatedHomeComponent {
+                        repository_id: (*repository_id).to_string(),
+                        root_path: (*root_path).to_string(),
+                        selected_bookmark: "main".to_string(),
+                        selected_revision: content_id(commit.id().as_bytes()),
+                    },
+                )
+                .collect(),
+            path_owners: std::iter::once(FederatedHomePathOwner {
+                path: String::new(),
+                owner: FederatedHomePathOwnerKind::HomeRoot,
+            })
+            .chain(
+                components
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, root_path, _))| FederatedHomePathOwner {
+                        path: (*root_path).to_string(),
+                        owner: FederatedHomePathOwnerKind::Component {
+                            component_index: index,
+                        },
+                    }),
+            )
+            .collect(),
+        };
+        let repositories = std::iter::once(crate::vex::VexFederatedHomeRepository {
+            repository_id: "9001".to_string(),
+            repository_public_id: "repository_home".to_string(),
+            repository_slug: "home".to_string(),
+            root_path: String::new(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+        })
+        .chain(components.iter().map(|(repository_id, root_path, _)| {
+            crate::vex::VexFederatedHomeRepository {
+                repository_id: (*repository_id).to_string(),
+                repository_public_id: format!("repository_{repository_id}"),
+                repository_slug: format!("repo-{repository_id}"),
+                root_path: (*root_path).to_string(),
+                endpoint: "http://127.0.0.1:1".to_string(),
+            }
+        }))
+        .collect();
+        VexFederatedHomeConfig {
+            format_version: 1,
+            manifest_artifact_suffix: manifest.artifact_suffix().unwrap(),
+            manifest_content_sha256: manifest.content_sha256().unwrap(),
+            manifest_generation: 1,
+            manifest,
+            aggregate_access_token: "vexhome_test".to_string(),
+            repositories,
+            aggregate_base_commit_id: None,
+        }
+    }
+
+    async fn write_test_file(
+        store: &Arc<crate::store::Store>,
+        path: &RepoPathBuf,
+        contents: &[u8],
+    ) -> FileId {
+        store.write_file(path, &mut &contents[..]).await.unwrap()
+    }
+
+    async fn write_test_commit(
+        store: &Arc<crate::store::Store>,
+        parent: CommitId,
+        root_tree: crate::backend::TreeId,
+        change_byte: u8,
+    ) -> Commit {
+        let mut commit = store.root_commit().store_commit().as_ref().clone();
+        commit.parents = vec![parent];
+        commit.predecessors.clear();
+        commit.root_tree = Merge::resolved(root_tree);
+        commit.conflict_labels = Merge::resolved(String::new());
+        commit.change_id = ChangeId::from_bytes(&vec![change_byte; store.change_id_length()]);
+        commit.description = format!("test commit {change_byte}");
+        commit.secure_sig = None;
+        store.write_commit(commit, None).await.unwrap()
+    }
+
+    #[test]
+    fn delta_closure_skips_an_unchanged_large_subtree() {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings).unwrap();
+        let store = repo.store().clone();
+        let (base, target, unchanged_tree, unchanged_blob, changed_blob) = async {
+            let unchanged_path = repo_path("large/unchanged.bin");
+            let second_unchanged_path = repo_path("large/also-unchanged.bin");
+            let changed_path = repo_path("changed.txt");
+            let unchanged_blob = write_test_file(&store, &unchanged_path, b"large-a").await;
+            let second_blob = write_test_file(&store, &second_unchanged_path, b"large-b").await;
+            let old_changed = write_test_file(&store, &changed_path, b"before").await;
+            let mut base_builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+            for (path, id) in [
+                (unchanged_path.clone(), unchanged_blob.clone()),
+                (second_unchanged_path, second_blob),
+                (changed_path.clone(), old_changed),
+            ] {
+                base_builder.set(
+                    path,
+                    TreeValue::File {
+                        id,
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                );
+            }
+            let base_tree = base_builder.write_tree().await.unwrap();
+            let base =
+                write_test_commit(&store, store.root_commit_id().clone(), base_tree, 1).await;
+            let unchanged_tree = match base
+                .tree()
+                .path_value(&repo_path("large"))
+                .await
+                .unwrap()
+                .into_resolved()
+                .unwrap()
+                .unwrap()
+            {
+                TreeValue::Tree(id) => id,
+                value => panic!("expected unchanged subtree, got {value:?}"),
+            };
+            let changed_blob = write_test_file(&store, &changed_path, b"after").await;
+            let mut target_builder = TreeBuilder::new(
+                store.clone(),
+                base.tree_ids().as_resolved().unwrap().clone(),
+            );
+            target_builder.set(
+                changed_path,
+                TreeValue::File {
+                    id: changed_blob.clone(),
+                    executable: false,
+                    copy_id: CopyId::placeholder(),
+                },
+            );
+            let target_tree = target_builder.write_tree().await.unwrap();
+            let target = write_test_commit(&store, base.id().clone(), target_tree, 2).await;
+            (base, target, unchanged_tree, unchanged_blob, changed_blob)
+        }
+        .block_on();
+
+        let closure = crate::vex_backend::collect_commit_delta_object_closure(
+            &store,
+            &[(target.id().clone(), Some(base.id().clone()))],
+        )
+        .block_on()
+        .unwrap();
+
+        assert!(closure.contains(&(ObjectKind::Commit, content_id(target.id().as_bytes()))));
+        assert!(closure.contains(&(
+            ObjectKind::Tree,
+            content_id(target.tree_ids().as_resolved().unwrap().as_bytes())
+        )));
+        assert!(closure.contains(&(ObjectKind::Blob, content_id(changed_blob.as_bytes()))));
+        assert!(!closure.contains(&(ObjectKind::Tree, content_id(unchanged_tree.as_bytes()))));
+        assert!(!closure.contains(&(ObjectKind::Blob, content_id(unchanged_blob.as_bytes()))));
+    }
+
+    #[test]
+    fn composition_marker_closure_stops_at_selected_component_snapshot() {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings).unwrap();
+        let store = repo.store().clone();
+        let (home, synthetic, component_tree, component_blob, home_blob, overlay_ancestor) =
+            async {
+                let home_path = repo_path("README.md");
+                let home_blob = write_test_file(&store, &home_path, b"home").await;
+                let mut home_builder =
+                    TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+                home_builder.set(
+                    home_path,
+                    TreeValue::File {
+                        id: home_blob.clone(),
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                );
+                let home_tree = home_builder.write_tree().await.unwrap();
+                let home =
+                    write_test_commit(&store, store.root_commit_id().clone(), home_tree, 3).await;
+
+                let component_path = repo_path("unchanged-component.bin");
+                let component_blob = write_test_file(&store, &component_path, b"component").await;
+                let mut component_builder =
+                    TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+                component_builder.set(
+                    component_path,
+                    TreeValue::File {
+                        id: component_blob.clone(),
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                );
+                let component_tree = component_builder.write_tree().await.unwrap();
+
+                let mut aggregate_builder = TreeBuilder::new(
+                    store.clone(),
+                    home.tree_ids().as_resolved().unwrap().clone(),
+                );
+                aggregate_builder.set(
+                    repo_path("apps/web"),
+                    TreeValue::Tree(component_tree.clone()),
+                );
+                let aggregate_tree = aggregate_builder.write_tree().await.unwrap();
+                let synthetic =
+                    write_test_commit(&store, home.id().clone(), aggregate_tree, 4).await;
+                let overlay_ancestor = match synthetic
+                    .tree()
+                    .path_value(&repo_path("apps"))
+                    .await
+                    .unwrap()
+                    .into_resolved()
+                    .unwrap()
+                    .unwrap()
+                {
+                    TreeValue::Tree(id) => id,
+                    value => panic!("expected overlay ancestor, got {value:?}"),
+                };
+                (
+                    home,
+                    synthetic,
+                    component_tree,
+                    component_blob,
+                    home_blob,
+                    overlay_ancestor,
+                )
+            }
+            .block_on();
+
+        let closure = crate::vex_backend::collect_composed_overlay_object_closure(
+            &store,
+            synthetic.id(),
+            home.id(),
+            [component_tree.clone()],
+        )
+        .block_on()
+        .unwrap();
+
+        assert!(closure.contains(&(ObjectKind::Commit, content_id(synthetic.id().as_bytes()))));
+        assert!(closure.contains(&(
+            ObjectKind::Tree,
+            content_id(synthetic.tree_ids().as_resolved().unwrap().as_bytes())
+        )));
+        assert!(closure.contains(&(ObjectKind::Tree, content_id(overlay_ancestor.as_bytes()))));
+        assert!(!closure.contains(&(ObjectKind::Tree, content_id(component_tree.as_bytes()))));
+        assert!(!closure.contains(&(ObjectKind::Blob, content_id(component_blob.as_bytes()))));
+        assert!(!closure.contains(&(ObjectKind::Blob, content_id(home_blob.as_bytes()))));
+    }
+
+    #[test]
+    fn flat_snapshot_validation_rejects_nested_repository_artifacts() {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings).unwrap();
+        let store = repo.store().clone();
+        let commit = async {
+            let path = repo_path("component/.jj/config");
+            let file = write_test_file(&store, &path, b"nested metadata").await;
+            let mut builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+            builder.set(
+                path,
+                TreeValue::File {
+                    id: file,
+                    executable: false,
+                    copy_id: CopyId::placeholder(),
+                },
+            );
+            let tree = builder.write_tree().await.unwrap();
+            write_test_commit(&store, store.root_commit_id().clone(), tree, 5).await
+        }
+        .block_on();
+
+        let error = crate::vex_backend::collect_commit_object_closure(
+            &store,
+            std::slice::from_ref(commit.id()),
+        )
+        .block_on()
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Home trees cannot contain reserved metadata `.jj`"),
+            "unexpected validation error: {message}"
+        );
+    }
+
+    #[test]
+    fn composition_rejects_a_home_entry_at_the_exact_component_root() {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings).unwrap();
+        let store = repo.store().clone();
+        let (home, component) = async {
+            let occupied = repo_path("apps/web");
+            let file = write_test_file(&store, &occupied, b"Home collision").await;
+            let mut home_builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+            home_builder.set(
+                occupied,
+                TreeValue::File {
+                    id: file,
+                    executable: false,
+                    copy_id: CopyId::placeholder(),
+                },
+            );
+            let home_tree = home_builder.write_tree().await.unwrap();
+            let home =
+                write_test_commit(&store, store.root_commit_id().clone(), home_tree, 6).await;
+            let component = write_test_commit(
+                &store,
+                store.root_commit_id().clone(),
+                store.empty_tree_id().clone(),
+                7,
+            )
+            .await;
+            (home, component)
+        }
+        .block_on();
+        let config = flat_home_config(&home, &[("9002", "apps/web", &component)]);
+
+        let error = synthesize_federated_home_base(&repo, &config, &home)
+            .block_on()
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already occupies manifest path apps/web")
+        );
+    }
+
+    #[test]
+    fn flat_config_rejects_overlapping_component_roots() {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings).unwrap();
+        let store = repo.store().clone();
+        let (home, first, second) = async {
+            let home = write_test_commit(
+                &store,
+                store.root_commit_id().clone(),
+                store.empty_tree_id().clone(),
+                8,
+            )
+            .await;
+            let first = write_test_commit(
+                &store,
+                store.root_commit_id().clone(),
+                store.empty_tree_id().clone(),
+                9,
+            )
+            .await;
+            let second = write_test_commit(
+                &store,
+                store.root_commit_id().clone(),
+                store.empty_tree_id().clone(),
+                10,
+            )
+            .await;
+            (home, first, second)
+        }
+        .block_on();
+        let manifest = FederatedHomeManifest {
+            format_version: 1,
+            home_repository_id: "9001".to_string(),
+            home_bookmark: "main".to_string(),
+            home_revision: content_id(home.id().as_bytes()),
+            components: vec![
+                FederatedHomeComponent {
+                    repository_id: "9002".to_string(),
+                    root_path: "apps".to_string(),
+                    selected_bookmark: "main".to_string(),
+                    selected_revision: content_id(first.id().as_bytes()),
+                },
+                FederatedHomeComponent {
+                    repository_id: "9003".to_string(),
+                    root_path: "apps/web".to_string(),
+                    selected_bookmark: "main".to_string(),
+                    selected_revision: content_id(second.id().as_bytes()),
+                },
+            ],
+            path_owners: vec![
+                FederatedHomePathOwner {
+                    path: String::new(),
+                    owner: FederatedHomePathOwnerKind::HomeRoot,
+                },
+                FederatedHomePathOwner {
+                    path: "apps".to_string(),
+                    owner: FederatedHomePathOwnerKind::Component { component_index: 0 },
+                },
+                FederatedHomePathOwner {
+                    path: "apps/web".to_string(),
+                    owner: FederatedHomePathOwnerKind::Component { component_index: 1 },
+                },
+            ],
+        };
+
+        let error = manifest.validate().unwrap_err();
+
+        assert!(error.to_string().contains("component roots collide"));
     }
 
     #[test]
@@ -2117,6 +2919,49 @@ mod tests {
         };
 
         assert!(!hydration_pack_manifest_covers(&manifest, &[first, second]));
+    }
+
+    #[test]
+    fn federated_home_clone_view_uses_only_the_manifest_bookmark_and_revision()
+    -> Result<(), WorkspaceInitError> {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings)?;
+        let home = write_test_commit(
+            repo.store(),
+            repo.store().root_commit_id().clone(),
+            repo.store().empty_tree_id().clone(),
+            11,
+        )
+        .block_on();
+        let mut config = flat_home_config(&home, &[]);
+        config.manifest.home_bookmark = "release".to_string();
+        config.manifest_content_sha256 = config.manifest.content_sha256().unwrap();
+        config.manifest_artifact_suffix = config.manifest.artifact_suffix().unwrap();
+        config.validate().unwrap();
+
+        let repo = seed_federated_home_clone_view(repo, &config).block_on()?;
+        let (start_commit, resolved_trunk) =
+            clone_vex_checkout_target(&repo, None, Some(config.manifest.home_bookmark.as_str()))
+                .block_on()?;
+
+        assert_eq!(start_commit.id(), home.id());
+        assert_eq!(resolved_trunk.as_deref(), Some("release"));
+        assert_eq!(
+            repo.view()
+                .get_local_bookmark("release".as_ref())
+                .as_normal(),
+            Some(home.id())
+        );
+        let remote = repo.view().get_remote_bookmark(RemoteRefSymbol {
+            name: "release".as_ref(),
+            remote: RemoteName::new(crate::vex_ref_sync::VEX_REMOTE),
+        });
+        assert_eq!(remote.target.as_normal(), Some(home.id()));
+        assert_eq!(remote.state, RemoteRefState::Tracked);
+        assert_eq!(repo.view().local_bookmarks().count(), 1);
+        assert_eq!(repo.view().all_remote_bookmarks().count(), 1);
+        assert!(repo.view().heads().contains(home.id()));
+        Ok(())
     }
 
     #[test]

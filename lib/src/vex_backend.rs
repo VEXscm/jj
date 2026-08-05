@@ -14,6 +14,8 @@
 
 #![expect(missing_docs)]
 
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::Path;
 use std::path::PathBuf;
@@ -65,7 +67,9 @@ use crate::simple_backend::commit_from_proto;
 use crate::simple_backend::commit_to_proto;
 use crate::simple_backend::tree_from_proto;
 use crate::simple_backend::tree_to_proto;
+use crate::store::Store;
 use crate::vex::VexClient;
+use crate::vex::VexObjectId;
 use crate::vex::VexObjectReadMode;
 use crate::vex::VexRepoConfig;
 use crate::vex::vex_client_stats;
@@ -138,6 +142,194 @@ fn to_content_id(id: &[u8], object_type: &str) -> BackendResult<jj_backend_types
     let mut bytes = [0; ID_LENGTH];
     bytes.copy_from_slice(id);
     Ok(jj_backend_types::ContentId::from_bytes(bytes))
+}
+
+/// Collect the native commit/tree/file closure rooted at `commit_ids` without
+/// following commit parents. Callers explicitly include any locally derived
+/// parent commits they need to publish and stop at repository-owned manifest
+/// bases, which already exist in the destination backend.
+pub async fn collect_commit_object_closure(
+    store: &std::sync::Arc<Store>,
+    commit_ids: &[CommitId],
+) -> BackendResult<Vec<VexObjectId>> {
+    let revisions = commit_ids
+        .iter()
+        .cloned()
+        .map(|commit_id| (commit_id, None))
+        .collect::<Vec<_>>();
+    collect_commit_delta_object_closure(store, &revisions).await
+}
+
+/// Collect the native object delta introduced by each target commit relative
+/// to its trusted repository-local base. Identical subtree ids stop traversal,
+/// so publication cost is proportional to changed paths rather than repository
+/// size. A missing base intentionally falls back to a complete target closure.
+pub async fn collect_commit_delta_object_closure(
+    store: &std::sync::Arc<Store>,
+    revisions: &[(CommitId, Option<CommitId>)],
+) -> BackendResult<Vec<VexObjectId>> {
+    collect_commit_delta_object_closure_with_stops(store, revisions, &HashSet::new()).await
+}
+
+/// Collect only locally synthesized facade overlay objects. Selected physical
+/// component roots are opaque boundaries: neither their tree object nor any
+/// mounted descendant is visited merely to retire local staged markers.
+pub async fn collect_composed_overlay_object_closure(
+    store: &std::sync::Arc<Store>,
+    synthetic_commit_id: &CommitId,
+    physical_home_base_id: &CommitId,
+    selected_component_tree_ids: impl IntoIterator<Item = TreeId>,
+) -> BackendResult<Vec<VexObjectId>> {
+    let stops = selected_component_tree_ids
+        .into_iter()
+        .collect::<HashSet<_>>();
+    collect_commit_delta_object_closure_with_stops(
+        store,
+        &[(
+            synthetic_commit_id.clone(),
+            Some(physical_home_base_id.clone()),
+        )],
+        &stops,
+    )
+    .await
+}
+
+async fn collect_commit_delta_object_closure_with_stops(
+    store: &std::sync::Arc<Store>,
+    revisions: &[(CommitId, Option<CommitId>)],
+    stop_tree_ids: &HashSet<TreeId>,
+) -> BackendResult<Vec<VexObjectId>> {
+    use jj_backend_types::ObjectKind;
+
+    let implicit_empty = jj_backend_types::ContentId::hash_bytes(b"");
+    let implicit_zeros = jj_backend_types::ContentId::from_bytes([0; 32]);
+    let mut objects = HashSet::new();
+    let mut trees = Vec::new();
+    let mut seen_trees = HashSet::new();
+    for (commit_id, base_commit_id) in revisions {
+        objects.insert((
+            ObjectKind::Commit,
+            to_content_id(commit_id.as_bytes(), "commit")?,
+        ));
+        let commit = store.get_commit_async(commit_id).await?;
+        let target_tree_id = commit.tree_ids().as_resolved().ok_or_else(|| {
+            BackendError::Unsupported("Home commits cannot have conflicted root trees".to_string())
+        })?;
+        let base_tree_id = match base_commit_id {
+            Some(base_commit_id) => Some(
+                store
+                    .get_commit_async(base_commit_id)
+                    .await?
+                    .tree_ids()
+                    .as_resolved()
+                    .cloned()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported(
+                            "Home bases cannot have conflicted root trees".to_string(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        if base_tree_id.as_ref() != Some(target_tree_id)
+            && seen_trees.insert((target_tree_id.clone(), base_tree_id.clone()))
+        {
+            trees.push((RepoPathBuf::root(), target_tree_id.clone(), base_tree_id));
+        }
+    }
+
+    while let Some((dir, tree_id, base_tree_id)) = trees.pop() {
+        let tree_content_id = to_content_id(tree_id.as_bytes(), "tree")?;
+        if tree_content_id != implicit_empty && tree_content_id != implicit_zeros {
+            objects.insert((ObjectKind::Tree, tree_content_id));
+        }
+        let tree = store.get_tree(dir, &tree_id).await?;
+        let base_entries = match base_tree_id {
+            Some(base_tree_id) => store
+                .get_tree(tree.dir().to_owned(), &base_tree_id)
+                .await?
+                .entries_non_recursive()
+                .map(|entry| (entry.name().to_owned(), entry.value().clone()))
+                .collect::<BTreeMap<_, _>>(),
+            None => BTreeMap::new(),
+        };
+        for entry in tree.entries_non_recursive() {
+            reject_nested_repository_artifact(entry.name().as_internal_str())?;
+            let base_value = base_entries.get(entry.name());
+            if base_value == Some(entry.value()) {
+                continue;
+            }
+            let object = match entry.value() {
+                TreeValue::File { id, .. } => {
+                    Some((ObjectKind::Blob, to_content_id(id.as_bytes(), "file")?))
+                }
+                TreeValue::Symlink(id) => Some((
+                    ObjectKind::Symlink,
+                    to_content_id(id.as_bytes(), "symlink")?,
+                )),
+                TreeValue::Tree(child_id) => {
+                    if stop_tree_ids.contains(child_id) {
+                        continue;
+                    }
+                    let base_child_id = match base_value {
+                        Some(TreeValue::Tree(base_child_id)) => Some(base_child_id.clone()),
+                        _ => None,
+                    };
+                    if seen_trees.insert((child_id.clone(), base_child_id.clone())) {
+                        trees.push((
+                            tree.dir().join(entry.name()),
+                            child_id.clone(),
+                            base_child_id,
+                        ));
+                    }
+                    None
+                }
+                TreeValue::GitSubmodule(_) => {
+                    return Err(BackendError::Unsupported(
+                        "Home trees contain an unsupported repository entry".to_string(),
+                    ));
+                }
+            };
+            if let Some(object) = object
+                && object.1 != implicit_empty
+                && object.1 != implicit_zeros
+            {
+                objects.insert(object);
+            }
+        }
+    }
+
+    let mut objects = objects.into_iter().collect::<Vec<_>>();
+    objects.sort_by_key(|(kind, content_id)| (object_kind_rank(*kind), content_id.to_hex()));
+    Ok(objects)
+}
+
+fn reject_nested_repository_artifact(name: &str) -> BackendResult<()> {
+    if [".git", ".jj", ".gitmodules"]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(BackendError::Unsupported(format!(
+            "Home trees cannot contain reserved metadata `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+fn object_kind_rank(kind: jj_backend_types::ObjectKind) -> u8 {
+    use jj_backend_types::ObjectKind;
+    match kind {
+        ObjectKind::Blob => 0,
+        ObjectKind::Symlink => 1,
+        ObjectKind::Tree => 2,
+        ObjectKind::Commit => 3,
+        ObjectKind::Copy => 4,
+        ObjectKind::Tag => 5,
+        ObjectKind::View => 6,
+        ObjectKind::Op => 7,
+        ObjectKind::Pack => 8,
+        ObjectKind::Manifest => 9,
+    }
 }
 
 /// Typed error for a native-only read path that fetched commit/tree bytes

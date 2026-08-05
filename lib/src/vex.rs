@@ -35,7 +35,10 @@ use std::time::SystemTime;
 
 use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
 use jj_backend_api::CloneViewKind as ProtoCloneViewKind;
+use jj_backend_api::FederatedHomePathChange as ProtoFederatedHomePathChange;
+use jj_backend_api::FederatedHomeSubmitOperationKind as ProtoFederatedHomeSubmitOperationKind;
 use jj_backend_api::GetCloneManifestRequest;
+use jj_backend_api::GetFederatedHomeManifestRequest;
 use jj_backend_api::GetHydrationPacksRequest;
 use jj_backend_api::GetObjectRequest;
 use jj_backend_api::GetObjectsInlineRequest;
@@ -44,17 +47,28 @@ use jj_backend_api::GetRepoRequest;
 use jj_backend_api::InitRepoRequest;
 use jj_backend_api::InlineObject;
 use jj_backend_api::ObjectId;
+use jj_backend_api::PlanFederatedHomeSubmitRequest;
 use jj_backend_api::PutObjectRequest;
 use jj_backend_api::PutObjectsRequest;
 use jj_backend_api::RefNaming;
 use jj_backend_api::ResolveOperationIdPrefixRequest;
 use jj_backend_api::ResolveRefsRequest;
+use jj_backend_api::StageFederatedHomeSubmitPartitionRequest;
 use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
+use jj_backend_api::get_federated_home_manifest_request::Selection as FederatedHomeManifestSelection;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
-    CloneManifest, ContentId, HydrationPackManifest, ObjectKind, ObjectPackEntry,
-    decode_object_pack, decode_object_pack_reader, decode_object_pack_with_visitor,
-    decode_pack_chunk_entries, parse_pack_header,
+    CloneManifest, ContentId, FederatedHomeManifest, HydrationPackManifest, ObjectKind,
+    ObjectPackEntry, decode_object_pack, decode_object_pack_reader,
+    decode_object_pack_with_visitor, decode_pack_chunk_entries, parse_pack_header,
+};
+pub use jj_backend_types::{
+    ContentId as VexContentId, FederatedHomeComponent as VexFederatedHomeComponent,
+    FederatedHomeManifest as VexFederatedHomeManifest,
+    FederatedHomePathOwner as VexFederatedHomePathOwner,
+    FederatedHomePathOwnerKind as VexFederatedHomePathOwnerKind,
+    FederatedHomeSubmitOperationKind as VexFederatedHomeOperationKind,
+    FederatedHomeSubmitPlan as VexFederatedHomeSubmitPlan, ObjectKind as VexObjectKind,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -113,7 +127,6 @@ where
             }
         }
     }
-
 }
 
 /// Sleep usable from a non-tokio (pollster-style) executor: the timer runs as
@@ -131,6 +144,11 @@ pub(crate) async fn shared_runtime_sleep(duration: Duration) {
 /// with "decoded message length too large". The server already allows 64 MiB
 /// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+// Must match the backend's single-request plan-bound Home staging boundary.
+// There is intentionally no transparent generic-upload fallback for a larger
+// closure; the caller gets a clear error before any remote write is attempted.
+const MAX_FEDERATED_HOME_STAGE_OBJECTS: usize = 512;
+const MAX_FEDERATED_HOME_STAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Ref namespace the freshness probe (roadmap/088, D8) scopes its token to.
 ///
@@ -874,6 +892,8 @@ pub enum VexConfigError {
     InvalidEndpoint { endpoint: String, message: String },
     #[error("backend did not return repo information")]
     MissingRepoInfo,
+    #[error("invalid Home checkout metadata: {0}")]
+    InvalidFederatedHome(String),
 }
 
 #[derive(Debug, Error)]
@@ -902,6 +922,25 @@ pub enum VexClientError {
     /// nothing is retryable, and the fix is a human one.
     #[error("{0}")]
     StagedObjectsMissing(String),
+}
+
+pub type VexObjectId = (VexObjectKind, VexContentId);
+
+/// A backend-issued flat Home submit plan plus one capability for each
+/// nonempty physical partition. The capabilities remain in-process only and
+/// are never written to Home checkout metadata or Rails payloads.
+#[derive(Debug, Clone)]
+pub struct VexFederatedHomeSubmitPlanResponse {
+    pub plan: VexFederatedHomeSubmitPlan,
+    stage_capabilities: HashMap<String, String>,
+}
+
+impl VexFederatedHomeSubmitPlanResponse {
+    pub fn stage_capability(&self, repository_id: &str) -> Option<&str> {
+        self.stage_capabilities
+            .get(repository_id)
+            .map(String::as_str)
+    }
 }
 
 /// Object decode policy for the Vex backend read path (roadmap/066).
@@ -991,6 +1030,226 @@ pub struct VexVirtualRepositoryMount {
     pub sync_provider_kind: Option<String>,
 }
 
+pub const VEX_FEDERATED_HOME_FORMAT_VERSION: u32 = 1;
+const VEX_FEDERATED_HOME_METADATA_FILE: &str = "federated-home.json";
+
+/// Hidden local routing state for one flat Home checkout.
+///
+/// `manifest` is the exact canonical Rust contract returned by jj-backend.
+/// Slugs, public ids, endpoints, and credentials are deliberately outside it so
+/// they cannot affect its content digest.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VexFederatedHomeConfig {
+    pub format_version: u32,
+    pub manifest_artifact_suffix: String,
+    pub manifest_content_sha256: String,
+    /// Exact generation of jj-backend's mutable current-manifest pointer at
+    /// clone time. Submit must observe this same current pointer.
+    pub manifest_generation: u64,
+    pub manifest: FederatedHomeManifest,
+    /// Single short-lived Home aggregate credential, bound by jj-backend to
+    /// this exact manifest pointer and its component selections. It is never a
+    /// reusable credential for an individual physical repository.
+    pub aggregate_access_token: String,
+    /// Home first, followed by components in manifest order.
+    pub repositories: Vec<VexFederatedHomeRepository>,
+    /// The locally synthesized flat snapshot. It is not part of the canonical
+    /// ownership manifest and is filled in only after clone composition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_base_commit_id: Option<ContentId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VexFederatedHomeRepository {
+    /// Exact `jj-backend` `RepoInfo.repo_id` resolved with the Home aggregate
+    /// credential. It is explicitly not Rails `Repository#id`.
+    pub repository_id: String,
+    /// Rails public id and slug are request/display identity only.
+    pub repository_public_id: String,
+    pub repository_slug: String,
+    /// Empty for Home; otherwise the Home-relative ownership root.
+    pub root_path: String,
+    pub endpoint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VexFederatedHomeManifestResponse {
+    pub manifest_artifact_suffix: String,
+    pub manifest_content_sha256: String,
+    pub manifest_generation: u64,
+    pub manifest: FederatedHomeManifest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VexFederatedHomePathChange {
+    pub path: String,
+    pub operation: VexFederatedHomeOperationKind,
+}
+
+fn require_current_federated_home_manifest(is_current: bool) -> Result<(), VexClientError> {
+    if is_current {
+        Ok(())
+    } else {
+        Err(VexConfigError::InvalidFederatedHome(
+            "the Home configuration changed since this checkout was cloned".to_string(),
+        )
+        .into())
+    }
+}
+
+fn validate_federated_home_pointer(
+    pointer: &jj_backend_api::FederatedHomeManifestPointer,
+    expected_suffix: &str,
+    expected_digest: &str,
+    expected_generation: Option<u64>,
+) -> Result<(), VexClientError> {
+    if pointer.format_version != VEX_FEDERATED_HOME_FORMAT_VERSION
+        || pointer.generation == 0
+        || pointer.manifest_artifact_suffix != expected_suffix
+        || pointer.manifest_content_sha256 != expected_digest
+    {
+        return Err(VexConfigError::InvalidFederatedHome(
+            "backend current-manifest pointer is incoherent".to_string(),
+        )
+        .into());
+    }
+    if expected_generation.is_some_and(|generation| generation != pointer.generation) {
+        return Err(VexConfigError::InvalidFederatedHome(
+            "the flat Home current-manifest pointer generation changed since clone".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+impl VexFederatedHomeConfig {
+    pub fn metadata_path_for_repo(repo_path: &Path) -> PathBuf {
+        repo_path.join(VEX_FEDERATED_HOME_METADATA_FILE)
+    }
+
+    pub fn load_from_repo_path(repo_path: &Path) -> Result<Option<Self>, VexConfigError> {
+        let path = Self::metadata_path_for_repo(repo_path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let config: Self = serde_json::from_slice(&fs::read(path)?)?;
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    pub fn write_to_repo_path(&self, repo_path: &Path) -> Result<(), VexConfigError> {
+        self.validate()?;
+        let path = Self::metadata_path_for_repo(repo_path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| VexConfigError::InvalidStorePath(path.clone()))?;
+        let mut temporary = NamedTempFile::new_in(parent)?;
+        temporary.write_all(&serde_json::to_vec_pretty(self)?)?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), VexConfigError> {
+        if self.format_version != VEX_FEDERATED_HOME_FORMAT_VERSION
+            || self.format_version != self.manifest.format_version
+        {
+            return Err(VexConfigError::InvalidFederatedHome(format!(
+                "unsupported format version {}",
+                self.format_version
+            )));
+        }
+        self.manifest.validate().map_err(|_| {
+            VexConfigError::InvalidFederatedHome("Home manifest path layout is invalid".to_string())
+        })?;
+        let digest = self
+            .manifest
+            .content_sha256()
+            .map_err(|error| VexConfigError::InvalidFederatedHome(error.to_string()))?;
+        let suffix = self
+            .manifest
+            .artifact_suffix()
+            .map_err(|error| VexConfigError::InvalidFederatedHome(error.to_string()))?;
+        if digest != self.manifest_content_sha256 || suffix != self.manifest_artifact_suffix {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "backend manifest bytes, digest, and artifact suffix disagree".to_string(),
+            ));
+        }
+        if self.manifest_generation == 0 {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "current manifest pointer generation must be positive".to_string(),
+            ));
+        }
+        if !self
+            .aggregate_access_token
+            .strip_prefix("vexhome_")
+            .is_some_and(|token| !token.is_empty())
+        {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "Home routing requires a manifest-bound aggregate credential".to_string(),
+            ));
+        }
+        if self.repositories.len() != self.manifest.components.len() + 1 {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "repository access routes do not exactly cover the manifest".to_string(),
+            ));
+        }
+        let expected = std::iter::once((self.manifest.home_repository_id.as_str(), "")).chain(
+            self.manifest.components.iter().map(|component| {
+                (
+                    component.repository_id.as_str(),
+                    component.root_path.as_str(),
+                )
+            }),
+        );
+        for (repository, (repository_id, root_path)) in self.repositories.iter().zip(expected) {
+            if repository.repository_id != repository_id
+                || repository.root_path != root_path
+                || repository.repository_public_id.trim().is_empty()
+                || repository.repository_slug.trim().is_empty()
+                || repository.endpoint.trim().is_empty()
+            {
+                return Err(VexConfigError::InvalidFederatedHome(format!(
+                    "invalid or out-of-order access route for repository {}",
+                    repository.repository_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn home(&self) -> &VexFederatedHomeRepository {
+        &self.repositories[0]
+    }
+
+    pub fn component_repository(&self, component_index: usize) -> &VexFederatedHomeRepository {
+        &self.repositories[component_index + 1]
+    }
+
+    pub fn repository_config(
+        &self,
+        home_config: &VexRepoConfig,
+        repository: &VexFederatedHomeRepository,
+    ) -> VexRepoConfig {
+        VexRepoConfig {
+            endpoint: repository.endpoint.clone(),
+            tenant_id: home_config.tenant_id.clone(),
+            tenant_slug: home_config.tenant_slug.clone(),
+            repo_id: repository.repository_id.clone(),
+            repo_slug: repository.repository_slug.clone(),
+            // Component object and staged-write RPCs are authorized as part of
+            // the single Home facade, never as raw physical repository access.
+            repository_scope_kind: Some("composed".to_string()),
+            virtual_repository_id: None,
+            backing_repo_slug: None,
+            virtual_root_path: None,
+            virtual_mounts: Vec::new(),
+            access_token: Some(self.aggregate_access_token.clone()),
+            local_writes: false,
+            object_read_mode: VexObjectReadMode::NativeOnly,
+        }
+    }
+}
+
 impl VexRepoConfig {
     pub fn metadata_path_for_repo(repo_path: &Path) -> PathBuf {
         repo_path.join("vex.json")
@@ -1034,6 +1293,18 @@ impl VexRepoConfig {
 pub struct VexClient {
     config: VexRepoConfig,
     cache_root: Option<PathBuf>,
+    /// `.jj/repo` for a disk-backed client. Flat Home clients lazily read the
+    /// hidden federated config here after a cache miss, including clients that
+    /// were opened during clone before that config was persisted.
+    repo_path: Option<PathBuf>,
+    /// Immutable physical read routes resolved from hidden flat Home metadata.
+    /// An absent metadata file is not cached: clone writes it only after the
+    /// synthetic aggregate base is readable, and the already-open backend must
+    /// discover it afterward without being rebuilt.
+    federated_read_routes: Arc<OnceLock<Vec<VexRepoConfig>>>,
+    /// This store is the local-only synthetic Home facade. Ordinary staged
+    /// publication (notably `vex push`) must never send its objects to Home.
+    federated_facade: bool,
     cache_max_bytes: Option<u64>,
     /// Mirror of `config.local_writes`. When true, `put_object` short-circuits to
     /// the local cache instead of issuing a gRPC `PutObject` (READ_ONLY CI runner).
@@ -1121,6 +1392,12 @@ const PENDING_FLUSH_OBJECTS: usize = 256;
 /// number of batches held at once. Peak upload memory is therefore bounded at
 /// roughly `STAGED_UPLOAD_CONCURRENCY * PENDING_FLUSH_BYTES`.
 const STAGED_UPLOAD_CONCURRENCY: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedMarkerPolicy {
+    Preserve,
+    Remove,
+}
 
 /// Max objects per `GetObjectsInline` batch (read-side analogue of
 /// [`PENDING_FLUSH_OBJECTS`]).
@@ -1512,6 +1789,9 @@ impl VexClient {
         Ok(Self {
             config,
             cache_root: None,
+            repo_path: None,
+            federated_read_routes: Arc::new(OnceLock::new()),
+            federated_facade: false,
             cache_max_bytes: cache_max_bytes(),
             local_writes,
             fresh_cache: false,
@@ -1540,6 +1820,30 @@ impl VexClient {
         store_path: &Path,
     ) -> Result<Self, VexConfigError> {
         Self::from_store_path_and_config(store_path, config)
+    }
+
+    /// Bind another repository-scoped client to this checkout's single object
+    /// cache. Federated Home uses this for component prefetch/publication; it
+    /// does not create another store, workspace, or `.jj` directory.
+    pub fn from_config_with_cache_root(
+        config: VexRepoConfig,
+        cache_root: PathBuf,
+    ) -> Result<Self, VexConfigError> {
+        Self::validate_endpoint(&config.endpoint)?;
+        fs::create_dir_all(&cache_root)?;
+        let local_writes = config.local_writes;
+        Ok(Self {
+            config,
+            cache_root: Some(cache_root),
+            repo_path: None,
+            federated_read_routes: Arc::new(OnceLock::new()),
+            federated_facade: false,
+            cache_max_bytes: cache_max_bytes(),
+            local_writes,
+            fresh_cache: false,
+            pack_resident_override: None,
+            presigned_get_disabled: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Like [`Self::from_store_path`], but forces `object_read_mode` after
@@ -1594,9 +1898,13 @@ impl VexClient {
         let cache_root = shared_cache_root(&config).unwrap_or_else(|| repo_path.join("vex-cache"));
         fs::create_dir_all(&cache_root)?;
         let local_writes = config.local_writes;
+        let federated_facade = VexFederatedHomeConfig::metadata_path_for_repo(repo_path).is_file();
         Ok(Self {
             config,
             cache_root: Some(cache_root),
+            repo_path: Some(repo_path.to_path_buf()),
+            federated_read_routes: Arc::new(OnceLock::new()),
+            federated_facade,
             cache_max_bytes: cache_max_bytes(),
             local_writes,
             fresh_cache: false,
@@ -1607,6 +1915,240 @@ impl VexClient {
 
     pub fn config(&self) -> &VexRepoConfig {
         &self.config
+    }
+
+    pub fn cache_root(&self) -> Option<&Path> {
+        self.cache_root.as_deref()
+    }
+
+    fn federated_read_routes(&self) -> Result<&[VexRepoConfig], VexClientError> {
+        if let Some(routes) = self.federated_read_routes.get() {
+            return Ok(routes);
+        }
+        let Some(repo_path) = self.repo_path.as_deref() else {
+            return Ok(&[]);
+        };
+        let Some(flat_home) = VexFederatedHomeConfig::load_from_repo_path(repo_path)? else {
+            // Clone persists the config only after synthesizing the flat base.
+            // Do not memoize absence: this same backend remains live for the
+            // initial checkout and must discover the routes if pruning causes
+            // a miss after persistence.
+            return Ok(&[]);
+        };
+        if flat_home.home().repository_id != self.config.repo_id {
+            return Err(VexConfigError::InvalidFederatedHome(format!(
+                "hidden Home repository {} does not match the checkout backend {}",
+                flat_home.home().repository_id,
+                self.config.repo_id
+            ))
+            .into());
+        }
+        let routes = flat_home
+            .repositories
+            .iter()
+            .skip(1)
+            .map(|repository| flat_home.repository_config(&self.config, repository))
+            .collect::<Vec<_>>();
+        for route in &routes {
+            Self::validate_endpoint(&route.endpoint)?;
+        }
+        // Another concurrent read may have initialized the same immutable
+        // routes. Either value was derived from the same validated hidden
+        // config, so use the winner.
+        drop(self.federated_read_routes.set(routes));
+        Ok(self
+            .federated_read_routes
+            .get()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]))
+    }
+
+    fn supports_federated_object_fallback(kind: ObjectKind) -> bool {
+        matches!(
+            kind,
+            ObjectKind::Blob | ObjectKind::Symlink | ObjectKind::Tree | ObjectKind::Commit
+        )
+    }
+
+    fn is_not_found(error: &VexClientError) -> bool {
+        matches!(error, VexClientError::Status(status) if status.code() == tonic::Code::NotFound)
+    }
+
+    /// Fetch the exact canonical manifest selected by the backend's durable
+    /// current pointer. The response digest is checked against both the bytes
+    /// received and Rust's canonical serde encoding before it can be persisted.
+    pub async fn get_current_federated_home_manifest(
+        &self,
+    ) -> Result<VexFederatedHomeManifestResponse, VexClientError> {
+        let response =
+            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+                client
+                    .get_federated_home_manifest(Self::auth_request(
+                        GetFederatedHomeManifestRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            selection: Some(FederatedHomeManifestSelection::Current(true)),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            })?;
+        let bytes_digest = ContentId::hash_bytes(&response.manifest_json).to_hex();
+        if bytes_digest != response.manifest_content_sha256 {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "backend manifest response digest does not match its bytes".to_string(),
+            )
+            .into());
+        }
+        let manifest: FederatedHomeManifest =
+            serde_json::from_slice(&response.manifest_json).map_err(VexConfigError::Json)?;
+        manifest.validate().map_err(|_| {
+            VexConfigError::InvalidFederatedHome("Home manifest path layout is invalid".to_string())
+        })?;
+        let canonical_digest = manifest
+            .content_sha256()
+            .map_err(|error| VexConfigError::InvalidFederatedHome(error.to_string()))?;
+        let canonical_suffix = manifest
+            .artifact_suffix()
+            .map_err(|error| VexConfigError::InvalidFederatedHome(error.to_string()))?;
+        if canonical_digest != response.manifest_content_sha256
+            || canonical_suffix != response.manifest_artifact_suffix
+        {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "backend manifest response is not canonical Rust serde JSON".to_string(),
+            )
+            .into());
+        }
+        require_current_federated_home_manifest(response.is_current)?;
+        let pointer = response.current_pointer.as_ref().ok_or_else(|| {
+            VexConfigError::InvalidFederatedHome(
+                "backend omitted the current-manifest pointer".to_string(),
+            )
+        })?;
+        validate_federated_home_pointer(
+            pointer,
+            &response.manifest_artifact_suffix,
+            &response.manifest_content_sha256,
+            None,
+        )?;
+        Ok(VexFederatedHomeManifestResponse {
+            manifest_artifact_suffix: response.manifest_artifact_suffix,
+            manifest_content_sha256: response.manifest_content_sha256,
+            manifest_generation: pointer.generation,
+            manifest,
+        })
+    }
+
+    /// Ask the backend to deterministically route a flat facade diff through
+    /// the exact manifest artifact cloned into this workspace. Hidden local
+    /// metadata supplies credentials only; it never decides path ownership.
+    pub async fn plan_federated_home_submit(
+        &self,
+        manifest: &FederatedHomeManifest,
+        manifest_artifact_suffix: &str,
+        manifest_generation: u64,
+        changes: Vec<VexFederatedHomePathChange>,
+    ) -> Result<VexFederatedHomeSubmitPlanResponse, VexClientError> {
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| {
+            let changes = changes.clone();
+            async move {
+                client
+                    .plan_federated_home_submit(Self::auth_request(
+                        PlanFederatedHomeSubmitRequest {
+                            tenant_id: self.config.tenant_id.clone(),
+                            repo_id: self.config.repo_id.clone(),
+                            manifest_artifact_suffix: manifest_artifact_suffix.to_string(),
+                            changes: changes
+                                .into_iter()
+                                .map(|change| ProtoFederatedHomePathChange {
+                                    path: change.path,
+                                    operation: match change.operation {
+                                        VexFederatedHomeOperationKind::Delete => {
+                                            ProtoFederatedHomeSubmitOperationKind::Delete as i32
+                                        }
+                                        VexFederatedHomeOperationKind::Upsert => {
+                                            ProtoFederatedHomeSubmitOperationKind::Upsert as i32
+                                        }
+                                    },
+                                })
+                                .collect(),
+                            // Cross-owner renames are intentionally already
+                            // represented as source delete + destination upsert.
+                            renames: Vec::new(),
+                        },
+                        self.config.access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            }
+        })?;
+        require_current_federated_home_manifest(response.manifest_is_current)?;
+        let expected_digest = manifest
+            .content_sha256()
+            .map_err(|error| VexConfigError::InvalidFederatedHome(error.to_string()))?;
+        if response.manifest_artifact_suffix != manifest_artifact_suffix
+            || response.manifest_content_sha256 != expected_digest
+        {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "backend submit plan does not identify the checkout manifest".to_string(),
+            )
+            .into());
+        }
+        let pointer = response.current_pointer.as_ref().ok_or_else(|| {
+            VexConfigError::InvalidFederatedHome(
+                "backend submit plan omitted the current-manifest pointer".to_string(),
+            )
+        })?;
+        validate_federated_home_pointer(
+            pointer,
+            manifest_artifact_suffix,
+            &expected_digest,
+            Some(manifest_generation),
+        )?;
+        let plan: VexFederatedHomeSubmitPlan = serde_json::from_slice(&response.submit_plan_json)
+            .map_err(|error| {
+            VexConfigError::InvalidFederatedHome(format!(
+                "cannot decode backend submit plan: {error}"
+            ))
+        })?;
+        plan.validate_resolved_targets(manifest).map_err(|_| {
+            VexConfigError::InvalidFederatedHome(
+                "Home submit plan does not match this checkout or lacks target CAS state"
+                    .to_string(),
+            )
+        })?;
+        let required_capabilities = plan
+            .partitions
+            .iter()
+            .filter(|partition| !partition.operations.is_empty())
+            .map(|partition| partition.repository_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut stage_capabilities = HashMap::with_capacity(response.partition_capabilities.len());
+        for capability in response.partition_capabilities {
+            if capability.repository_id.is_empty()
+                || capability.capability.is_empty()
+                || !required_capabilities.contains(capability.repository_id.as_str())
+                || stage_capabilities
+                    .insert(capability.repository_id, capability.capability)
+                    .is_some()
+            {
+                return Err(VexConfigError::InvalidFederatedHome(
+                    "backend returned invalid Home staging capabilities".to_string(),
+                )
+                .into());
+            }
+        }
+        if stage_capabilities.len() != required_capabilities.len() {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "backend omitted a Home staging capability".to_string(),
+            )
+            .into());
+        }
+        Ok(VexFederatedHomeSubmitPlanResponse {
+            plan,
+            stage_capabilities,
+        })
     }
 
     /// Whether this client is in local-write mode (READ_ONLY CI runner): writes
@@ -2064,22 +2606,21 @@ impl VexClient {
         let target_bytes = limit_bytes.saturating_mul(9).saturating_div(10);
         let mut removed_files = 0_u64;
         let mut reclaimed_bytes = 0_u64;
-        // Staged objects are the *only* copy of work that has not been pushed
-        // yet, so they are not evictable — a prune that dropped one would leave
-        // a marker naming bytes nobody holds, and `vex push` would have to
-        // refuse. Read once: the set is empty on the overwhelmingly common
-        // path, and it is bounded by what one session has left unpushed.
-        let staged: HashSet<PathBuf> = self
+        // Staged objects are the only copy of unpublished work. Federated pins
+        // are the only durable copy of synthetic facade state, which is never
+        // published by design. Neither class is evictable.
+        let protected: HashSet<PathBuf> = self
             .staged_objects()
             .unwrap_or_default()
             .into_iter()
+            .chain(self.pinned_federated_objects().unwrap_or_default())
             .filter_map(|(kind, content_id)| self.cache_path(kind, &content_id))
             .collect();
         for entry in entries {
             if total_bytes <= target_bytes {
                 break;
             }
-            if staged.contains(&entry.path) {
+            if protected.contains(&entry.path) {
                 continue;
             }
             if fs::remove_file(&entry.path).is_ok() {
@@ -3785,15 +4326,28 @@ impl VexClient {
     /// able to finish without contacting the backend at all, and the objects it
     /// wrote must still be uploadable by a *later* process. Set
     /// `VEX_BATCH_SNAPSHOT_UPLOADS=0` (or `false`/`no`) to fall back to
-    /// immediate per-object PUTs. Never staged in local-write mode, where puts
-    /// stay local by design and are never published at all.
-    fn stage_writes_enabled(&self) -> bool {
-        if self.local_writes {
+    /// immediate per-object PUTs for an ordinary physical checkout. A
+    /// federated Home facade always stages: its signed Plan/Stage flow is the
+    /// only write boundary, and generic object PUTs are deliberately denied.
+    /// Never staged in local-write mode, where puts stay local by design and
+    /// are never published at all.
+    fn staged_object_writes_enabled(
+        local_writes: bool,
+        federated_facade: bool,
+        batch_override: Option<&str>,
+    ) -> bool {
+        if local_writes {
             return false;
         }
-        !matches!(
-            std::env::var("VEX_BATCH_SNAPSHOT_UPLOADS").ok().as_deref(),
-            Some("0") | Some("false") | Some("no")
+        federated_facade || !matches!(batch_override, Some("0") | Some("false") | Some("no"))
+    }
+
+    fn stage_writes_enabled(&self) -> bool {
+        let batch_override = std::env::var("VEX_BATCH_SNAPSHOT_UPLOADS").ok();
+        Self::staged_object_writes_enabled(
+            self.local_writes,
+            self.federated_facade,
+            batch_override.as_deref(),
         )
     }
 
@@ -3813,6 +4367,21 @@ impl VexClient {
 
     fn staged_marker_path(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PathBuf> {
         self.staged_marker_root()
+            .map(|root| root.join(kind_to_str(kind)).join(content_id.to_string()))
+    }
+
+    /// Local-only facade objects are never published, but remain part of the
+    /// editable flat working copy after aggregate acceptance. Their pins are
+    /// separate from staged-upload markers so pruning preserves the bytes
+    /// without making any later publication path consider them uploadable.
+    fn federated_pin_root(&self) -> Option<PathBuf> {
+        self.cache_root
+            .as_ref()
+            .map(|root| root.join(".federated-pins"))
+    }
+
+    fn federated_pin_path(&self, kind: ObjectKind, content_id: &ContentId) -> Option<PathBuf> {
+        self.federated_pin_root()
             .map(|root| root.join(kind_to_str(kind)).join(content_id.to_string()))
     }
 
@@ -3857,10 +4426,21 @@ impl VexClient {
     /// Every object currently staged for upload, read off disk. Includes work
     /// staged by earlier processes, which is the whole point.
     fn staged_objects(&self) -> Result<Vec<(ObjectKind, ContentId)>, VexClientError> {
-        let Some(root) = self.staged_marker_root() else {
+        self.object_markers(self.staged_marker_root())
+    }
+
+    fn pinned_federated_objects(&self) -> Result<Vec<(ObjectKind, ContentId)>, VexClientError> {
+        self.object_markers(self.federated_pin_root())
+    }
+
+    fn object_markers(
+        &self,
+        root: Option<PathBuf>,
+    ) -> Result<Vec<(ObjectKind, ContentId)>, VexClientError> {
+        let Some(root) = root else {
             return Ok(Vec::new());
         };
-        let mut staged = Vec::new();
+        let mut objects = Vec::new();
         let kind_dirs = match fs::read_dir(&root) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3884,13 +4464,13 @@ impl VexClient {
                 else {
                     continue;
                 };
-                staged.push((kind, content_id));
+                objects.push((kind, content_id));
             }
         }
         // Deterministic order so a failed upload retries the same way and so
         // logs of two runs are comparable.
-        staged.sort_by_key(|(kind, id)| (kind_to_str(*kind), id.to_hex()));
-        Ok(staged)
+        objects.sort_by_key(|(kind, id)| (kind_to_str(*kind), id.to_hex()));
+        Ok(objects)
     }
 
     /// Upload everything staged for this repo, then drop its markers.
@@ -3908,6 +4488,12 @@ impl VexClient {
     /// This is a blocking call (it drives the shared gRPC runtime) and must not
     /// be invoked from within that runtime.
     pub fn upload_staged_objects(&self) -> Result<usize, VexClientError> {
+        if self.federated_facade {
+            return Err(VexClientError::StagedObjectsMissing(
+                "ordinary object publication is disabled for a Home checkout; use `vex submit`"
+                    .to_string(),
+            ));
+        }
         let staged = self.staged_objects()?;
         if staged.is_empty() {
             return Ok(0);
@@ -3957,11 +4543,251 @@ impl VexClient {
         Ok(uploaded)
     }
 
+    /// Publish an explicit content-addressed closure from this client's bound
+    /// cache. Replays are safe because `PutObjects` is create-if-missing. This
+    /// path deliberately preserves ordinary staged markers: one cached object
+    /// can be required by both a component closure and the Home facade, and the
+    /// marker is not repository-scoped.
+    pub fn upload_cached_objects(
+        &self,
+        objects: impl IntoIterator<Item = VexObjectId>,
+    ) -> Result<usize, VexClientError> {
+        let mut seen = HashSet::new();
+        let mut objects = objects
+            .into_iter()
+            .filter(|object| seen.insert(*object))
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| {
+            kind_to_str(left.0)
+                .cmp(kind_to_str(right.0))
+                .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
+        });
+        if objects.is_empty() {
+            return Ok(0);
+        }
+
+        let mut uploaded = 0usize;
+        let mut missing = Vec::new();
+        let mut wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> = Vec::new();
+        let mut batch: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::new();
+        let mut batch_bytes = 0usize;
+        for (kind, content_id) in objects {
+            let Some(data) = self.read_cached_object(kind, &content_id) else {
+                missing.push((kind, content_id));
+                continue;
+            };
+            batch_bytes += data.len();
+            batch.push((kind, content_id, data));
+            if batch.len() >= PENDING_FLUSH_OBJECTS || batch_bytes >= PENDING_FLUSH_BYTES {
+                wave.push(std::mem::take(&mut batch));
+                batch_bytes = 0;
+            }
+            if wave.len() >= STAGED_UPLOAD_CONCURRENCY {
+                uploaded +=
+                    self.upload_wave(std::mem::take(&mut wave), StagedMarkerPolicy::Preserve)?;
+            }
+        }
+        if !batch.is_empty() {
+            wave.push(batch);
+        }
+        if !wave.is_empty() {
+            uploaded += self.upload_wave(wave, StagedMarkerPolicy::Preserve)?;
+        }
+        if let Some((kind, content_id)) = missing.first() {
+            return Err(VexClientError::StagedObjectsMissing(format!(
+                "{} object(s) in the submit closure are missing from the flat Home cache (first: {}/{}); refresh or reclone before submitting",
+                missing.len(),
+                kind_to_str(*kind),
+                content_id
+            )));
+        }
+        Ok(uploaded)
+    }
+
+    /// Stage one exact planned physical child closure for a flat Home submit.
+    ///
+    /// Unlike [`Self::upload_cached_objects`], this sends one bounded request
+    /// to the dedicated capability endpoint and never falls back to generic
+    /// `PutObjects`. Staged markers remain until Rails accepts the single
+    /// aggregate operation and the caller retires them explicitly.
+    pub fn stage_federated_home_submit_partition(
+        &self,
+        partition_capability: &str,
+        proposed_child_commit: &ContentId,
+        objects: impl IntoIterator<Item = VexObjectId>,
+    ) -> Result<usize, VexClientError> {
+        let mut objects = objects.into_iter().collect::<Vec<_>>();
+        objects.sort_by(|left, right| {
+            kind_to_str(left.0)
+                .cmp(kind_to_str(right.0))
+                .then_with(|| left.1.to_hex().cmp(&right.1.to_hex()))
+        });
+        if objects.len() > MAX_FEDERATED_HOME_STAGE_OBJECTS {
+            return Err(VexConfigError::InvalidFederatedHome(format!(
+                "flat Home staged-write request has {} objects (maximum {MAX_FEDERATED_HOME_STAGE_OBJECTS})",
+                objects.len(),
+            ))
+            .into());
+        }
+        let mut seen = HashSet::with_capacity(objects.len());
+        let mut inline = Vec::with_capacity(objects.len());
+        let mut total_bytes = 0usize;
+        for (kind, content_id) in objects {
+            if !seen.insert((kind, content_id)) {
+                return Err(VexConfigError::InvalidFederatedHome(
+                    "Home child closure repeats one object".to_string(),
+                )
+                .into());
+            }
+            let data = self.read_cached_object(kind, &content_id).ok_or_else(|| {
+                VexClientError::StagedObjectsMissing(format!(
+                    "a planned Home child object is missing from the local cache: {}/{}",
+                    kind_to_str(kind),
+                    content_id
+                ))
+            })?;
+            total_bytes = total_bytes.checked_add(data.len()).ok_or_else(|| {
+                VexConfigError::InvalidFederatedHome(
+                    "flat Home staged-write inline byte count overflow".to_string(),
+                )
+            })?;
+            if total_bytes > MAX_FEDERATED_HOME_STAGE_BYTES {
+                return Err(VexConfigError::InvalidFederatedHome(format!(
+                    "flat Home staged-write request has {total_bytes} bytes (maximum {MAX_FEDERATED_HOME_STAGE_BYTES})",
+                ))
+                .into());
+            }
+            inline.push(InlineObject {
+                object: Some(ObjectId {
+                    kind: kind_to_str(kind).to_string(),
+                    content_id: content_id.to_hex(),
+                }),
+                data,
+            });
+        }
+        let proposed_child_commit = *proposed_child_commit;
+        if !seen.contains(&(ObjectKind::Commit, proposed_child_commit)) {
+            return Err(VexConfigError::InvalidFederatedHome(
+                "Home child closure omits its proposed commit".to_string(),
+            )
+            .into());
+        }
+        let response = Self::block_on_grpc_retry(&self.config.endpoint, 3, |mut client| {
+            let tenant_id = self.config.tenant_id.clone();
+            let repo_id = self.config.repo_id.clone();
+            let capability = partition_capability.to_string();
+            let objects = inline.clone();
+            let token = self.config.access_token.clone();
+            async move {
+                client
+                    .stage_federated_home_submit_partition(Self::auth_request(
+                        StageFederatedHomeSubmitPartitionRequest {
+                            tenant_id,
+                            repo_id,
+                            partition_capability: capability,
+                            proposed_child_commit_id: proposed_child_commit.to_hex(),
+                            objects,
+                        },
+                        token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            }
+        })?;
+        if !response.ok {
+            return Err(VexClientError::Status(tonic::Status::internal(
+                "backend rejected a federated Home stage without a status",
+            )));
+        }
+        Ok(response.stored_count as usize)
+    }
+
+    /// Protect exact local-only flat facade objects from cache eviction without
+    /// making them eligible for upload. Call this after the aggregate API
+    /// accepts a federated submit and before retiring its staged markers.
+    pub fn pin_local_federated_objects(
+        &self,
+        objects: impl IntoIterator<Item = VexObjectId>,
+    ) -> Result<usize, VexClientError> {
+        let mut seen = HashSet::new();
+        let mut objects = objects
+            .into_iter()
+            .filter(|object| seen.insert(*object))
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|(kind, content_id)| (kind_to_str(*kind), content_id.to_hex()));
+        let missing = objects
+            .iter()
+            .filter(|(kind, content_id)| {
+                self.cache_path(*kind, content_id)
+                    .is_none_or(|path| !path.is_file())
+            })
+            .collect::<Vec<_>>();
+        if let Some((kind, content_id)) = missing.first() {
+            return Err(VexClientError::StagedObjectsMissing(format!(
+                "{} local Home object(s) are missing (first: {}/{}); retry or reclone Home before finalizing submit",
+                missing.len(),
+                kind_to_str(*kind),
+                content_id
+            )));
+        }
+
+        let mut pinned = 0;
+        for (kind, content_id) in objects {
+            let Some(path) = self.federated_pin_path(kind, &content_id) else {
+                continue;
+            };
+            if path.is_file() {
+                continue;
+            }
+            let parent = path.parent().expect("federated pin has a parent");
+            fs::create_dir_all(parent)?;
+            let temporary = NamedTempFile::new_in(parent)?;
+            temporary.as_file().sync_all()?;
+            temporary.persist(path).map_err(|error| error.error)?;
+            pinned += 1;
+        }
+        Ok(pinned)
+    }
+
+    /// Retire only the exact staged markers whose federated owner uploads were
+    /// acknowledged and whose single Home orchestration request succeeded.
+    /// No bytes are uploaded here, and unrelated staged work is never scanned
+    /// or cleared.
+    pub fn retire_staged_objects(
+        &self,
+        objects: impl IntoIterator<Item = VexObjectId>,
+    ) -> Result<usize, VexClientError> {
+        let mut seen = HashSet::new();
+        let mut retired = 0;
+        for (kind, content_id) in objects {
+            if !seen.insert((kind, content_id)) {
+                continue;
+            }
+            let Some(path) = self.staged_marker_path(kind, &content_id) else {
+                continue;
+            };
+            match fs::remove_file(path) {
+                Ok(()) => retired += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(retired)
+    }
+
     /// Upload one wave of batches concurrently over the shared connection and
     /// drop the markers of everything it acknowledged.
     fn upload_staged_wave(
         &self,
         wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
+    ) -> Result<usize, VexClientError> {
+        self.upload_wave(wave, StagedMarkerPolicy::Remove)
+    }
+
+    fn upload_wave(
+        &self,
+        wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
+        marker_policy: StagedMarkerPolicy,
     ) -> Result<usize, VexClientError> {
         let ids: Vec<(ObjectKind, ContentId)> = wave
             .iter()
@@ -4013,15 +4839,22 @@ impl VexClient {
                 })
                 .await
         }))?;
-        // Now — and only now — is "cached ⟹ uploaded" true for these objects
-        // again, so the markers may go. A failure to unlink is harmless: the
-        // next push re-uploads, which is free.
-        for (kind, content_id) in &ids {
+        self.apply_uploaded_marker_policy(&ids, marker_policy);
+        Ok(ids.len())
+    }
+
+    fn apply_uploaded_marker_policy(&self, ids: &[VexObjectId], marker_policy: StagedMarkerPolicy) {
+        if marker_policy == StagedMarkerPolicy::Preserve {
+            return;
+        }
+        // Now — and only now — is "cached ⟹ uploaded" true for the repository
+        // whose ordinary staged publication is running, so its markers may go.
+        // A failure to unlink is harmless: the next push re-uploads.
+        for (kind, content_id) in ids {
             if let Some(path) = self.staged_marker_path(*kind, content_id) {
                 drop(fs::remove_file(path));
             }
         }
-        Ok(ids.len())
     }
 
     pub async fn put_object(
@@ -4300,39 +5133,91 @@ impl VexClient {
         kind: ObjectKind,
         content_id: &ContentId,
     ) -> Result<Vec<u8>, VexClientError> {
+        self.get_object_with_fetch(kind, content_id, |config, kind, content_id| async move {
+            Self::fetch_object_grpc_verified_for_config(&config, kind, &content_id).await
+        })
+        .await
+    }
+
+    async fn get_object_with_fetch<F, Fut>(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+        mut fetch: F,
+    ) -> Result<Vec<u8>, VexClientError>
+    where
+        F: FnMut(VexRepoConfig, ObjectKind, ContentId) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>, VexClientError>>,
+    {
         let _t = RpcTimer::start(|| format!("get_object/{}", kind_to_str(kind)));
         if let Some(bytes) = self.read_cached_object(kind, content_id) {
             vex_client_stats().record_get_object_cache_hit(kind);
             return Ok(bytes);
         }
-        let bytes = self.fetch_object_grpc_verified(kind, content_id).await?;
-        // A cache hit is assumed present-on-server (see `has_cached_object`)
-        // and is never re-verified; the fetch above hash-verified the bytes,
-        // so they may enter the cache.
-        self.write_cached_object(kind, content_id, &bytes)?;
-        Ok(bytes)
+        let primary_error = match fetch(self.config.clone(), kind, *content_id).await {
+            Ok(bytes) => {
+                self.write_cached_object(kind, content_id, &bytes)?;
+                return Ok(bytes);
+            }
+            Err(error)
+                if Self::supports_federated_object_fallback(kind) && Self::is_not_found(&error) =>
+            {
+                error
+            }
+            Err(error) => return Err(error),
+        };
+        let mut first_route_error = None;
+        for route in self.federated_read_routes()? {
+            debug!(
+                kind = kind_to_str(kind),
+                %content_id,
+                repository_id = %route.repo_id,
+                "flat Home cache miss; trying immutable physical owner fallback"
+            );
+            match fetch(route.clone(), kind, *content_id).await {
+                Ok(bytes) => {
+                    self.write_cached_object(kind, content_id, &bytes)?;
+                    return Ok(bytes);
+                }
+                Err(error) if Self::is_not_found(&error) => {}
+                Err(error) => {
+                    // An earlier unrelated component may have an expired token
+                    // or transient endpoint failure. Keep searching exact
+                    // physical routes for the immutable content id, but report
+                    // the first real route failure if no owner can serve it.
+                    first_route_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_route_error.unwrap_or(primary_error))
     }
 
-    /// gRPC `GetObject` plus content-hash verification, *without* touching the
-    /// local cache. [`Self::get_object`] layers the cache on top; pack-chunk
-    /// fallback reads use this directly, since chunk bytes belong in the
-    /// transfer's `.part` file, not the loose cache.
     async fn fetch_object_grpc_verified(
         &self,
         kind: ObjectKind,
         content_id: &ContentId,
     ) -> Result<Vec<u8>, VexClientError> {
-        debug!(kind = kind_to_str(kind), %content_id, "vex cache miss");
+        Self::fetch_object_grpc_verified_for_config(&self.config, kind, content_id).await
+    }
+
+    /// gRPC `GetObject` plus content-hash verification for one exact physical
+    /// route, without touching the local cache.
+    async fn fetch_object_grpc_verified_for_config(
+        config: &VexRepoConfig,
+        kind: ObjectKind,
+        content_id: &ContentId,
+    ) -> Result<Vec<u8>, VexClientError> {
+        debug!(kind = kind_to_str(kind), %content_id, repository_id = %config.repo_id, "vex cache miss");
         vex_client_stats().record_get_object_rpc(kind);
         // Own every captured value so the fetch future is `Send + 'static` and can
         // be spawned onto the shared runtime. This is what lets `check_out`'s
         // `.buffered(concurrency())` actually run reads in parallel instead of
         // serializing them behind a per-object `block_on` (see `grpc_retry_async`).
-        let repo_id = self.config.repo_id.clone();
-        let access_token = self.config.access_token.clone();
+        let repo_id = config.repo_id.clone();
+        let access_token = config.access_token.clone();
         let kind_str = kind_to_str(kind).to_string();
         let content_id_str = content_id.to_string();
-        let bytes = Self::grpc_retry_async(&self.config.endpoint, 5, move |mut client| {
+        let bytes = Self::grpc_retry_async(&config.endpoint, 5, move |mut client| {
             let repo_id = repo_id.clone();
             let access_token = access_token.clone();
             let kind_str = kind_str.clone();
@@ -4354,12 +5239,6 @@ impl VexClient {
             }
         })
         .await?;
-        // Verify content addressing before the bytes are used anywhere: a
-        // cache hit is assumed present-on-server (see `has_cached_object`) and
-        // is never re-verified, so nothing unverified may be written. This
-        // also keeps `hydrate_one_batch` honest — an inline object that failed
-        // its hash check is refetched through here and must not slip into the
-        // cache unchecked on the second try.
         if ContentId::hash_bytes(&bytes) != *content_id {
             return Err(VexClientError::Status(tonic::Status::data_loss(format!(
                 "object {}/{content_id} failed hash verification",
@@ -5609,6 +6488,23 @@ mod tests {
     }
 
     #[test]
+    fn federated_facade_ignores_the_generic_upload_opt_out() {
+        for batch_override in [Some("0"), Some("false"), Some("no")] {
+            assert!(VexClient::staged_object_writes_enabled(
+                false,
+                true,
+                batch_override
+            ));
+            assert!(!VexClient::staged_object_writes_enabled(
+                false,
+                false,
+                batch_override
+            ));
+        }
+        assert!(!VexClient::staged_object_writes_enabled(true, true, None));
+    }
+
+    #[test]
     fn a_client_version_is_sent_verbatim_including_a_dev_build_suffix() {
         for version in [
             "1.0.0",
@@ -5751,6 +6647,46 @@ mod tests {
             object_read_mode: VexObjectReadMode::NativeOnly,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn flat_home_stage_client_matches_the_server_512_object_and_32_mib_bounds() {
+        let client = sample_client();
+        let proposed_commit = ContentId::from_bytes([1; 32]);
+        let error = client
+            .stage_federated_home_submit_partition(
+                "test-capability",
+                &proposed_commit,
+                std::iter::repeat((ObjectKind::Blob, ContentId::from_bytes([2; 32])))
+                    .take(MAX_FEDERATED_HOME_STAGE_OBJECTS + 1),
+            )
+            .expect_err("the client must not send a 513-object Home stage request");
+        assert!(matches!(
+            error,
+            VexClientError::Config(VexConfigError::InvalidFederatedHome(message))
+                if message.contains("512")
+        ));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = sample_client();
+        client.cache_root = Some(temp_dir.path().to_path_buf());
+        let data = vec![0; MAX_FEDERATED_HOME_STAGE_BYTES + 1];
+        let blob_id = ContentId::hash_bytes(&data);
+        client
+            .write_cached_object_no_prune(ObjectKind::Blob, &blob_id, &data)
+            .unwrap();
+        let error = client
+            .stage_federated_home_submit_partition(
+                "test-capability",
+                &proposed_commit,
+                [(ObjectKind::Blob, blob_id)],
+            )
+            .expect_err("the client must not send a Home closure above 32 MiB");
+        assert!(matches!(
+            error,
+            VexClientError::Config(VexConfigError::InvalidFederatedHome(message))
+                if message.contains(&MAX_FEDERATED_HOME_STAGE_BYTES.to_string())
+        ));
     }
 
     #[test]
@@ -7576,6 +8512,298 @@ mod tests {
         // The marker is deliberately left in place: dropping it would turn a
         // loud failure into a silent one on the next push.
         assert!(client.has_staged_object(ObjectKind::Commit, &content_id));
+    }
+
+    #[test]
+    fn component_closure_acknowledgement_preserves_a_shared_home_marker() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut home = pack_resident_client(temp_dir.path(), false);
+        home.config.repo_id = "41".to_string();
+        let data = b"object required by Home and component".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        futures::executor::block_on(home.put_object(ObjectKind::Blob, &content_id, data)).unwrap();
+        let closure = [(ObjectKind::Blob, content_id)];
+        assert!(home.has_staged_object(ObjectKind::Blob, &content_id));
+
+        let mut component = home.clone();
+        component.config.repo_id = "57".to_string();
+        component.apply_uploaded_marker_policy(&closure, StagedMarkerPolicy::Preserve);
+        assert!(
+            home.has_staged_object(ObjectKind::Blob, &content_id),
+            "component publication must not hide the object from Home staged publication"
+        );
+
+        home.apply_uploaded_marker_policy(&closure, StagedMarkerPolicy::Remove);
+        assert!(
+            !home.has_staged_object(ObjectKind::Blob, &content_id),
+            "the ordinary Home publication owns marker removal after acknowledgement"
+        );
+    }
+
+    #[test]
+    fn exact_marker_retirement_leaves_unrelated_staged_work() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), false);
+        client.config.repo_id = "41".to_string();
+        let accepted_data = b"accepted federated child".to_vec();
+        let accepted_id = ContentId::hash_bytes(&accepted_data);
+        let unrelated_data = b"unrelated later work".to_vec();
+        let unrelated_id = ContentId::hash_bytes(&unrelated_data);
+        futures::executor::block_on(client.put_object(
+            ObjectKind::Commit,
+            &accepted_id,
+            accepted_data,
+        ))
+        .unwrap();
+        futures::executor::block_on(client.put_object(
+            ObjectKind::Blob,
+            &unrelated_id,
+            unrelated_data,
+        ))
+        .unwrap();
+
+        let retired = client
+            .retire_staged_objects([(ObjectKind::Commit, accepted_id)])
+            .unwrap();
+
+        assert_eq!(retired, 1);
+        assert!(!client.has_staged_object(ObjectKind::Commit, &accepted_id));
+        assert!(
+            client.has_staged_object(ObjectKind::Blob, &unrelated_id),
+            "aggregate success must not clear an unrelated global marker"
+        );
+    }
+
+    #[test]
+    fn accepted_facade_pin_survives_marker_retirement_and_cache_pruning() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), false);
+        client.config.repo_id = "41".to_string();
+        client.cache_max_bytes = Some(1);
+        let facade_data = b"local synthetic aggregate commit".to_vec();
+        let facade_id = ContentId::hash_bytes(&facade_data);
+        futures::executor::block_on(client.put_object(
+            ObjectKind::Commit,
+            &facade_id,
+            facade_data.clone(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            client
+                .pin_local_federated_objects([(ObjectKind::Commit, facade_id)])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            client
+                .retire_staged_objects([(ObjectKind::Commit, facade_id)])
+                .unwrap(),
+            1
+        );
+        assert!(!client.has_staged_object(ObjectKind::Commit, &facade_id));
+
+        let evictable_data = b"ordinary server-backed cache entry";
+        let evictable_id = ContentId::hash_bytes(evictable_data);
+        client
+            .write_cached_object(ObjectKind::Blob, &evictable_id, evictable_data)
+            .unwrap();
+
+        assert_eq!(
+            client.read_cached_object(ObjectKind::Commit, &facade_id),
+            Some(facade_data),
+            "a local facade object stays readable after its upload marker is retired"
+        );
+    }
+
+    fn write_flat_home_read_fallback_fixture(
+        workspace_root: &Path,
+    ) -> (PathBuf, VexFederatedHomeConfig) {
+        let repo_path = workspace_root.join(".jj/repo");
+        let store_path = repo_path.join("store");
+        fs::create_dir_all(&store_path).unwrap();
+        let mut home_config = sample_client().config;
+        home_config.repo_id = "9001".to_string();
+        home_config.repo_slug = "home".to_string();
+        home_config.repository_scope_kind = Some("composed".to_string());
+        home_config.access_token = Some("vexhome_aggregate".to_string());
+        home_config.write_to_repo_path(&repo_path).unwrap();
+        let mut manifest = FederatedHomeManifest {
+            format_version: VEX_FEDERATED_HOME_FORMAT_VERSION,
+            home_repository_id: "9001".to_string(),
+            home_bookmark: "main".to_string(),
+            home_revision: ContentId::from_bytes([1; 32]),
+            components: vec![jj_backend_types::FederatedHomeComponent {
+                repository_id: "9002".to_string(),
+                root_path: "apps/web".to_string(),
+                selected_bookmark: "main".to_string(),
+                selected_revision: ContentId::from_bytes([2; 32]),
+            }],
+            path_owners: Vec::new(),
+        };
+        manifest.path_owners = manifest.canonical_path_owners();
+        let flat_home = VexFederatedHomeConfig {
+            format_version: VEX_FEDERATED_HOME_FORMAT_VERSION,
+            manifest_artifact_suffix: manifest.artifact_suffix().unwrap(),
+            manifest_content_sha256: manifest.content_sha256().unwrap(),
+            manifest_generation: 3,
+            manifest,
+            aggregate_access_token: "vexhome_aggregate".to_string(),
+            repositories: vec![
+                VexFederatedHomeRepository {
+                    repository_id: "9001".to_string(),
+                    repository_public_id: "repository_home".to_string(),
+                    repository_slug: "home".to_string(),
+                    root_path: String::new(),
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                },
+                VexFederatedHomeRepository {
+                    repository_id: "9002".to_string(),
+                    repository_public_id: "repository_web".to_string(),
+                    repository_slug: "web".to_string(),
+                    root_path: "apps/web".to_string(),
+                    endpoint: "http://127.0.0.1:2".to_string(),
+                },
+            ],
+            aggregate_base_commit_id: Some(ContentId::from_bytes([3; 32])),
+        };
+        flat_home.write_to_repo_path(&repo_path).unwrap();
+        (store_path, flat_home)
+    }
+
+    #[test]
+    fn evicted_component_object_is_read_through_its_hidden_physical_route() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path().join("home");
+        let (store_path, _flat_home) = write_flat_home_read_fallback_fixture(&workspace_root);
+        let client = VexClient::from_store_path(&store_path).unwrap();
+        let data = b"component blob restored after eviction".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        client
+            .write_cached_object_no_prune(ObjectKind::Blob, &content_id, &data)
+            .unwrap();
+        let cache_path = client.cache_path(ObjectKind::Blob, &content_id).unwrap();
+        fs::remove_file(&cache_path).unwrap();
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let restored = futures::executor::block_on(client.get_object_with_fetch(
+            ObjectKind::Blob,
+            &content_id,
+            {
+                let attempts = Arc::clone(&attempts);
+                let data = data.clone();
+                move |config, _kind, _content_id| {
+                    let attempts = Arc::clone(&attempts);
+                    let data = data.clone();
+                    async move {
+                        attempts.lock().unwrap().push((
+                            config.repo_id.clone(),
+                            config.access_token.clone().unwrap_or_default(),
+                        ));
+                        if config.repo_id == "9002" {
+                            Ok(data)
+                        } else {
+                            Err(VexClientError::Status(tonic::Status::not_found(
+                                "object is not in physical Home",
+                            )))
+                        }
+                    }
+                }
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(restored, data);
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![
+                ("9001".to_string(), "vexhome_aggregate".to_string()),
+                ("9002".to_string(), "vexhome_aggregate".to_string()),
+            ]
+        );
+        assert_eq!(fs::read(cache_path).unwrap(), data);
+        assert!(!workspace_root.join("apps/web/.jj").exists());
+        assert!(!workspace_root.join(".gitmodules").exists());
+    }
+
+    #[test]
+    fn ordinary_push_refuses_a_flat_facade_without_consuming_markers() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().join("repo");
+        let store_path = repo_path.join("store");
+        fs::create_dir_all(&store_path).unwrap();
+        let config = sample_client().config;
+        config.write_to_repo_path(&repo_path).unwrap();
+        fs::write(
+            VexFederatedHomeConfig::metadata_path_for_repo(&repo_path),
+            b"{}",
+        )
+        .unwrap();
+        let client = VexClient::from_store_path(&store_path).unwrap();
+        let data = b"local facade commit".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        futures::executor::block_on(client.put_object(ObjectKind::Commit, &content_id, data))
+            .unwrap();
+
+        let error = client.upload_staged_objects().unwrap_err();
+
+        assert!(error.to_string().contains("disabled for a Home checkout"));
+        assert!(
+            client.has_staged_object(ObjectKind::Commit, &content_id),
+            "the refusal must preserve the facade marker for federated retry"
+        );
+    }
+
+    #[test]
+    fn federated_pointer_requires_exact_positive_clone_generation() {
+        let pointer = jj_backend_api::FederatedHomeManifestPointer {
+            format_version: VEX_FEDERATED_HOME_FORMAT_VERSION,
+            generation: 11,
+            manifest_artifact_suffix: "federated-home/v1/digest.json".to_string(),
+            manifest_content_sha256: "digest".to_string(),
+        };
+
+        validate_federated_home_pointer(
+            &pointer,
+            "federated-home/v1/digest.json",
+            "digest",
+            Some(11),
+        )
+        .unwrap();
+        let stale = validate_federated_home_pointer(
+            &pointer,
+            "federated-home/v1/digest.json",
+            "digest",
+            Some(10),
+        )
+        .unwrap_err();
+        assert!(stale.to_string().contains("generation changed since clone"));
+
+        let mut incoherent = pointer;
+        incoherent.generation = 0;
+        let error = validate_federated_home_pointer(
+            &incoherent,
+            "federated-home/v1/digest.json",
+            "digest",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pointer is incoherent"));
+    }
+
+    #[test]
+    fn backend_non_current_manifest_is_stale() {
+        let error = require_current_federated_home_manifest(false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed since this checkout was cloned")
+        );
     }
 
     /// Whoever publishes a repository's staged objects has to bind to the same
