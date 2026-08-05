@@ -46,6 +46,7 @@ use jj_backend_api::InlineObject;
 use jj_backend_api::ObjectId;
 use jj_backend_api::PutObjectRequest;
 use jj_backend_api::PutObjectsRequest;
+use jj_backend_api::RefNaming;
 use jj_backend_api::ResolveOperationIdPrefixRequest;
 use jj_backend_api::ResolveRefsRequest;
 use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
@@ -4830,6 +4831,7 @@ impl VexClient {
                             tenant_id: self.config.tenant_id.clone(),
                             repo_id: self.config.repo_id.clone(),
                             names: vec![name.to_string()],
+                            naming: RefNaming::Legacy as i32,
                         },
                         self.config.access_token.as_deref(),
                     )?)
@@ -4859,6 +4861,7 @@ impl VexClient {
                             tenant_id: self.config.tenant_id.clone(),
                             repo_id: self.config.repo_id.clone(),
                             names: names.to_vec(),
+                            naming: RefNaming::Legacy as i32,
                         },
                         self.config.access_token.as_deref(),
                     )?)
@@ -4886,6 +4889,7 @@ impl VexClient {
                             repo_id: self.config.repo_id.clone(),
                             prefix: prefix.to_string(),
                             resolve_git_target_class: false,
+                            naming: RefNaming::Legacy as i32,
                         },
                         self.config.access_token.as_deref(),
                     )?)
