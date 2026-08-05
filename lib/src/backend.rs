@@ -645,6 +645,31 @@ pub trait Backend: Any + Send + Sync + Debug {
         Ok(())
     }
 
+    /// Fetches tree objects into any backend-owned local cache.
+    ///
+    /// The commit counterpart above exists because a caller that knows many
+    /// commit ids up front can pay one round trip instead of one per object.
+    /// Nothing about that is commit-shaped: a caller walking history level by
+    /// level knows a whole level's tree ids at once, and against a networked
+    /// backend the level is otherwise a round trip per tree.
+    ///
+    /// **Advisory.** A prefetch warms a cache and returns no data, so a caller
+    /// must treat a failure as "not warmed" and read normally; a backend
+    /// without a local cache keeps the default no-op.
+    async fn prefetch_trees(&self, _ids: &[TreeId]) -> BackendResult<()> {
+        Ok(())
+    }
+
+    /// Fetches file objects into any backend-owned local cache. See
+    /// [`Backend::prefetch_trees`]; likewise advisory.
+    ///
+    /// Note the asymmetry with [`Backend::read_file`], which takes a path: the
+    /// path is there for error messages and for backends that key on it, and a
+    /// prefetch names only content, so nothing here needs one.
+    async fn prefetch_files(&self, _ids: &[FileId]) -> BackendResult<()> {
+        Ok(())
+    }
+
     /// Writes a commit and returns its ID and the commit itself. The commit
     /// should contain the data that was actually written, which may differ
     /// from the data passed in. For example, the backend may change the

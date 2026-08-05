@@ -191,6 +191,14 @@ impl Backend for SecretBackend {
         self.inner.prefetch_commits(ids).await
     }
 
+    async fn prefetch_trees(&self, ids: &[TreeId]) -> BackendResult<()> {
+        self.inner.prefetch_trees(ids).await
+    }
+
+    async fn prefetch_files(&self, ids: &[FileId]) -> BackendResult<()> {
+        self.inner.prefetch_files(ids).await
+    }
+
     async fn write_commit(
         &self,
         contents: Commit,

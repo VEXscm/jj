@@ -161,6 +161,18 @@ impl Store {
         self.backend.prefetch_commits(ids).await
     }
 
+    /// Warm the backend's local cache with these trees. Advisory: see
+    /// [`Backend::prefetch_trees`].
+    pub async fn prefetch_trees(&self, ids: &[TreeId]) -> BackendResult<()> {
+        self.backend.prefetch_trees(ids).await
+    }
+
+    /// Warm the backend's local cache with these files. Advisory: see
+    /// [`Backend::prefetch_files`].
+    pub async fn prefetch_files(&self, ids: &[FileId]) -> BackendResult<()> {
+        self.backend.prefetch_files(ids).await
+    }
+
     async fn get_backend_commit(&self, id: &CommitId) -> BackendResult<Arc<backend::Commit>> {
         {
             let mut locked_cache = self.commit_cache.lock().unwrap();

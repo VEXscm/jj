@@ -1091,6 +1091,61 @@ impl Backend for VexBackend {
         Ok(())
     }
 
+    /// The same seam as [`Self::prefetch_commits`], under a different kind.
+    ///
+    /// `get_objects_inline_batched` takes the [`jj_backend_types::ObjectKind`]
+    /// as a parameter and writes every object it verifies into the same local
+    /// cache `read_tree` consults through [`Self::read_object_bytes`], so one
+    /// batched `GetObjectsInline` turns a level's worth of later `read_tree`
+    /// calls into local disk reads. Nothing about the batching was ever
+    /// commit-specific; `prefetch_commits` was simply its only caller.
+    ///
+    /// The empty tree is filtered out for the reason the root commit is above:
+    /// `read_tree` answers it locally without ever asking the server, so
+    /// including it asks for an object that need not exist as stored bytes.
+    async fn prefetch_trees(&self, ids: &[TreeId]) -> BackendResult<()> {
+        let ids = ids
+            .iter()
+            .filter(|id| *id != &self.empty_tree_id)
+            .map(|id| {
+                to_content_id(&id.to_bytes(), &id.object_type())
+                    .map(|content_id| (jj_backend_types::ObjectKind::Tree, content_id, None))
+            })
+            .collect::<BackendResult<Vec<_>>>()?;
+        self.client
+            .get_objects_inline_batched(ids, None)
+            .await
+            .map_err(|error| BackendError::ReadObject {
+                object_type: "tree batch".to_string(),
+                hash: "multiple trees".to_string(),
+                source: Box::new(error),
+            })?;
+        Ok(())
+    }
+
+    /// See [`Self::prefetch_trees`]. A warmed blob is doubly worth having:
+    /// [`Self::read_file`] streams a *cache hit* from the on-disk file through
+    /// `open_cached_object` and only buffers the whole body on a miss, so
+    /// prefetching lowers peak memory as well as latency.
+    async fn prefetch_files(&self, ids: &[FileId]) -> BackendResult<()> {
+        let ids = ids
+            .iter()
+            .map(|id| {
+                to_content_id(&id.to_bytes(), &id.object_type())
+                    .map(|content_id| (jj_backend_types::ObjectKind::Blob, content_id, None))
+            })
+            .collect::<BackendResult<Vec<_>>>()?;
+        self.client
+            .get_objects_inline_batched(ids, None)
+            .await
+            .map_err(|error| BackendError::ReadObject {
+                object_type: "file batch".to_string(),
+                hash: "multiple files".to_string(),
+                source: Box::new(error),
+            })?;
+        Ok(())
+    }
+
     async fn write_commit(
         &self,
         mut commit: Commit,
