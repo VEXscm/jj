@@ -4885,6 +4885,7 @@ impl VexClient {
                             tenant_id: self.config.tenant_id.clone(),
                             repo_id: self.config.repo_id.clone(),
                             prefix: prefix.to_string(),
+                            resolve_git_target_class: false,
                         },
                         self.config.access_token.as_deref(),
                     )?)
