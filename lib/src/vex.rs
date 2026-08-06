@@ -58,9 +58,10 @@ use jj_backend_api::VirtualRepositoryMount as ProtoVirtualRepositoryMount;
 use jj_backend_api::get_federated_home_manifest_request::Selection as FederatedHomeManifestSelection;
 use jj_backend_api::jj_backend_client::JjBackendClient;
 use jj_backend_types::{
-    CloneManifest, ContentId, FederatedHomeManifest, HydrationPackManifest, ObjectKind,
+    CloneManifest, ContentId, FederatedHomeManifest, HydrationPackManifest, ObjectKind, ObjectPack,
     ObjectPackEntry, decode_object_pack, decode_object_pack_reader,
-    decode_object_pack_with_visitor, decode_pack_chunk_entries, parse_pack_header,
+    decode_object_pack_with_visitor, decode_pack_chunk_entries, encode_object_pack,
+    parse_pack_header,
 };
 pub use jj_backend_types::{
     ContentId as VexContentId, FederatedHomeComponent as VexFederatedHomeComponent,
@@ -5157,6 +5158,189 @@ impl VexClient {
             max_batch_bytes,
         );
         self.put_object_batches_pipelined(batches, concurrency).await
+    }
+
+    /// Encode object batches as compressed VXPK packs and upload with bounded
+    /// concurrency via `PutObjectPack`. Falls back to
+    /// [`Self::put_object_batches_pipelined`] when the backend does not yet
+    /// implement the pack RPC (older edges return Unimplemented/Unknown).
+    pub async fn put_object_packs_pipelined(
+        &self,
+        batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        let packs: Vec<Vec<u8>> = batches
+            .into_iter()
+            .filter(|batch| !batch.is_empty())
+            .map(|batch| {
+                let objects = batch
+                    .into_iter()
+                    .map(|(kind, content_id, data)| ObjectPackEntry {
+                        kind,
+                        content_id,
+                        data,
+                    })
+                    .collect();
+                encode_object_pack(&ObjectPack { objects })
+            })
+            .collect();
+        if packs.is_empty() {
+            return Ok(());
+        }
+
+        match self.put_object_pack_bytes_pipelined(packs.clone(), concurrency).await {
+            Ok(()) => Ok(()),
+            Err(err) if Self::is_unimplemented_pack_upload(&err) => {
+                debug!(
+                    error = %err,
+                    "PutObjectPack unavailable; falling back to PutObjects batches"
+                );
+                let batches = packs
+                    .into_iter()
+                    .map(|pack_bytes| {
+                        let pack = decode_object_pack(&pack_bytes).map_err(|e| {
+                            VexClientError::Io(std::io::Error::other(format!(
+                                "re-decode pack after fallback: {e}"
+                            )))
+                        })?;
+                        Ok(pack
+                            .objects
+                            .into_iter()
+                            .map(|entry| (entry.kind, entry.content_id, entry.data))
+                            .collect::<Vec<_>>())
+                    })
+                    .collect::<Result<Vec<_>, VexClientError>>()?;
+                self.put_object_batches_pipelined(batches, concurrency).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Pipelined file-blob upload using compressed packs (import hot path).
+    pub async fn put_file_blobs_packed_pipelined(
+        &self,
+        blobs: Vec<Vec<u8>>,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+        concurrency: usize,
+    ) -> Result<Vec<crate::backend::FileId>, VexClientError> {
+        let mut ids = Vec::with_capacity(blobs.len());
+        let mut batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> = Vec::new();
+        let mut current: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::new();
+        let mut current_bytes = 0usize;
+        let max_objects = max_batch_objects.max(1);
+        for data in blobs {
+            let content_id = Self::blob_content_id(&data);
+            ids.push(crate::backend::FileId::new(content_id.as_bytes().to_vec()));
+            current_bytes += data.len();
+            current.push((ObjectKind::Blob, content_id, data));
+            if current.len() >= max_objects || current_bytes >= max_batch_bytes {
+                batches.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+        self.put_object_packs_pipelined(batches, concurrency).await?;
+        Ok(ids)
+    }
+
+    pub async fn put_tree_blobs_packed_pipelined(
+        &self,
+        blobs: Vec<Vec<u8>>,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        let batches =
+            Self::split_object_batches(blobs, ObjectKind::Tree, max_batch_objects, max_batch_bytes);
+        self.put_object_packs_pipelined(batches, concurrency).await
+    }
+
+    pub async fn put_commit_blobs_packed_pipelined(
+        &self,
+        blobs: Vec<Vec<u8>>,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        let batches = Self::split_object_batches(
+            blobs,
+            ObjectKind::Commit,
+            max_batch_objects,
+            max_batch_bytes,
+        );
+        self.put_object_packs_pipelined(batches, concurrency).await
+    }
+
+    fn is_unimplemented_pack_upload(err: &VexClientError) -> bool {
+        matches!(
+            err,
+            VexClientError::Status(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::Unimplemented | tonic::Code::Unknown | tonic::Code::NotFound
+                )
+        )
+    }
+
+    async fn put_object_pack_bytes_pipelined(
+        &self,
+        packs: Vec<Vec<u8>>,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        if packs.is_empty() {
+            return Ok(());
+        }
+        let initial_channel = match Self::cached_channel(&self.config.endpoint) {
+            Ok(channel) => Some(channel),
+            Err(err) if Self::is_transient_pipelined_put_error(&err) => None,
+            Err(err) => return Err(err),
+        };
+        let endpoint = self.config.endpoint.clone();
+        let repo_id = self.config.repo_id.clone();
+        let token = self.config.access_token.clone();
+        let concurrency = concurrency.max(1);
+        Self::shared_grpc_runtime().block_on(async move {
+            use futures::stream::TryStreamExt as _;
+            futures::stream::iter(packs.into_iter().map(Ok::<_, VexClientError>))
+                .try_for_each_concurrent(concurrency, |pack_data| {
+                    let initial_channel = initial_channel.clone();
+                    let endpoint = endpoint.clone();
+                    let repo_id = repo_id.clone();
+                    let token = token.clone();
+                    async move {
+                        Self::retry_pipelined_put_batch(move |use_initial_channel| {
+                            let endpoint = endpoint.clone();
+                            let initial_channel = initial_channel.clone();
+                            let repo_id = repo_id.clone();
+                            let token = token.clone();
+                            let pack_data = pack_data.clone();
+                            async move {
+                                let channel = match (use_initial_channel, initial_channel) {
+                                    (true, Some(channel)) => channel,
+                                    _ => Self::endpoint(&endpoint)?.connect().await?,
+                                };
+                                JjBackendClient::new(channel)
+                                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                                    .put_object_pack(Self::auth_request(
+                                        jj_backend_api::PutObjectPackRequest {
+                                            repo_id,
+                                            pack_data,
+                                        },
+                                        token.as_deref(),
+                                    )?)
+                                    .await?;
+                                Ok(())
+                            }
+                        })
+                        .await
+                    }
+                })
+                .await
+        })
     }
 
     fn split_object_batches(
