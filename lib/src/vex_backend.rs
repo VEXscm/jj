@@ -484,11 +484,32 @@ impl VexBackend {
     fn new(client: VexClient) -> Self {
         let empty_tree_proto = tree_to_proto(&Tree::default()).encode_to_vec();
         let empty_tree_id = TreeId::new(sha256_bytes(&empty_tree_proto).to_vec());
+        // Prefer the explicit projection root. Older virtual-repo clones only
+        // wrote a single `virtual_mounts` entry (with the monorepo folder path)
+        // and left `virtual_root_path` empty — fall back so those checkouts
+        // still remount the folder at the working-copy root.
         let virtual_root_path = client
             .config()
             .virtual_root_path
             .as_deref()
+            .map(str::trim)
             .filter(|path| !path.is_empty() && *path != ".")
+            .or_else(|| {
+                match client.config().virtual_mounts.as_slice() {
+                    [mount]
+                        if client.config().repository_scope_kind.as_deref()
+                            == Some("virtual_repository") =>
+                    {
+                        let path = mount.root_path.trim();
+                        if path.is_empty() || path == "." {
+                            None
+                        } else {
+                            Some(path)
+                        }
+                    }
+                    _ => None,
+                }
+            })
             .and_then(|path| RepoPathBuf::from_internal_string(path.to_string()).ok());
         let object_read_mode = client.config().object_read_mode;
         Self {
@@ -549,14 +570,127 @@ impl VexBackend {
             return Ok(root_tree);
         };
 
-        let mut tree = root_tree;
+        // Monorepo-shaped trees (from trunk) have `apps/musiccore/...` and need
+        // projection. Working-copy snapshots used to write a *virtual-shaped*
+        // tree with those files already at the root — walking the monorepo
+        // path on them finds nothing and used to return an empty tree, so the
+        // next status reported every file as deleted. If any path component is
+        // missing, treat the tree as already projected and return it unchanged.
+        // New commits re-nest on write (see {@link Self::write_commit}).
+        let mut tree = root_tree.clone();
         for component in virtual_root_path.components() {
             let Some(TreeValue::Tree(child_tree_id)) = tree.value(component).cloned() else {
-                return Ok(Tree::default());
+                return Ok(root_tree);
             };
             tree = self.read_physical_tree(&child_tree_id).await?;
         }
         Ok(tree)
+    }
+
+    /// True when `tree` already has the monorepo folder layout for this
+    /// virtual root (first path component is a subdirectory).
+    fn looks_monorepo_shaped(&self, tree: &Tree) -> bool {
+        let Some(virtual_root_path) = &self.virtual_root_path else {
+            return true;
+        };
+        let Some(first) = virtual_root_path.components().next() else {
+            return true;
+        };
+        matches!(tree.value(first), Some(TreeValue::Tree(_)))
+    }
+
+    async fn physical_root_tree_of(&self, commit_id: &CommitId) -> BackendResult<Tree> {
+        if commit_id == &self.root_commit_id {
+            return Ok(Tree::default());
+        }
+        let commit = self.read_commit(commit_id).await?;
+        let tree_id = commit.root_tree.as_resolved().ok_or_else(|| {
+            BackendError::Other(std::io::Error::other("conflicted parent root tree").into())
+        })?;
+        self.read_physical_tree(tree_id).await
+    }
+
+    /// Persist a tree without virtual-root remapping (used when building the
+    /// monorepo-shaped graft wrappers).
+    async fn write_tree_bytes(&self, tree: &Tree) -> BackendResult<TreeId> {
+        let data = tree_to_proto(tree).encode_to_vec();
+        let content_id = self
+            .write_object_bytes(jj_backend_types::ObjectKind::Tree, "tree", data)
+            .await?;
+        Ok(TreeId::new(content_id.as_bytes().to_vec()))
+    }
+
+    /// Replace the monorepo subtree at `virtual_root_path` with `projected`,
+    /// preserving every sibling path from `monorepo_root`. Built bottom-up so
+    /// the async body is not recursive.
+    async fn graft_projected_into_monorepo(
+        &self,
+        monorepo_root: Tree,
+        projected: Tree,
+    ) -> BackendResult<TreeId> {
+        let Some(virtual_root_path) = &self.virtual_root_path else {
+            return self.write_tree_bytes(&projected).await;
+        };
+        let components: Vec<RepoPathComponentBuf> = virtual_root_path
+            .components()
+            .map(|component| component.to_owned())
+            .collect();
+        if components.is_empty() {
+            return self.write_tree_bytes(&projected).await;
+        }
+
+        // Walk down, recording each monorepo tree along the path.
+        let mut stack: Vec<(Tree, RepoPathComponentBuf)> = Vec::with_capacity(components.len());
+        let mut current = monorepo_root;
+        for component in &components {
+            let child = match current.value(component.as_ref()).cloned() {
+                Some(TreeValue::Tree(id)) => self.read_physical_tree(&id).await?,
+                _ => Tree::default(),
+            };
+            stack.push((current, component.clone()));
+            current = child;
+        }
+
+        // Replace the leaf with the projected tree, then rewrite parents up.
+        let mut child_id = self.write_tree_bytes(&projected).await?;
+        while let Some((parent, component)) = stack.pop() {
+            let mut entries: BTreeMap<RepoPathComponentBuf, TreeValue> = parent
+                .entries()
+                .map(|entry| (entry.name().to_owned(), entry.value().clone()))
+                .collect();
+            entries.insert(component, TreeValue::Tree(child_id));
+            let new_tree = Tree::from_sorted_entries(entries.into_iter().collect());
+            child_id = self.write_tree_bytes(&new_tree).await?;
+        }
+        Ok(child_id)
+    }
+
+    /// Working-copy snapshots produce virtual-shaped root trees (files at the
+    /// WC root). Before a commit is stored, re-nest that content under the
+    /// monorepo folder and graft it onto the parent monorepo tree so submit
+    /// scope checks and landing see `apps/musiccore/...` paths.
+    async fn unproject_commit_root_tree(&self, commit: &mut Commit) -> BackendResult<()> {
+        if self.virtual_root_path.is_none() {
+            return Ok(());
+        }
+        let Some(projected_id) = commit.root_tree.as_resolved() else {
+            // Conflicted root trees are rare for virtual checkouts; leave as-is.
+            return Ok(());
+        };
+        let projected = self.read_physical_tree(projected_id).await?;
+        if self.looks_monorepo_shaped(&projected) {
+            return Ok(());
+        }
+
+        let parent_id = commit.parents.first().ok_or_else(|| {
+            BackendError::Other(std::io::Error::other("commit has no parents").into())
+        })?;
+        let parent_tree = self.physical_root_tree_of(parent_id).await?;
+        let grafted_id = self
+            .graft_projected_into_monorepo(parent_tree, projected)
+            .await?;
+        commit.root_tree = Merge::resolved(grafted_id);
+        Ok(())
     }
 
     /// Resolve one raw Git SHA-1 to its native content ID through the
@@ -967,6 +1101,8 @@ impl Backend for VexBackend {
                 std::io::Error::other("Cannot write a commit with no parents").into(),
             ));
         }
+
+        self.unproject_commit_root_tree(&mut commit).await?;
 
         let mut proto = commit_to_proto(&commit);
         if let Some(sign) = sign_with {
