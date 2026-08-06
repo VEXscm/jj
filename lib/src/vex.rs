@@ -5116,6 +5116,20 @@ impl VexClient {
         self.put_objects(objects).await
     }
 
+    /// Like [`Self::put_tree_blobs`] but splits into size-limited batches and
+    /// keeps several `PutObjects` RPCs in flight (same pipelining as file blobs).
+    pub async fn put_tree_blobs_pipelined(
+        &self,
+        blobs: Vec<Vec<u8>>,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        let batches =
+            Self::split_object_batches(blobs, ObjectKind::Tree, max_batch_objects, max_batch_bytes);
+        self.put_object_batches_pipelined(batches, concurrency).await
+    }
+
     /// Bulk-upload pre-serialized commit objects (canonical bytes).
     pub async fn put_commit_blobs(&self, blobs: Vec<Vec<u8>>) -> Result<(), VexClientError> {
         let objects = blobs
@@ -5126,6 +5140,48 @@ impl VexClient {
             })
             .collect();
         self.put_objects(objects).await
+    }
+
+    /// Like [`Self::put_commit_blobs`] with pipelined multi-batch upload.
+    pub async fn put_commit_blobs_pipelined(
+        &self,
+        blobs: Vec<Vec<u8>>,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+        concurrency: usize,
+    ) -> Result<(), VexClientError> {
+        let batches = Self::split_object_batches(
+            blobs,
+            ObjectKind::Commit,
+            max_batch_objects,
+            max_batch_bytes,
+        );
+        self.put_object_batches_pipelined(batches, concurrency).await
+    }
+
+    fn split_object_batches(
+        blobs: Vec<Vec<u8>>,
+        kind: ObjectKind,
+        max_batch_objects: usize,
+        max_batch_bytes: usize,
+    ) -> Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> {
+        let max_objects = max_batch_objects.max(1);
+        let mut batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> = Vec::new();
+        let mut current: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::new();
+        let mut current_bytes = 0usize;
+        for data in blobs {
+            let content_id = Self::blob_content_id(&data);
+            current_bytes += data.len();
+            current.push((kind, content_id, data));
+            if current.len() >= max_objects || current_bytes >= max_batch_bytes {
+                batches.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+        batches
     }
 
     pub async fn get_object(
@@ -5725,6 +5781,10 @@ impl VexClient {
     /// mapping-ref lookups (e.g. materialization git<->native identity maps)
     /// where a `resolve_ref`-per-name loop would be one network round trip
     /// per row.
+    ///
+    /// Uses the spawned-task [`Self::grpc_retry_async`] path so concurrent
+    /// callers (pipelined mapping chunks) actually overlap on the shared
+    /// runtime instead of serializing behind a blocking `block_on`.
     pub async fn resolve_refs(
         &self,
         names: &[String],
@@ -5732,21 +5792,31 @@ impl VexClient {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let response =
-            Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
+        let names = names.to_vec();
+        let tenant_id = self.config.tenant_id.clone();
+        let repo_id = self.config.repo_id.clone();
+        let access_token = self.config.access_token.clone();
+        let response = Self::grpc_retry_async(&self.config.endpoint, 5, move |mut client| {
+            let names = names.clone();
+            let tenant_id = tenant_id.clone();
+            let repo_id = repo_id.clone();
+            let access_token = access_token.clone();
+            async move {
                 client
                     .resolve_refs(Self::auth_request(
                         ResolveRefsRequest {
-                            tenant_id: self.config.tenant_id.clone(),
-                            repo_id: self.config.repo_id.clone(),
-                            names: names.to_vec(),
+                            tenant_id,
+                            repo_id,
+                            names,
                             naming: RefNaming::Legacy as i32,
                         },
-                        self.config.access_token.as_deref(),
+                        access_token.as_deref(),
                     )?)
                     .await
                     .map(|response| response.into_inner())
-            })?;
+            }
+        })
+        .await?;
         Ok(response.refs)
     }
 
@@ -5787,6 +5857,9 @@ impl VexClient {
     /// retry at the call site is safe to re-send verbatim. Returns an error
     /// if the backend rejects the batch (CAS conflict or validation failure);
     /// the message is the backend's `error_message`.
+    ///
+    /// Uses the spawned-task [`Self::grpc_once_async`] path so concurrent
+    /// callers (pipelined mapping chunks) can keep several updates in flight.
     pub async fn update_refs(
         &self,
         updates: Vec<jj_backend_api::RefUpdate>,
@@ -5794,20 +5867,30 @@ impl VexClient {
         if updates.is_empty() {
             return Ok(());
         }
-        let response = Self::block_on_grpc(&self.config.endpoint, |mut client| async move {
-            client
-                .update_refs(Self::auth_request(
-                    jj_backend_api::UpdateRefsRequest {
-                        tenant_id: self.config.tenant_id.clone(),
-                        repo_id: self.config.repo_id.clone(),
-                        updates,
-                        policy_lease: String::new(),
-                    },
-                    self.config.access_token.as_deref(),
-                )?)
-                .await
-                .map(|response| response.into_inner())
-        })?;
+        let tenant_id = self.config.tenant_id.clone();
+        let repo_id = self.config.repo_id.clone();
+        let access_token = self.config.access_token.clone();
+        let response = Self::grpc_once_async(&self.config.endpoint, move |mut client| {
+            let tenant_id = tenant_id;
+            let repo_id = repo_id;
+            let access_token = access_token;
+            let updates = updates;
+            async move {
+                client
+                    .update_refs(Self::auth_request(
+                        jj_backend_api::UpdateRefsRequest {
+                            tenant_id,
+                            repo_id,
+                            updates,
+                            policy_lease: String::new(),
+                        },
+                        access_token.as_deref(),
+                    )?)
+                    .await
+                    .map(|response| response.into_inner())
+            }
+        })
+        .await?;
         if response.ok {
             Ok(())
         } else {
