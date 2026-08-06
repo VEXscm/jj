@@ -1951,7 +1951,15 @@ async fn hydrate_start_commit_blobs(
             return None;
         }
     };
-    let (ids, file_count) = match clone_vex_hydration_ids(repo, start_commit).await {
+    let walk_started = std::time::Instant::now();
+    let walk = clone_vex_hydration_ids(repo, start_commit).await;
+    crate::vex::vex_client_stats()
+        .hydration_walk_ms
+        .fetch_add(
+            walk_started.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    let (ids, file_count) = match walk {
         Ok(walk) => walk,
         Err(err) => {
             tracing::warn!(

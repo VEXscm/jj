@@ -539,6 +539,14 @@ pub struct VexClientStats {
     /// Wall-clock milliseconds spent in the serial per-object `GetObject`
     /// loop that tails the clone-manifest prefetch.
     pub pack_loose_object_ms: AtomicU64,
+    /// Wall-clock milliseconds awaiting `GetHydrationPacks` — the single
+    /// request in which the server builds (or serves) the blob packs a lazy
+    /// clone checks out. Separated from `pack_download_ms` because a cache
+    /// miss here is server-side pack construction, not transfer.
+    pub hydration_manifest_ms: AtomicU64,
+    /// Wall-clock milliseconds walking the start commit's trees to collect the
+    /// blob/symlink ids the hydration request asks for.
+    pub hydration_walk_ms: AtomicU64,
     /// `GetOpHeads` RPCs issued, including budgeted freshness refreshes
     /// (roadmap/088). Zero on the hot path of a converged local-first repo.
     pub op_head_rpcs: AtomicU64,
@@ -607,6 +615,8 @@ macro_rules! for_each_vex_client_stat {
             pack_download_ms,
             pack_unpack_ms,
             pack_loose_object_ms,
+            hydration_manifest_ms,
+            hydration_walk_ms,
             op_head_rpcs,
             op_head_local_serves,
             refresh_attempts,
@@ -664,6 +674,8 @@ pub struct VexClientStatsSnapshot {
     pub pack_download_ms: u64,
     pub pack_unpack_ms: u64,
     pub pack_loose_object_ms: u64,
+    pub hydration_manifest_ms: u64,
+    pub hydration_walk_ms: u64,
     pub op_head_rpcs: u64,
     pub op_head_local_serves: u64,
     pub refresh_attempts: u64,
@@ -6245,6 +6257,13 @@ impl VexClient {
             .collect();
         let repo_id = self.config.repo_id.clone();
         let access_token = self.config.access_token.clone();
+        // Timed: this single request can dominate clone wall time (the server
+        // builds the blob packs on the request path when its manifest cache
+        // misses), and until it was measured the cost was invisible in both
+        // `VEX_RPC_TIMING` and the bench phase breakdown.
+        let object_count = objects.len();
+        let started = std::time::Instant::now();
+        let _t = RpcTimer::start(|| format!("get_hydration_packs[{object_count}]"));
         let response = Self::grpc_once_async(&self.config.endpoint, move |mut client| async move {
             client
                 .get_hydration_packs(Self::auth_request(
@@ -6258,6 +6277,9 @@ impl VexClient {
                 .map(|response| response.into_inner())
         })
         .await?;
+        vex_client_stats()
+            .hydration_manifest_ms
+            .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         serde_json::from_slice(&response.manifest_json)
             .map_err(VexConfigError::Json)
             .map_err(Into::into)
