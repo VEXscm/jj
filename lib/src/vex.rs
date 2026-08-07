@@ -133,8 +133,9 @@ where
 /// Sleep usable from a non-tokio (pollster-style) executor: the timer runs as
 /// a task on the shared gRPC runtime and its `JoinHandle` is awaited — a
 /// cooperative yield, mirroring `grpc_retry_async`. Used by the clone's
-/// materializing-progress ticker, whose caller executor has no timer driver.
-pub(crate) async fn shared_runtime_sleep(duration: Duration) {
+/// materializing-progress ticker and by CLI retry backoffs, whose caller
+/// executors have no timer driver of their own.
+pub async fn shared_runtime_sleep(duration: Duration) {
     let handle = VexClient::shared_grpc_runtime().spawn(tokio::time::sleep(duration));
     drop(handle.await);
 }
@@ -2876,6 +2877,15 @@ impl VexClient {
                 | tonic::Code::Aborted
                 | tonic::Code::ResourceExhausted
         )
+    }
+
+    /// [`Self::is_transient_client_error`] for callers outside this module that
+    /// drive their own retry loop because only they know the operation is safe
+    /// to repeat — `update_refs` deliberately does not retry itself (a blind
+    /// CAS retry is not generally safe), but a resolve-then-insert-absent
+    /// caller can repeat one idempotently.
+    pub fn is_transient_error(err: &VexClientError) -> bool {
+        Self::is_transient_client_error(err)
     }
 
     /// Whether a client error is a transient blip worth riding through (network
