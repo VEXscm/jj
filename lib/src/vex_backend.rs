@@ -494,21 +494,19 @@ impl VexBackend {
             .as_deref()
             .map(str::trim)
             .filter(|path| !path.is_empty() && *path != ".")
-            .or_else(|| {
-                match client.config().virtual_mounts.as_slice() {
-                    [mount]
-                        if client.config().repository_scope_kind.as_deref()
-                            == Some("virtual_repository") =>
-                    {
-                        let path = mount.root_path.trim();
-                        if path.is_empty() || path == "." {
-                            None
-                        } else {
-                            Some(path)
-                        }
+            .or_else(|| match client.config().virtual_mounts.as_slice() {
+                [mount]
+                    if client.config().repository_scope_kind.as_deref()
+                        == Some("virtual_repository") =>
+                {
+                    let path = mount.root_path.trim();
+                    if path.is_empty() || path == "." {
+                        None
+                    } else {
+                        Some(path)
                     }
-                    _ => None,
                 }
+                _ => None,
             })
             .and_then(|path| RepoPathBuf::from_internal_string(path.to_string()).ok());
         let object_read_mode = client.config().object_read_mode;

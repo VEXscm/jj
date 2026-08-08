@@ -69,7 +69,11 @@ impl TreeBuilder {
         self.override_path(path, Override::Tombstone)
     }
 
-    pub fn set_or_remove(&mut self, path: RepoPathBuf, value: Option<TreeValue>) -> BackendResult<()> {
+    pub fn set_or_remove(
+        &mut self,
+        path: RepoPathBuf,
+        value: Option<TreeValue>,
+    ) -> BackendResult<()> {
         match value {
             Some(value) => self.set(path, value),
             None => self.remove(path),

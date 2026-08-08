@@ -1960,12 +1960,10 @@ async fn hydrate_start_commit_blobs(
     };
     let walk_started = std::time::Instant::now();
     let walk = clone_vex_hydration_ids(repo, start_commit).await;
-    crate::vex::vex_client_stats()
-        .hydration_walk_ms
-        .fetch_add(
-            walk_started.elapsed().as_millis() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    crate::vex::vex_client_stats().hydration_walk_ms.fetch_add(
+        walk_started.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let (ids, file_count) = match walk {
         Ok(walk) => walk,
         Err(err) => {
@@ -2581,14 +2579,16 @@ mod tests {
                 (second_unchanged_path, second_blob),
                 (changed_path.clone(), old_changed),
             ] {
-                base_builder.set(
-                    path,
-                    TreeValue::File {
-                        id,
-                        executable: false,
-                        copy_id: CopyId::placeholder(),
-                    },
-                ).unwrap();
+                base_builder
+                    .set(
+                        path,
+                        TreeValue::File {
+                            id,
+                            executable: false,
+                            copy_id: CopyId::placeholder(),
+                        },
+                    )
+                    .unwrap();
             }
             let base_tree = base_builder.write_tree().await.unwrap();
             let base =
@@ -2610,14 +2610,16 @@ mod tests {
                 store.clone(),
                 base.tree_ids().as_resolved().unwrap().clone(),
             );
-            target_builder.set(
-                changed_path,
-                TreeValue::File {
-                    id: changed_blob.clone(),
-                    executable: false,
-                    copy_id: CopyId::placeholder(),
-                },
-            ).unwrap();
+            target_builder
+                .set(
+                    changed_path,
+                    TreeValue::File {
+                        id: changed_blob.clone(),
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                )
+                .unwrap();
             let target_tree = target_builder.write_tree().await.unwrap();
             let target = write_test_commit(&store, base.id().clone(), target_tree, 2).await;
             (base, target, unchanged_tree, unchanged_blob, changed_blob)
@@ -2652,14 +2654,16 @@ mod tests {
                 let home_blob = write_test_file(&store, &home_path, b"home").await;
                 let mut home_builder =
                     TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
-                home_builder.set(
-                    home_path,
-                    TreeValue::File {
-                        id: home_blob.clone(),
-                        executable: false,
-                        copy_id: CopyId::placeholder(),
-                    },
-                ).unwrap();
+                home_builder
+                    .set(
+                        home_path,
+                        TreeValue::File {
+                            id: home_blob.clone(),
+                            executable: false,
+                            copy_id: CopyId::placeholder(),
+                        },
+                    )
+                    .unwrap();
                 let home_tree = home_builder.write_tree().await.unwrap();
                 let home =
                     write_test_commit(&store, store.root_commit_id().clone(), home_tree, 3).await;
@@ -2668,24 +2672,28 @@ mod tests {
                 let component_blob = write_test_file(&store, &component_path, b"component").await;
                 let mut component_builder =
                     TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
-                component_builder.set(
-                    component_path,
-                    TreeValue::File {
-                        id: component_blob.clone(),
-                        executable: false,
-                        copy_id: CopyId::placeholder(),
-                    },
-                ).unwrap();
+                component_builder
+                    .set(
+                        component_path,
+                        TreeValue::File {
+                            id: component_blob.clone(),
+                            executable: false,
+                            copy_id: CopyId::placeholder(),
+                        },
+                    )
+                    .unwrap();
                 let component_tree = component_builder.write_tree().await.unwrap();
 
                 let mut aggregate_builder = TreeBuilder::new(
                     store.clone(),
                     home.tree_ids().as_resolved().unwrap().clone(),
                 );
-                aggregate_builder.set(
-                    repo_path("apps/web"),
-                    TreeValue::Tree(component_tree.clone()),
-                ).unwrap();
+                aggregate_builder
+                    .set(
+                        repo_path("apps/web"),
+                        TreeValue::Tree(component_tree.clone()),
+                    )
+                    .unwrap();
                 let aggregate_tree = aggregate_builder.write_tree().await.unwrap();
                 let synthetic =
                     write_test_commit(&store, home.id().clone(), aggregate_tree, 4).await;
@@ -2741,14 +2749,16 @@ mod tests {
             let path = repo_path("component/.jj/config");
             let file = write_test_file(&store, &path, b"nested metadata").await;
             let mut builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
-            builder.set(
-                path,
-                TreeValue::File {
-                    id: file,
-                    executable: false,
-                    copy_id: CopyId::placeholder(),
-                },
-            ).unwrap();
+            builder
+                .set(
+                    path,
+                    TreeValue::File {
+                        id: file,
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                )
+                .unwrap();
             let tree = builder.write_tree().await.unwrap();
             write_test_commit(&store, store.root_commit_id().clone(), tree, 5).await
         }
@@ -2777,14 +2787,16 @@ mod tests {
             let occupied = repo_path("apps/web");
             let file = write_test_file(&store, &occupied, b"Home collision").await;
             let mut home_builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
-            home_builder.set(
-                occupied,
-                TreeValue::File {
-                    id: file,
-                    executable: false,
-                    copy_id: CopyId::placeholder(),
-                },
-            ).unwrap();
+            home_builder
+                .set(
+                    occupied,
+                    TreeValue::File {
+                        id: file,
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                )
+                .unwrap();
             let home_tree = home_builder.write_tree().await.unwrap();
             let home =
                 write_test_commit(&store, store.root_commit_id().clone(), home_tree, 6).await;

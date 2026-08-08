@@ -464,12 +464,14 @@ impl TestTreeBuilder {
     pub fn symlink(&mut self, path: &RepoPath, target: &str) {
         let id = self.store.write_symlink(path, target).block_on().unwrap();
         self.tree_builder
-            .set(path.to_owned(), TreeValue::Symlink(id)).unwrap();
+            .set(path.to_owned(), TreeValue::Symlink(id))
+            .unwrap();
     }
 
     pub fn submodule(&mut self, path: &RepoPath, commit: CommitId) {
         self.tree_builder
-            .set(path.to_owned(), TreeValue::GitSubmodule(commit)).unwrap();
+            .set(path.to_owned(), TreeValue::GitSubmodule(commit))
+            .unwrap();
     }
 
     pub fn write_single_tree(self) -> Tree {
@@ -537,14 +539,16 @@ impl Drop for TestTreeFileEntryBuilder<'_> {
         } else {
             self.copy_id.clone()
         };
-        self.tree_builder.set(
-            path,
-            TreeValue::File {
-                id,
-                executable: self.executable,
-                copy_id,
-            },
-        ).unwrap();
+        self.tree_builder
+            .set(
+                path,
+                TreeValue::File {
+                    id,
+                    executable: self.executable,
+                    copy_id,
+                },
+            )
+            .unwrap();
     }
 }
 
