@@ -61,7 +61,7 @@ use jj_backend_types::{
     CloneManifest, ContentId, FederatedHomeManifest, HydrationPackManifest, ObjectKind, ObjectPack,
     ObjectPackEntry, decode_object_pack, decode_object_pack_reader,
     decode_object_pack_with_visitor, decode_pack_chunk_entries, encode_object_pack,
-    encode_object_pack_with_level, parse_pack_header,
+    parse_pack_header,
 };
 pub use jj_backend_types::{
     ContentId as VexContentId, FederatedHomeComponent as VexFederatedHomeComponent,
@@ -145,24 +145,7 @@ pub async fn shared_runtime_sleep(duration: Duration) {
 /// blob fetched inline via `GetObject` during checkout), so reads would fail
 /// with "decoded message length too large". The server already allows 64 MiB
 /// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
-use rayon::prelude::*;
-
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-/// Whole-pack zstd level for objects this client UPLOADS.
-///
-/// Higher than the `DEFAULT_PACK_COMPRESSION_LEVEL` of 3 because an import is
-/// bounded by the uplink, not the CPU: measured against a full Linux history
-/// the client sat at ~2% CPU while the link was the entire cost. The wire
-/// format is identical at every level, so nothing downstream changes.
-///
-/// Not 19, which was the tempting choice. Level 19 runs at single-digit MB/s
-/// per core, and a 186 GB history would spend longer compressing than it saves
-/// transmitting even across every core. This level keeps encode several times
-/// faster while still cutting bytes well below the default.
-const UPLOAD_PACK_COMPRESSION_LEVEL: i32 = 12;
-/// Content prefix used to cluster similar objects into the same pack, matching
-/// the backend's own clone-pack ordering.
-const SIMILARITY_PREFIX_BYTES: usize = 64;
 // Must match the backend's single-request plan-bound Home staging boundary.
 // There is intentionally no transparent generic-upload fallback for a larger
 // closure; the caller gets a clear error before any remote write is attempted.
@@ -5167,8 +5150,7 @@ impl VexClient {
     ) -> Result<(), VexClientError> {
         let batches =
             Self::split_object_batches(blobs, ObjectKind::Tree, max_batch_objects, max_batch_bytes);
-        self.put_object_batches_pipelined(batches, concurrency)
-            .await
+        self.put_object_batches_pipelined(batches, concurrency).await
     }
 
     /// Bulk-upload pre-serialized commit objects (canonical bytes).
@@ -5197,8 +5179,7 @@ impl VexClient {
             max_batch_objects,
             max_batch_bytes,
         );
-        self.put_object_batches_pipelined(batches, concurrency)
-            .await
+        self.put_object_batches_pipelined(batches, concurrency).await
     }
 
     /// Encode object batches as compressed VXPK packs and upload with bounded
@@ -5210,48 +5191,26 @@ impl VexClient {
         batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
         concurrency: usize,
     ) -> Result<(), VexClientError> {
-        // Encode across cores, at a level worth spending them on. The import
-        // client sits near-idle on CPU while its uplink is the whole cost, so
-        // trading compression work for wire bytes is free — but only while the
-        // work is parallel. Level 19 single-threaded would take longer than
-        // the transfer it saves; this level compresses several times faster
-        // per core and still beats the default meaningfully.
-        //
-        // `spawn_blocking` because rayon's pool is not the async runtime's:
-        // encoding a wave is seconds of pure CPU and must not sit on a worker
-        // that also drives the in-flight uploads.
-        let encode_level = UPLOAD_PACK_COMPRESSION_LEVEL;
-        let packs: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || {
-            batches
-                .into_par_iter()
-                .filter(|batch| !batch.is_empty())
-                .map(|batch| {
-                    let objects = batch
-                        .into_iter()
-                        .map(|(kind, content_id, data)| ObjectPackEntry {
-                            kind,
-                            content_id,
-                            data,
-                        })
-                        .collect();
-                    encode_object_pack_with_level(&ObjectPack { objects }, encode_level)
-                })
-                .collect::<Vec<Vec<u8>>>()
-        })
-        .await
-        .map_err(|err| {
-            VexClientError::Io(std::io::Error::other(format!(
-                "pack encode task failed: {err}"
-            )))
-        })?;
+        let packs: Vec<Vec<u8>> = batches
+            .into_iter()
+            .filter(|batch| !batch.is_empty())
+            .map(|batch| {
+                let objects = batch
+                    .into_iter()
+                    .map(|(kind, content_id, data)| ObjectPackEntry {
+                        kind,
+                        content_id,
+                        data,
+                    })
+                    .collect();
+                encode_object_pack(&ObjectPack { objects })
+            })
+            .collect();
         if packs.is_empty() {
             return Ok(());
         }
 
-        match self
-            .put_object_pack_bytes_pipelined(packs.clone(), concurrency)
-            .await
-        {
+        match self.put_object_pack_bytes_pipelined(packs.clone(), concurrency).await {
             Ok(()) => Ok(()),
             Err(err) if Self::is_unimplemented_pack_upload(&err) => {
                 debug!(
@@ -5273,8 +5232,7 @@ impl VexClient {
                             .collect::<Vec<_>>())
                     })
                     .collect::<Result<Vec<_>, VexClientError>>()?;
-                self.put_object_batches_pipelined(batches, concurrency)
-                    .await
+                self.put_object_batches_pipelined(batches, concurrency).await
             }
             Err(err) => Err(err),
         }
@@ -5288,40 +5246,16 @@ impl VexClient {
         max_batch_bytes: usize,
         concurrency: usize,
     ) -> Result<Vec<crate::backend::FileId>, VexClientError> {
-        // Ids are content-derived and returned in the CALLER's order — the
-        // import zips them against its own source ids — so the upload order
-        // below is free to differ.
         let mut ids = Vec::with_capacity(blobs.len());
-        let mut entries: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::with_capacity(blobs.len());
-        for data in blobs {
-            let content_id = Self::blob_content_id(&data);
-            ids.push(crate::backend::FileId::new(content_id.as_bytes().to_vec()));
-            entries.push((ObjectKind::Blob, content_id, data));
-        }
-
-        // Cluster similar blobs so each pack's whole-payload zstd sees the
-        // redundancy between them. A history's blobs are overwhelmingly
-        // successive versions of the same file, and arriving in hash order
-        // scatters those versions across different packs where the compressor
-        // can never relate them. Same key the backend uses when it builds
-        // clone packs.
-        entries.sort_by(|(a_kind, a_id, a_data), (b_kind, b_id, b_data)| {
-            let a_prefix = &a_data[..a_data.len().min(SIMILARITY_PREFIX_BYTES)];
-            let b_prefix = &b_data[..b_data.len().min(SIMILARITY_PREFIX_BYTES)];
-            (*a_kind as u8)
-                .cmp(&(*b_kind as u8))
-                .then_with(|| a_prefix.cmp(b_prefix))
-                .then_with(|| b_data.len().cmp(&a_data.len()))
-                .then_with(|| a_id.as_bytes().cmp(b_id.as_bytes()))
-        });
-
         let mut batches: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>> = Vec::new();
         let mut current: Vec<(ObjectKind, ContentId, Vec<u8>)> = Vec::new();
         let mut current_bytes = 0usize;
         let max_objects = max_batch_objects.max(1);
-        for entry in entries {
-            current_bytes += entry.2.len();
-            current.push(entry);
+        for data in blobs {
+            let content_id = Self::blob_content_id(&data);
+            ids.push(crate::backend::FileId::new(content_id.as_bytes().to_vec()));
+            current_bytes += data.len();
+            current.push((ObjectKind::Blob, content_id, data));
             if current.len() >= max_objects || current_bytes >= max_batch_bytes {
                 batches.push(std::mem::take(&mut current));
                 current_bytes = 0;
@@ -5330,8 +5264,7 @@ impl VexClient {
         if !current.is_empty() {
             batches.push(current);
         }
-        self.put_object_packs_pipelined(batches, concurrency)
-            .await?;
+        self.put_object_packs_pipelined(batches, concurrency).await?;
         Ok(ids)
     }
 
@@ -5415,7 +5348,10 @@ impl VexClient {
                                     .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                                     .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                                     .put_object_pack(Self::auth_request(
-                                        jj_backend_api::PutObjectPackRequest { repo_id, pack_data },
+                                        jj_backend_api::PutObjectPackRequest {
+                                            repo_id,
+                                            pack_data,
+                                        },
                                         token.as_deref(),
                                     )?)
                                     .await?;
