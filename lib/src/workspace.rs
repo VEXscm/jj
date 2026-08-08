@@ -1416,7 +1416,14 @@ async fn synthesize_federated_home_base(
             .ok_or_else(|| {
                 federated_home_init_error("a selected Home snapshot has a conflicted root tree")
             })?;
-        builder.set(root, TreeValue::Tree(component_tree_id));
+        builder
+            .set(root, TreeValue::Tree(component_tree_id))
+            .map_err(|error| {
+                federated_home_init_error(format!(
+                    "invalid Home manifest path {}: {error}",
+                    component.root_path
+                ))
+            })?;
     }
     let flat_tree_id = builder.write_tree().await.map_err(|error| {
         federated_home_init_error(format!("cannot synthesize flat Home tree: {error}"))
@@ -2581,7 +2588,7 @@ mod tests {
                         executable: false,
                         copy_id: CopyId::placeholder(),
                     },
-                );
+                ).unwrap();
             }
             let base_tree = base_builder.write_tree().await.unwrap();
             let base =
@@ -2610,7 +2617,7 @@ mod tests {
                     executable: false,
                     copy_id: CopyId::placeholder(),
                 },
-            );
+            ).unwrap();
             let target_tree = target_builder.write_tree().await.unwrap();
             let target = write_test_commit(&store, base.id().clone(), target_tree, 2).await;
             (base, target, unchanged_tree, unchanged_blob, changed_blob)
@@ -2652,7 +2659,7 @@ mod tests {
                         executable: false,
                         copy_id: CopyId::placeholder(),
                     },
-                );
+                ).unwrap();
                 let home_tree = home_builder.write_tree().await.unwrap();
                 let home =
                     write_test_commit(&store, store.root_commit_id().clone(), home_tree, 3).await;
@@ -2668,7 +2675,7 @@ mod tests {
                         executable: false,
                         copy_id: CopyId::placeholder(),
                     },
-                );
+                ).unwrap();
                 let component_tree = component_builder.write_tree().await.unwrap();
 
                 let mut aggregate_builder = TreeBuilder::new(
@@ -2678,7 +2685,7 @@ mod tests {
                 aggregate_builder.set(
                     repo_path("apps/web"),
                     TreeValue::Tree(component_tree.clone()),
-                );
+                ).unwrap();
                 let aggregate_tree = aggregate_builder.write_tree().await.unwrap();
                 let synthetic =
                     write_test_commit(&store, home.id().clone(), aggregate_tree, 4).await;
@@ -2741,7 +2748,7 @@ mod tests {
                     executable: false,
                     copy_id: CopyId::placeholder(),
                 },
-            );
+            ).unwrap();
             let tree = builder.write_tree().await.unwrap();
             write_test_commit(&store, store.root_commit_id().clone(), tree, 5).await
         }
@@ -2777,7 +2784,7 @@ mod tests {
                     executable: false,
                     copy_id: CopyId::placeholder(),
                 },
-            );
+            ).unwrap();
             let home_tree = home_builder.write_tree().await.unwrap();
             let home =
                 write_test_commit(&store, store.root_commit_id().clone(), home_tree, 6).await;

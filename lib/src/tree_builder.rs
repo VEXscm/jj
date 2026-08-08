@@ -61,23 +61,36 @@ impl TreeBuilder {
         self.store.as_ref()
     }
 
-    pub fn set(&mut self, path: RepoPathBuf, value: TreeValue) {
-        assert!(!path.is_root());
-        self.overrides.insert(path, Override::Replace(value));
+    pub fn set(&mut self, path: RepoPathBuf, value: TreeValue) -> BackendResult<()> {
+        self.override_path(path, Override::Replace(value))
     }
 
-    pub fn remove(&mut self, path: RepoPathBuf) {
-        assert!(!path.is_root());
-        self.overrides.insert(path, Override::Tombstone);
+    pub fn remove(&mut self, path: RepoPathBuf) -> BackendResult<()> {
+        self.override_path(path, Override::Tombstone)
     }
 
-    pub fn set_or_remove(&mut self, path: RepoPathBuf, value: Option<TreeValue>) {
-        assert!(!path.is_root());
-        if let Some(value) = value {
-            self.overrides.insert(path, Override::Replace(value));
-        } else {
-            self.overrides.insert(path, Override::Tombstone);
+    pub fn set_or_remove(&mut self, path: RepoPathBuf, value: Option<TreeValue>) -> BackendResult<()> {
+        match value {
+            Some(value) => self.set(path, value),
+            None => self.remove(path),
         }
+    }
+
+    /// An override is applied by rewriting the entry for `path` in its parent
+    /// tree, so the root — which has no parent tree, and whose `split()`
+    /// therefore yields nothing — can never be an override target. Rejecting it
+    /// as a recoverable error keeps a bad `--root-path` reaching
+    /// `vex materialize` a diagnosable failure instead of a process panic.
+    fn override_path(&mut self, path: RepoPathBuf, value: Override) -> BackendResult<()> {
+        if path.is_root() {
+            return Err(BackendError::Other(
+                "Cannot set or remove the repository root as a tree entry; the root has no parent \
+                 tree to record it in"
+                    .into(),
+            ));
+        }
+        self.overrides.insert(path, value);
+        Ok(())
     }
 
     pub async fn write_tree(self) -> BackendResult<TreeId> {

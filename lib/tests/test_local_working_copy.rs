@@ -591,7 +591,7 @@ fn test_tree_builder_file_directory_transition() -> TestResult {
             executable: false,
             copy_id: CopyId::placeholder(),
         },
-    );
+    ).unwrap();
     let tree_id = tree_builder.write_tree().block_on()?;
     check_out_tree(&tree_id);
     assert!(parent_path.to_fs_path_unchecked(&workspace_root).is_file());
@@ -599,7 +599,7 @@ fn test_tree_builder_file_directory_transition() -> TestResult {
 
     // Turn parent_path into directory, add file at child_path
     let mut tree_builder = TreeBuilder::new(store.clone(), tree_id);
-    tree_builder.remove(parent_path.to_owned());
+    tree_builder.remove(parent_path.to_owned()).unwrap();
     tree_builder.set(
         child_path.to_owned(),
         TreeValue::File {
@@ -607,7 +607,7 @@ fn test_tree_builder_file_directory_transition() -> TestResult {
             executable: false,
             copy_id: CopyId::placeholder(),
         },
-    );
+    ).unwrap();
     let tree_id = tree_builder.write_tree().block_on()?;
     check_out_tree(&tree_id);
     assert!(parent_path.to_fs_path_unchecked(&workspace_root).is_dir());
@@ -615,7 +615,7 @@ fn test_tree_builder_file_directory_transition() -> TestResult {
 
     // Turn parent_path back to file
     let mut tree_builder = TreeBuilder::new(store.clone(), tree_id);
-    tree_builder.remove(child_path.to_owned());
+    tree_builder.remove(child_path.to_owned()).unwrap();
     tree_builder.set(
         parent_path.to_owned(),
         TreeValue::File {
@@ -623,7 +623,7 @@ fn test_tree_builder_file_directory_transition() -> TestResult {
             executable: false,
             copy_id: CopyId::placeholder(),
         },
-    );
+    ).unwrap();
     let tree_id = tree_builder.write_tree().block_on()?;
     check_out_tree(&tree_id);
     assert!(parent_path.to_fs_path_unchecked(&workspace_root).is_file());
