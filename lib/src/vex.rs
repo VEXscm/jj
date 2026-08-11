@@ -924,6 +924,8 @@ pub enum VexClientError {
     Status(#[from] tonic::Status),
     #[error("invalid grpc authorization metadata: {0}")]
     InvalidAuthorizationMetadata(String),
+    #[error("the freshness check did not answer within {budget_ms}ms")]
+    RefFreshnessTimeout { budget_ms: u64 },
     #[error("invalid binary pack: {0}")]
     PackDecode(String),
     #[error(transparent)]
@@ -2231,7 +2233,13 @@ impl VexClient {
                 vex_client_stats()
                     .refresh_timeouts
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
+                // Distinct from an empty token below: this client ran out of
+                // time, which is a local budget problem with a local remedy.
+                // Collapsing both into "no token available" is what left the
+                // warning undiagnosable.
+                return Err(VexClientError::RefFreshnessTimeout {
+                    budget_ms: budget.as_millis() as u64,
+                });
             }
             Ok(Ok(response)) => response,
             Ok(Err(err)) => {

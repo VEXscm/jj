@@ -48,9 +48,21 @@ use crate::vex_publish::ServerHeadsMarker;
 use crate::vex_publish::read_server_heads;
 use crate::vex_publish::write_server_heads;
 
-/// Default wall-clock budget for the probe, covering the connect handshake as
-/// well as the request.
+/// Default wall-clock budget for a *blocking* probe, covering the connect
+/// handshake as well as the request. Deliberately tight: a caller that opted
+/// into `VEX_REFRESH_BUDGET_MS` is waiting on this before its output.
 pub const DEFAULT_REFRESH_BUDGET_MS: u64 = 100;
+
+/// Budget for the background probe, which runs detached after the command has
+/// already produced its output and exited.
+///
+/// Nothing waits on it, so the tight blocking budget bought nothing here and
+/// cost accuracy: 100ms is below a single TLS + gRPC round trip to a hosted
+/// backend, so any ordinary moment of latency timed the probe out, recorded a
+/// failure, and made the next command report "freshness unknown" — the warning
+/// that made this state look permanently broken when the probe merely never had
+/// time to answer.
+pub const DEFAULT_BACKGROUND_REFRESH_BUDGET_MS: u64 = 5_000;
 
 /// Why freshness is unknown. Each variant is a different remedy, so they are
 /// not collapsed into one "unknown".
@@ -171,10 +183,12 @@ pub fn refresh_budget() -> Option<Duration> {
 }
 
 /// Budget for the end-of-command probe, from `VEX_REFRESH_BUDGET_MS` or
-/// [`DEFAULT_REFRESH_BUDGET_MS`]. This one runs after the command's output is
-/// done, so spending it costs the user nothing.
+/// [`DEFAULT_BACKGROUND_REFRESH_BUDGET_MS`]. This one runs after the command's
+/// output is done, so spending it costs the user nothing — and it used to be
+/// capped as if it did, which is what made the probe fail against any backend
+/// further away than a millisecond.
 pub fn background_refresh_budget() -> Duration {
-    refresh_budget().unwrap_or(Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS))
+    refresh_budget().unwrap_or(Duration::from_millis(DEFAULT_BACKGROUND_REFRESH_BUDGET_MS))
 }
 
 /// Whether the user asked for no network probe at all (`VEX_NO_REFRESH=1`).
@@ -353,12 +367,14 @@ pub fn refresh_once_as(
             }
         }
         Ok(None) => {
-            // The budget expired, or the backend declined to answer. Either way
-            // this client could not establish freshness and must not pretend
-            // otherwise — an unanswered probe is unknown, never current.
-            marker.record_failure("no ref-freshness token available".to_string());
+            // The backend answered with no token: it is telling this client it
+            // cannot establish freshness, which is unknown and never current.
+            // A budget that ran out is a different thing with a different
+            // remedy and arrives as an error below.
+            let message = "the server did not provide a freshness token".to_string();
+            marker.record_failure(message.clone());
             FreshnessState::Unknown {
-                reason: UnknownReason::ProbeFailed("no ref-freshness token available".to_string()),
+                reason: UnknownReason::ProbeFailed(message),
             }
         }
         Err(err) => {
@@ -526,10 +542,27 @@ mod tests {
     #[test]
     fn the_read_path_does_not_block_on_refresh_by_default() {
         assert_eq!(refresh_budget(), None);
+    }
+
+    /// The two budgets are not the same number, and the difference is the whole
+    /// point: the blocking probe is a caller waiting on its own output, while
+    /// the background one runs after the command has exited. Capping the
+    /// background probe as tightly as the blocking one meant it could not
+    /// outlast a single round trip to a hosted backend, so it timed out and
+    /// reported "freshness unknown" on repositories that were perfectly current.
+    #[test]
+    fn the_background_probe_outlasts_a_round_trip() {
         assert_eq!(
             background_refresh_budget(),
-            Duration::from_millis(DEFAULT_REFRESH_BUDGET_MS)
+            Duration::from_millis(DEFAULT_BACKGROUND_REFRESH_BUDGET_MS)
         );
+        assert!(
+            DEFAULT_BACKGROUND_REFRESH_BUDGET_MS > DEFAULT_REFRESH_BUDGET_MS,
+            "the background probe must not be capped as tightly as a blocking one"
+        );
+        // A round trip to a hosted backend, handshake included, comfortably
+        // inside the budget rather than at its edge.
+        assert!(DEFAULT_BACKGROUND_REFRESH_BUDGET_MS >= 1_000);
     }
 
     /// The token comparison that makes "behind" possible, and the fact that it
