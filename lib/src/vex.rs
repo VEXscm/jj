@@ -3434,7 +3434,7 @@ impl VexClient {
     /// request runs as a spawned task on the shared runtime) so the chunk
     /// stream's `.buffered(W)` genuinely overlaps W fetches. `expected_len`
     /// is the chunk descriptor's `size_bytes` (caps the buffered body).
-    async fn direct_fetch_pack_blob_bytes(
+    async fn direct_fetch_object_bytes(
         &self,
         content_id: &ContentId,
         hints: &[jj_backend_api::PresignedGet],
@@ -3452,6 +3452,52 @@ impl VexClient {
         Self::http_get_async(hint.url.clone(), hint.headers.clone(), expected_len)
             .await
             .map(Some)
+    }
+
+    /// Fetch one content-addressed object via its presigned HTTP hint, with
+    /// hash verification, before falling back to the unary gRPC read. Clone
+    /// manifests may reference blobs larger than gRPC's message limit, so the
+    /// direct path is required for loose eager-clone objects as well as packs.
+    async fn fetch_object_with_hints(
+        &self,
+        kind: ObjectKind,
+        content_id: &ContentId,
+        hints: &[jj_backend_api::PresignedGet],
+        expected_len: Option<u64>,
+    ) -> Result<Vec<u8>, VexClientError> {
+        let mut last_hint_err: Option<VexClientError> = None;
+        if !self.presigned_get_disabled.load(Ordering::Relaxed) {
+            for _ in 0..2 {
+                match self
+                    .direct_fetch_object_bytes(content_id, hints, expected_len)
+                    .await
+                {
+                    Ok(Some(bytes)) => {
+                        if ContentId::hash_bytes(&bytes) == *content_id {
+                            return Ok(bytes);
+                        }
+                        last_hint_err = Some(VexClientError::PackDecode(format!(
+                            "presigned {} object {content_id} failed hash verification",
+                            kind_to_str(kind)
+                        )));
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let forbidden = Self::is_presigned_forbidden(&err);
+                        last_hint_err = Some(err);
+                        if forbidden {
+                            self.presigned_get_disabled.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(err) = last_hint_err {
+            debug!(kind = kind_to_str(kind), %content_id, error = %redact_url_queries(&err.to_string()), "direct object fetch failed, falling back to grpc");
+        }
+        let _t = RpcTimer::start(|| format!("get_object/{}", kind_to_str(kind)));
+        self.fetch_object_grpc_verified(kind, content_id).await
     }
 
     fn direct_fetch_pack_to_file(
@@ -3755,7 +3801,7 @@ impl VexClient {
         if !self.presigned_get_disabled.load(Ordering::Relaxed) {
             for _ in 0..2 {
                 match self
-                    .direct_fetch_pack_blob_bytes(content_id, hints, expected_len)
+                    .direct_fetch_object_bytes(content_id, hints, expected_len)
                     .await
                 {
                     Ok(Some(bytes)) => {
@@ -6507,6 +6553,18 @@ impl VexClient {
         let total_loose = manifest.objects.len() as u64;
         let mut loose_done = 0_u64;
         let loose_started = std::time::Instant::now();
+        let loose_hints = if manifest.objects.is_empty() {
+            Vec::new()
+        } else {
+            self.get_object_fetch_hints(
+                &manifest
+                    .objects
+                    .iter()
+                    .map(|object| (object.kind, object.content_id))
+                    .collect::<Vec<_>>(),
+            )
+            .await?
+        };
         for object in &manifest.objects {
             loose_done += 1;
             if self
@@ -6522,23 +6580,14 @@ impl VexClient {
                 }
                 continue;
             }
-            vex_client_stats().record_get_object_rpc(object.kind);
-            let bytes =
-                Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
-                    client
-                        .get_object(Self::auth_request(
-                            GetObjectRequest {
-                                repo_id: self.config.repo_id.clone(),
-                                object: Some(ObjectId {
-                                    kind: kind_to_str(object.kind).to_string(),
-                                    content_id: object.content_id.to_string(),
-                                }),
-                            },
-                            self.config.access_token.as_deref(),
-                        )?)
-                        .await
-                        .map(|response| response.into_inner().data)
-                })?;
+            let bytes = self
+                .fetch_object_with_hints(
+                    object.kind,
+                    &object.content_id,
+                    &loose_hints,
+                    object.size_bytes,
+                )
+                .await?;
             // Bulk write: the whole prefetch prunes once at the end instead of
             // rescanning the cache per object.
             self.write_cached_object_no_prune(object.kind, &object.content_id, &bytes)?;
@@ -7572,6 +7621,33 @@ mod tests {
 
         assert_eq!(bytes, b"pack-bytes");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn loose_clone_object_uses_presigned_http_hint() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let body = b"loose-clone-object".to_vec();
+        let content_id = ContentId::hash_bytes(&body);
+        let server = ChunkServer::start(
+            [(content_id.to_string(), body.clone())]
+                .into_iter()
+                .collect(),
+        );
+        let hints = vec![PresignedGet {
+            object_key: format!("blobs/sha256/{content_id}"),
+            url: server.url_for(&content_id),
+            headers: Default::default(),
+        }];
+
+        let bytes = futures::executor::block_on(sample_client().fetch_object_with_hints(
+            ObjectKind::Blob,
+            &content_id,
+            &hints,
+            Some(body.len() as u64),
+        ))
+        .unwrap();
+
+        assert_eq!(bytes, body);
     }
 
     /// Minimal HTTP server for presigned chunk fetches: serves
