@@ -894,6 +894,21 @@ pub enum CloneProgress {
 /// the blocking gRPC worker as well as the dedicated clone thread.
 pub type CloneProgressFn = dyn Fn(CloneProgress) + Send + Sync;
 
+#[derive(Clone, Copy)]
+enum InlineFetchPurpose {
+    Hydrating,
+    LooseObjects {
+        cached_objects: u64,
+        manifest_total: u64,
+    },
+}
+
+impl InlineFetchPurpose {
+    fn records_hydration_stats(self) -> bool {
+        matches!(self, Self::Hydrating)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VexConfigError {
     #[error("vex repo metadata file not found at {0}")]
@@ -5588,6 +5603,17 @@ impl VexClient {
         ids: Vec<(ObjectKind, ContentId, Option<u64>)>,
         progress: Option<&CloneProgressFn>,
     ) -> Result<u64, VexClientError> {
+        self.fetch_objects_inline_batched(ids, &[], progress, InlineFetchPurpose::Hydrating)
+            .await
+    }
+
+    async fn fetch_objects_inline_batched(
+        &self,
+        ids: Vec<(ObjectKind, ContentId, Option<u64>)>,
+        fallback_hints: &[jj_backend_api::PresignedGet],
+        progress: Option<&CloneProgressFn>,
+        purpose: InlineFetchPurpose,
+    ) -> Result<u64, VexClientError> {
         // Dedupe and drop objects already in the local cache.
         let mut seen: HashSet<(ObjectKind, ContentId)> = HashSet::new();
         let to_fetch: Vec<(ObjectKind, ContentId, Option<u64>)> = ids
@@ -5598,7 +5624,7 @@ impl VexClient {
             .collect();
         let total = to_fetch.len() as u64;
         if let Some(progress) = progress {
-            progress(CloneProgress::Hydrating { done: 0, total });
+            progress(inline_fetch_progress(purpose, 0, total));
         }
         if to_fetch.is_empty() {
             return Ok(0);
@@ -5613,7 +5639,7 @@ impl VexClient {
         let mut results = futures::stream::iter(
             batches
                 .into_iter()
-                .map(|batch| self.hydrate_one_batch(batch)),
+                .map(|batch| self.fetch_one_inline_batch(batch, fallback_hints, purpose)),
         )
         .buffer_unordered(inline_fetch_concurrency());
         let mut done = 0_u64;
@@ -5623,7 +5649,7 @@ impl VexClient {
                 Ok(count) => {
                     done += count;
                     if let Some(progress) = progress {
-                        progress(CloneProgress::Hydrating { done, total });
+                        progress(inline_fetch_progress(purpose, done, total));
                     }
                 }
                 Err(err) => {
@@ -5644,11 +5670,13 @@ impl VexClient {
 
     /// Fetch one `GetObjectsInline` batch, verify and cache its objects, and
     /// fetch whatever the response omitted (or failed verification) one object
-    /// at a time. Returns the number of objects hydrated (== `batch.len()` on
+    /// at a time. Returns the number of objects fetched (== `batch.len()` on
     /// success).
-    async fn hydrate_one_batch(
+    async fn fetch_one_inline_batch(
         &self,
         batch: Vec<(ObjectKind, ContentId)>,
+        fallback_hints: &[jj_backend_api::PresignedGet],
+        purpose: InlineFetchPurpose,
     ) -> Result<u64, VexClientError> {
         let stats = vex_client_stats();
         let mut remaining: HashSet<(ObjectKind, ContentId)> = batch.iter().copied().collect();
@@ -5676,9 +5704,11 @@ impl VexClient {
                     }
                     self.write_cached_object_no_prune(kind, &content_id, &inline.data)?;
                     stats.objects_inline_fetched.fetch_add(1, Ordering::Relaxed);
-                    stats
-                        .hydrated_bytes
-                        .fetch_add(inline.data.len() as u64, Ordering::Relaxed);
+                    if purpose.records_hydration_stats() {
+                        stats
+                            .hydrated_bytes
+                            .fetch_add(inline.data.len() as u64, Ordering::Relaxed);
+                    }
                     remaining.remove(&(kind, content_id));
                 }
             }
@@ -5694,8 +5724,15 @@ impl VexClient {
                     "inline batch overflowed the gRPC message cap; bisecting"
                 );
                 let (left, right) = batch.split_at(batch.len() / 2);
-                let count = Box::pin(self.hydrate_one_batch(left.to_vec())).await?
-                    + Box::pin(self.hydrate_one_batch(right.to_vec())).await?;
+                let count =
+                    Box::pin(self.fetch_one_inline_batch(left.to_vec(), fallback_hints, purpose))
+                        .await?
+                        + Box::pin(self.fetch_one_inline_batch(
+                            right.to_vec(),
+                            fallback_hints,
+                            purpose,
+                        ))
+                        .await?;
                 return Ok(count);
             }
             Err(err) => {
@@ -5712,7 +5749,15 @@ impl VexClient {
             if !remaining.contains(&(*kind, *content_id)) {
                 continue;
             }
-            let bytes = match self.get_object(*kind, content_id).await {
+            let fetch = |kind| async move {
+                if fallback_hints.is_empty() {
+                    self.get_object(kind, content_id).await
+                } else {
+                    self.fetch_object_with_hints(kind, content_id, fallback_hints, None)
+                        .await
+                }
+            };
+            let bytes = match fetch(*kind).await {
                 Ok(bytes) => bytes,
                 // Legacy repos store some symlink targets as blobs (see
                 // `VexBackend::read_symlink`); mirror its fallback rather than
@@ -5720,17 +5765,21 @@ impl VexClient {
                 Err(VexClientError::Status(status))
                     if status.code() == tonic::Code::NotFound && *kind == ObjectKind::Symlink =>
                 {
-                    self.get_object(ObjectKind::Blob, content_id).await?
+                    fetch(ObjectKind::Blob).await?
                 }
                 Err(err) => return Err(err),
             };
-            stats
-                .hydrated_bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            if purpose.records_hydration_stats() {
+                stats
+                    .hydrated_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
         }
-        stats
-            .hydrated_objects
-            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        if purpose.records_hydration_stats() {
+            stats
+                .hydrated_objects
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        }
         Ok(batch.len() as u64)
     }
 
@@ -6551,7 +6600,6 @@ impl VexClient {
         }
 
         let total_loose = manifest.objects.len() as u64;
-        let mut loose_done = 0_u64;
         let loose_started = std::time::Instant::now();
         let loose_hints = if manifest.objects.is_empty() {
             Vec::new()
@@ -6565,40 +6613,31 @@ impl VexClient {
             )
             .await?
         };
+        let mut cached_loose = 0_u64;
+        let mut loose_ids = Vec::with_capacity(manifest.objects.len());
         for object in &manifest.objects {
-            loose_done += 1;
             if self
                 .read_cached_object(object.kind, &object.content_id)
                 .is_some()
             {
                 vex_client_stats().record_get_object_cache_hit(object.kind);
-                if let Some(progress) = progress {
-                    progress(CloneProgress::LooseObjectFetched {
-                        done: loose_done,
-                        total: total_loose,
-                    });
-                }
+                cached_loose += 1;
                 continue;
             }
-            let bytes = self
-                .fetch_object_with_hints(
-                    object.kind,
-                    &object.content_id,
-                    &loose_hints,
-                    object.size_bytes,
-                )
-                .await?;
-            // Bulk write: the whole prefetch prunes once at the end instead of
-            // rescanning the cache per object.
-            self.write_cached_object_no_prune(object.kind, &object.content_id, &bytes)?;
-            prefetched_objects.fetch_add(1, Ordering::Relaxed);
-            if let Some(progress) = progress {
-                progress(CloneProgress::LooseObjectFetched {
-                    done: loose_done,
-                    total: total_loose,
-                });
-            }
+            loose_ids.push((object.kind, object.content_id, object.size_bytes));
         }
+        let fetched_loose = self
+            .fetch_objects_inline_batched(
+                loose_ids,
+                &loose_hints,
+                progress,
+                InlineFetchPurpose::LooseObjects {
+                    cached_objects: cached_loose,
+                    manifest_total: total_loose,
+                },
+            )
+            .await?;
+        prefetched_objects.fetch_add(fetched_loose, Ordering::Relaxed);
         vex_client_stats().pack_loose_object_ms.fetch_add(
             loose_started.elapsed().as_millis() as u64,
             Ordering::Relaxed,
@@ -6854,6 +6893,26 @@ fn split_inline_fetch_batches(
         batches.push(current);
     }
     batches
+}
+
+fn inline_fetch_progress(
+    purpose: InlineFetchPurpose,
+    done: u64,
+    fetch_total: u64,
+) -> CloneProgress {
+    match purpose {
+        InlineFetchPurpose::Hydrating => CloneProgress::Hydrating {
+            done,
+            total: fetch_total,
+        },
+        InlineFetchPurpose::LooseObjects {
+            cached_objects,
+            manifest_total,
+        } => CloneProgress::LooseObjectFetched {
+            done: cached_objects.saturating_add(done).min(manifest_total),
+            total: manifest_total,
+        },
+    }
 }
 
 /// Replace the query string of any URL embedded in `text` with `<redacted>`.
@@ -7458,6 +7517,33 @@ mod tests {
             batches.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![4, 4, 2]
         );
+    }
+
+    #[test]
+    fn inline_fetch_progress_preserves_cached_objects_and_manifest_total() {
+        let event = inline_fetch_progress(
+            InlineFetchPurpose::LooseObjects {
+                cached_objects: 32,
+                manifest_total: 544,
+            },
+            128,
+            512,
+        );
+
+        let CloneProgress::LooseObjectFetched { done, total } = event else {
+            panic!("expected loose-object progress");
+        };
+        assert_eq!((done, total), (160, 544));
+    }
+
+    #[test]
+    fn inline_fetch_progress_keeps_hydration_totals() {
+        let event = inline_fetch_progress(InlineFetchPurpose::Hydrating, 128, 512);
+
+        let CloneProgress::Hydrating { done, total } = event else {
+            panic!("expected hydration progress");
+        };
+        assert_eq!((done, total), (128, 512));
     }
 
     #[test]
