@@ -37,6 +37,7 @@ use jj_backend_api::CloneBlobMode as ProtoCloneBlobMode;
 use jj_backend_api::CloneViewKind as ProtoCloneViewKind;
 use jj_backend_api::FederatedHomePathChange as ProtoFederatedHomePathChange;
 use jj_backend_api::FederatedHomeSubmitOperationKind as ProtoFederatedHomeSubmitOperationKind;
+use jj_backend_api::GetCloneManifestRangeRequest;
 use jj_backend_api::GetCloneManifestRequest;
 use jj_backend_api::GetFederatedHomeManifestRequest;
 use jj_backend_api::GetHydrationPacksRequest;
@@ -146,6 +147,7 @@ pub async fn shared_runtime_sleep(duration: Duration) {
 /// with "decoded message length too large". The server already allows 64 MiB
 /// (`JJ_GRPC_MAX_MESSAGE_BYTES`); match it on the client for encode and decode.
 const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const CLONE_MANIFEST_RANGE_BYTES: u32 = 2 * 1024 * 1024;
 // Must match the backend's single-request plan-bound Home staging boundary.
 // There is intentionally no transparent generic-upload fallback for a larger
 // closure; the caller gets a clear error before any remote write is attempted.
@@ -6182,6 +6184,7 @@ impl VexClient {
                                 // Roadmap 032's snapshot packs are retired; the
                                 // proto field survives for wire compatibility.
                                 have_snapshot_commit_ids: Vec::new(),
+                                accept_manifest_key_only: true,
                             },
                             self.config.access_token.as_deref(),
                         )?)
@@ -6203,7 +6206,18 @@ impl VexClient {
                     continue;
                 }
                 Ok(response) => {
-                    return serde_json::from_slice(&response.manifest_json)
+                    let manifest_json = if response.manifest_json.is_empty() {
+                        self.get_clone_manifest_ranges(
+                            blob_mode,
+                            &response.manifest_key,
+                            response.manifest_size_bytes,
+                        )?
+                    } else {
+                        // An older server ignores `accept_manifest_key_only`
+                        // and returns the original inline response.
+                        response.manifest_json
+                    };
+                    return serde_json::from_slice(&manifest_json)
                         .map_err(VexConfigError::Json)
                         .map_err(Into::into);
                 }
@@ -6223,6 +6237,79 @@ impl VexClient {
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    fn get_clone_manifest_ranges(
+        &self,
+        blob_mode: CloneBlobMode,
+        manifest_key: &str,
+        manifest_size_bytes: u64,
+    ) -> Result<Vec<u8>, VexClientError> {
+        if manifest_key.is_empty() || manifest_size_bytes == 0 {
+            return Err(tonic::Status::data_loss(
+                "clone manifest response omitted both inline bytes and a readable manifest key",
+            )
+            .into());
+        }
+        let capacity = usize::try_from(manifest_size_bytes).map_err(|_| {
+            tonic::Status::resource_exhausted("clone manifest size does not fit this platform")
+        })?;
+        let mut manifest_json = Vec::new();
+        manifest_json.try_reserve_exact(capacity).map_err(|_| {
+            tonic::Status::resource_exhausted(format!(
+                "could not reserve {manifest_size_bytes} bytes for clone manifest"
+            ))
+        })?;
+
+        let mut offset = 0_u64;
+        while offset < manifest_size_bytes {
+            let size = (manifest_size_bytes - offset).min(CLONE_MANIFEST_RANGE_BYTES as u64) as u32;
+            let response = Self::block_on_grpc_retry(
+                &self.config.endpoint,
+                5,
+                |mut client| async move {
+                    client
+                        .get_clone_manifest_range(Self::auth_request(
+                            GetCloneManifestRangeRequest {
+                                tenant_id: self.config.tenant_id.clone(),
+                                repo_id: self.config.repo_id.clone(),
+                                manifest_key: manifest_key.to_string(),
+                                offset,
+                                size,
+                                clone_blob_mode: match blob_mode {
+                                    CloneBlobMode::Eager => ProtoCloneBlobMode::Eager as i32,
+                                    CloneBlobMode::Lazy => ProtoCloneBlobMode::Lazy as i32,
+                                },
+                            },
+                            self.config.access_token.as_deref(),
+                        )?)
+                        .await
+                        .map(|response| response.into_inner())
+                },
+            )?;
+            if response.data.is_empty() {
+                return Err(tonic::Status::data_loss(format!(
+                    "clone manifest ended at byte {offset}, expected {manifest_size_bytes} bytes"
+                ))
+                .into());
+            }
+            if response.data.len() > size as usize {
+                return Err(tonic::Status::data_loss(
+                    "clone manifest range exceeded its requested size",
+                )
+                .into());
+            }
+            offset = offset.saturating_add(response.data.len() as u64);
+            manifest_json.extend_from_slice(&response.data);
+        }
+        if manifest_json.len() != capacity {
+            return Err(tonic::Status::data_loss(format!(
+                "clone manifest returned {} bytes, expected {manifest_size_bytes}",
+                manifest_json.len()
+            ))
+            .into());
+        }
+        Ok(manifest_json)
     }
 
     async fn get_object_fetch_hints(
