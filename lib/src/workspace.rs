@@ -77,6 +77,7 @@ use crate::simple_backend::SimpleBackend;
 use crate::transaction::TransactionCommitError;
 use crate::tree_builder::TreeBuilder;
 use crate::vex::CloneBlobMode;
+use crate::vex::VexClient;
 use crate::vex::VexContentId;
 use crate::vex::VexFederatedHomeConfig;
 use crate::vex::VexRepoConfig;
@@ -1449,6 +1450,53 @@ async fn synthesize_federated_home_base(
         .map_err(|error| {
             federated_home_init_error(format!("cannot write flat Home base commit: {error}"))
         })
+}
+
+/// Hydrate the exact snapshots in a newer signed Home manifest and compose
+/// their local-only flat facade commit. The caller persists the returned
+/// routing metadata only after it has recorded the facade in the local view.
+pub async fn refresh_federated_home_base(
+    repo: &Arc<ReadonlyRepo>,
+    repo_path: &Path,
+    home_config: &VexRepoConfig,
+    mut flat_home: VexFederatedHomeConfig,
+) -> Result<(Commit, VexFederatedHomeConfig), WorkspaceInitError> {
+    flat_home
+        .validate()
+        .map_err(|error| federated_home_init_error(error.to_string()))?;
+    let store_path = repo_path.join("store");
+    let cache_root = VexClient::from_store_path(&store_path)
+        .map_err(|error| WorkspaceInitError::Backend(BackendInitError(error.into())))?
+        .cache_root()
+        .ok_or_else(|| federated_home_init_error("flat Home pull has no object cache"))?
+        .to_path_buf();
+
+    for repository in &flat_home.repositories {
+        let config = flat_home.repository_config(home_config, repository);
+        let client = VexClient::from_config_with_cache_root(config, cache_root.clone())
+            .map_err(|error| WorkspaceInitError::Backend(BackendInitError(error.into())))?;
+        let manifest = client
+            .get_clone_manifest(CloneBlobMode::Lazy, None)
+            .await
+            .map_err(|error| WorkspaceInitError::Backend(BackendInitError(error.into())))?;
+        client
+            .prefetch_clone_manifest(&manifest, None)
+            .await
+            .map_err(|error| WorkspaceInitError::Backend(BackendInitError(error.into())))?;
+    }
+
+    let home_id = CommitId::new(flat_home.manifest.home_revision.as_bytes().to_vec());
+    let home_commit = repo
+        .store()
+        .get_commit_async(&home_id)
+        .await
+        .map_err(|error| federated_home_init_error(format!("cannot read Home root: {error}")))?;
+    let facade = synthesize_federated_home_base(repo, &flat_home, &home_commit).await?;
+    flat_home.aggregate_base_commit_id = Some(content_id_from_commit_id(
+        facade.id(),
+        "flat Home base commit",
+    )?);
+    Ok((facade, flat_home))
 }
 
 fn component_root_ancestors(root: &str) -> Result<Vec<RepoPathBuf>, WorkspaceInitError> {
