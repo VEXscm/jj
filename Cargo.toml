@@ -173,6 +173,15 @@ while_let_loop = "warn"
 let_underscore_drop = "warn"
 redundant_imports = "warn"
 
+[profile.dev]
+# This workspace's own crates, which the `package."*"` rule below does not
+# cover. All four workspaces here share one CARGO_TARGET_DIR, so their debug
+# info accumulates into the same place — 46 GB of it, none older than a
+# fortnight. line-tables-only keeps file and line numbers in backtraces, which
+# is what a failing test needs; raise to 1 locally if you are stepping through
+# this code in a debugger.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 # Compile all dependencies with opt-level=3 to help speed up tests and
 # debug builds
