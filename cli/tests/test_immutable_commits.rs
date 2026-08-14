@@ -691,3 +691,84 @@ fn test_immutable_log() {
     [EOF]
     ");
 }
+
+/// `vex pull --refs changes` records remote-only `changes/<n>@vex` bookmarks.
+/// Those are in-flight review tips, so they must not freeze `vex edit`.
+#[test]
+fn test_change_and_stack_remote_bookmarks_stay_mutable() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "origin"]).success();
+    let origin_dir = test_env.work_dir("origin");
+    let origin_git_repo_path = origin_dir
+        .root()
+        .join(".jj")
+        .join("repo")
+        .join("store")
+        .join("git");
+
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "main"])
+        .success();
+    origin_dir.run_jj(["new", "-m=review change"]).success();
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "changes/832"])
+        .success();
+    origin_dir
+        .run_jj(["new", "main", "-m=ordinary remote feature"])
+        .success();
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "feature"])
+        .success();
+    origin_dir.run_jj(["new", "main", "-m=stack tip"]).success();
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "stacks/ABJY"])
+        .success();
+    origin_dir.run_jj(["git", "export"]).success();
+
+    test_env
+        .run_jj_in(
+            ".",
+            [
+                "git",
+                "clone",
+                origin_git_repo_path.to_str().unwrap(),
+                "local",
+            ],
+        )
+        .success();
+    let work_dir = test_env.work_dir("local");
+
+    let output = work_dir.run_jj(["edit", "changes/832@origin"]);
+    assert!(
+        output.status.success(),
+        "review change refs must stay editable: {output}"
+    );
+    assert!(
+        !output.stderr.normalized().contains("immutable"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["edit", "stacks/ABJY@origin"]);
+    assert!(
+        output.status.success(),
+        "review stack refs must stay editable: {output}"
+    );
+    assert!(
+        !output.stderr.normalized().contains("immutable"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["edit", "feature@origin"]);
+    assert!(
+        !output.status.success(),
+        "ordinary untracked remotes must stay immutable: {output}"
+    );
+    assert!(
+        output.stderr.normalized().contains("is immutable"),
+        "{output}"
+    );
+    assert!(
+        output.stderr.normalized().contains("feature@origin"),
+        "{output}"
+    );
+}

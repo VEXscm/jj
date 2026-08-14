@@ -626,13 +626,17 @@ for a comprehensive list.
   ```
 
 * `builtin_immutable_heads()`: Resolves to `trunk() | tags() |
-  untracked_remote_bookmarks()`. It is used as the default definition for
-  `immutable_heads()` below. It is not recommended to redefine this
-  alias. Prefer to redefine `immutable_heads()` instead.
+  untracked_remote_bookmarks(~(glob:"changes/*" | glob:"refs/changes/*" |
+  glob:"stacks/*" | glob:"refs/stacks/*"))`. Vex review refs
+  (`changes/<number>@vex`, `stacks/<code>@vex`) are current in-flight
+  patchset tips, so they stay mutable even though they are untracked remotes.
+  It is used as the default definition for `immutable_heads()` below. It is
+  not recommended to redefine this alias. Prefer to redefine
+  `immutable_heads()` instead.
 
 * `immutable_heads()`: The heads of the set of immutable commits (not "heads
-  that are immutable"). Resolves to `trunk() | tags() |
-  untracked_remote_bookmarks()` by default. It is actually defined as
+  that are immutable"). Resolves to the same set as
+  `builtin_immutable_heads()` by default. It is actually defined as
   `builtin_immutable_heads()`, and can be overridden as required. The full set
   of immutable commits is `::immutable_heads()` (i.e., `immutable()`). See
   [here](config.md#set-of-immutable-commits) for details.

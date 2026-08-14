@@ -894,6 +894,73 @@ pub enum CloneProgress {
 /// the blocking gRPC worker as well as the dedicated clone thread.
 pub type CloneProgressFn = dyn Fn(CloneProgress) + Send + Sync;
 
+/// Progress events emitted while unpublished objects are uploaded.
+///
+/// These are reported through the optional [`StagedUploadProgressFn`] passed to
+/// [`VexClient::upload_staged_objects_with_progress`]. They are advisory only:
+/// the upload behaves identically whether or not a sink is provided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedUploadProgress {
+    /// Staged markers have been listed; `count` is how many objects will be
+    /// published (or refused, if any of their bytes are missing).
+    Enumerating {
+        /// Number of staged objects about to be uploaded.
+        count: usize,
+    },
+    /// A batch finished. `done`/`bytes_done` are cumulative for this upload.
+    Uploading {
+        /// Objects whose `PutObjects` batch has been acknowledged.
+        done: usize,
+        /// Total staged objects in this upload.
+        total: usize,
+        /// Bytes whose `PutObjects` batch has been acknowledged.
+        bytes_done: u64,
+        /// Total staged bytes in this upload, from local cache metadata.
+        bytes_total: u64,
+    },
+}
+
+/// Sink for [`StagedUploadProgress`] events. `Send + Sync` so it can be invoked
+/// from the shared multi-thread gRPC runtime that publishes batches.
+pub type StagedUploadProgressFn = dyn Fn(StagedUploadProgress) + Send + Sync;
+
+/// Cumulative counters shared across concurrent `PutObjects` batches.
+struct StagedUploadReporter<'a> {
+    progress: Option<&'a StagedUploadProgressFn>,
+    total: usize,
+    bytes_total: u64,
+    done: AtomicUsize,
+    bytes_done: AtomicU64,
+}
+
+impl StagedUploadReporter<'_> {
+    fn emit_uploading(&self) {
+        let Some(progress) = self.progress else {
+            return;
+        };
+        progress(StagedUploadProgress::Uploading {
+            done: self.done.load(Ordering::Relaxed),
+            total: self.total,
+            bytes_done: self.bytes_done.load(Ordering::Relaxed),
+            bytes_total: self.bytes_total,
+        });
+    }
+
+    fn add(&self, objects: usize, bytes: u64) {
+        let done = self.done.fetch_add(objects, Ordering::Relaxed) + objects;
+        let bytes_done = self.bytes_done.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let Some(progress) = self.progress else {
+            return;
+        };
+        progress(StagedUploadProgress::Uploading {
+            done,
+            total: self.total,
+            bytes_done,
+            bytes_total: self.bytes_total,
+        });
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InlineFetchPurpose {
     Hydrating,
@@ -2324,6 +2391,13 @@ impl VexClient {
         self.cache_root
             .as_ref()
             .map(|root| root.join(kind_to_str(kind)).join(content_id.to_string()))
+    }
+
+    fn cached_object_len(&self, kind: ObjectKind, content_id: &ContentId) -> u64 {
+        self.cache_path(kind, content_id)
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .unwrap_or(0)
     }
 
     fn transfer_state_root(&self) -> Option<PathBuf> {
@@ -4582,6 +4656,15 @@ impl VexClient {
     /// This is a blocking call (it drives the shared gRPC runtime) and must not
     /// be invoked from within that runtime.
     pub fn upload_staged_objects(&self) -> Result<usize, VexClientError> {
+        self.upload_staged_objects_with_progress(None)
+    }
+
+    /// Same as [`Self::upload_staged_objects`], reporting [`StagedUploadProgress`]
+    /// as batches are acknowledged.
+    pub fn upload_staged_objects_with_progress(
+        &self,
+        progress: Option<&StagedUploadProgressFn>,
+    ) -> Result<usize, VexClientError> {
         if self.federated_facade {
             return Err(VexClientError::StagedObjectsMissing(
                 "ordinary object publication is disabled for a Home checkout; use `vex submit`"
@@ -4592,6 +4675,23 @@ impl VexClient {
         if staged.is_empty() {
             return Ok(0);
         }
+        if let Some(progress) = progress {
+            progress(StagedUploadProgress::Enumerating {
+                count: staged.len(),
+            });
+        }
+        let bytes_total = staged
+            .iter()
+            .map(|(kind, content_id)| self.cached_object_len(*kind, content_id))
+            .sum();
+        let reporter = StagedUploadReporter {
+            progress,
+            total: staged.len(),
+            bytes_total,
+            done: AtomicUsize::new(0),
+            bytes_done: AtomicU64::new(0),
+        };
+        reporter.emit_uploading();
         let _t = RpcTimer::start(|| format!("upload_staged_objects/{}", staged.len()));
 
         // Size/count-bounded batches, uploaded a wave at a time so peak memory
@@ -4615,14 +4715,14 @@ impl VexClient {
                 batch_bytes = 0;
             }
             if wave.len() >= STAGED_UPLOAD_CONCURRENCY {
-                uploaded += self.upload_staged_wave(std::mem::take(&mut wave))?;
+                uploaded += self.upload_staged_wave(std::mem::take(&mut wave), Some(&reporter))?;
             }
         }
         if !batch.is_empty() {
             wave.push(batch);
         }
         if !wave.is_empty() {
-            uploaded += self.upload_staged_wave(wave)?;
+            uploaded += self.upload_staged_wave(wave, Some(&reporter))?;
         }
         if !missing.is_empty() {
             return Err(VexClientError::StagedObjectsMissing(format!(
@@ -4677,15 +4777,18 @@ impl VexClient {
                 batch_bytes = 0;
             }
             if wave.len() >= STAGED_UPLOAD_CONCURRENCY {
-                uploaded +=
-                    self.upload_wave(std::mem::take(&mut wave), StagedMarkerPolicy::Preserve)?;
+                uploaded += self.upload_wave(
+                    std::mem::take(&mut wave),
+                    StagedMarkerPolicy::Preserve,
+                    None,
+                )?;
             }
         }
         if !batch.is_empty() {
             wave.push(batch);
         }
         if !wave.is_empty() {
-            uploaded += self.upload_wave(wave, StagedMarkerPolicy::Preserve)?;
+            uploaded += self.upload_wave(wave, StagedMarkerPolicy::Preserve, None)?;
         }
         if let Some((kind, content_id)) = missing.first() {
             return Err(VexClientError::StagedObjectsMissing(format!(
@@ -4874,14 +4977,16 @@ impl VexClient {
     fn upload_staged_wave(
         &self,
         wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
+        reporter: Option<&StagedUploadReporter<'_>>,
     ) -> Result<usize, VexClientError> {
-        self.upload_wave(wave, StagedMarkerPolicy::Remove)
+        self.upload_wave(wave, StagedMarkerPolicy::Remove, reporter)
     }
 
     fn upload_wave(
         &self,
         wave: Vec<Vec<(ObjectKind, ContentId, Vec<u8>)>>,
         marker_policy: StagedMarkerPolicy,
+        reporter: Option<&StagedUploadReporter<'_>>,
     ) -> Result<usize, VexClientError> {
         let ids: Vec<(ObjectKind, ContentId)> = wave
             .iter()
@@ -4915,6 +5020,9 @@ impl VexClient {
                     let repo_id = repo_id.clone();
                     let token = token.clone();
                     async move {
+                        let object_count = objects.len();
+                        let batch_bytes =
+                            objects.iter().map(|object| object.data.len() as u64).sum();
                         let request = Self::auth_request(
                             PutObjectsRequest { repo_id, objects },
                             token.as_deref(),
@@ -4928,6 +5036,9 @@ impl VexClient {
                             client.put_objects(request),
                         )
                         .await?;
+                        if let Some(reporter) = reporter {
+                            reporter.add(object_count, batch_bytes);
+                        }
                         Ok(())
                     }
                 })
@@ -5221,7 +5332,8 @@ impl VexClient {
     ) -> Result<(), VexClientError> {
         let batches =
             Self::split_object_batches(blobs, ObjectKind::Tree, max_batch_objects, max_batch_bytes);
-        self.put_object_batches_pipelined(batches, concurrency).await
+        self.put_object_batches_pipelined(batches, concurrency)
+            .await
     }
 
     /// Bulk-upload pre-serialized commit objects (canonical bytes).
@@ -5250,7 +5362,8 @@ impl VexClient {
             max_batch_objects,
             max_batch_bytes,
         );
-        self.put_object_batches_pipelined(batches, concurrency).await
+        self.put_object_batches_pipelined(batches, concurrency)
+            .await
     }
 
     /// Encode object batches as compressed VXPK packs and upload with bounded
@@ -5281,7 +5394,10 @@ impl VexClient {
             return Ok(());
         }
 
-        match self.put_object_pack_bytes_pipelined(packs.clone(), concurrency).await {
+        match self
+            .put_object_pack_bytes_pipelined(packs.clone(), concurrency)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(err) if Self::is_unimplemented_pack_upload(&err) => {
                 debug!(
@@ -5303,7 +5419,8 @@ impl VexClient {
                             .collect::<Vec<_>>())
                     })
                     .collect::<Result<Vec<_>, VexClientError>>()?;
-                self.put_object_batches_pipelined(batches, concurrency).await
+                self.put_object_batches_pipelined(batches, concurrency)
+                    .await
             }
             Err(err) => Err(err),
         }
@@ -5335,7 +5452,8 @@ impl VexClient {
         if !current.is_empty() {
             batches.push(current);
         }
-        self.put_object_packs_pipelined(batches, concurrency).await?;
+        self.put_object_packs_pipelined(batches, concurrency)
+            .await?;
         Ok(ids)
     }
 
@@ -5419,10 +5537,7 @@ impl VexClient {
                                     .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                                     .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                                     .put_object_pack(Self::auth_request(
-                                        jj_backend_api::PutObjectPackRequest {
-                                            repo_id,
-                                            pack_data,
-                                        },
+                                        jj_backend_api::PutObjectPackRequest { repo_id, pack_data },
                                         token.as_deref(),
                                     )?)
                                     .await?;
@@ -6359,10 +6474,8 @@ impl VexClient {
         let mut offset = 0_u64;
         while offset < manifest_size_bytes {
             let size = (manifest_size_bytes - offset).min(CLONE_MANIFEST_RANGE_BYTES as u64) as u32;
-            let response = Self::block_on_grpc_retry(
-                &self.config.endpoint,
-                5,
-                |mut client| async move {
+            let response =
+                Self::block_on_grpc_retry(&self.config.endpoint, 5, |mut client| async move {
                     client
                         .get_clone_manifest_range(Self::auth_request(
                             GetCloneManifestRangeRequest {
@@ -6380,8 +6493,7 @@ impl VexClient {
                         )?)
                         .await
                         .map(|response| response.into_inner())
-                },
-            )?;
+                })?;
             if response.data.is_empty() {
                 return Err(tonic::Status::data_loss(format!(
                     "clone manifest ended at byte {offset}, expected {manifest_size_bytes} bytes"
@@ -9068,6 +9180,32 @@ mod tests {
         // The marker is deliberately left in place: dropping it would turn a
         // loud failure into a silent one on the next push.
         assert!(client.has_staged_object(ObjectKind::Commit, &content_id));
+    }
+
+    #[test]
+    fn upload_progress_enumerates_before_refusing_a_missing_object() {
+        let _guard = stats_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut client = pack_resident_client(temp_dir.path(), false);
+        client.config.repo_id = "repo-staged-progress".to_string();
+        let data = b"bytes that will be deleted".to_vec();
+        let content_id = ContentId::hash_bytes(&data);
+        futures::executor::block_on(client.put_object(ObjectKind::Commit, &content_id, data))
+            .unwrap();
+        std::fs::remove_file(client.cache_path(ObjectKind::Commit, &content_id).unwrap()).unwrap();
+
+        let events = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let events_for_sink = std::sync::Arc::clone(&events);
+        let sink = move |event| events_for_sink.lock().unwrap().push(event);
+        let error = client
+            .upload_staged_objects_with_progress(Some(&sink))
+            .unwrap_err();
+        assert!(matches!(error, VexClientError::StagedObjectsMissing(_)));
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events.contains(&StagedUploadProgress::Enumerating { count: 1 }),
+            "the sink must see the staged set before the missing-bytes refusal: {events:?}"
+        );
     }
 
     #[test]

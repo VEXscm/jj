@@ -576,14 +576,16 @@ for a comprehensive list.
   ```
 
 * `builtin_immutable_heads()`: Resolves to
-  `present(trunk()) | tags() | untracked_remote_bookmarks()`. It is used as the
-   default definition for `immutable_heads()` below. It is not recommended to
-   redefine this alias. Prefer to redefine `immutable_heads()` instead.
+  `trunk() | tags() | untracked_remote_bookmarks(~(glob:"changes/*" |
+  glob:"refs/changes/*" | glob:"stacks/*" | glob:"refs/stacks/*"))`. Vex
+  review refs stay mutable. It is used as the default definition for
+  `immutable_heads()` below. It is not recommended to redefine this alias.
+  Prefer to redefine `immutable_heads()` instead.
 
-* `immutable_heads()`: Resolves to
-  `present(trunk()) | tags() | untracked_remote_bookmarks()` by default. It is
-  actually defined as `builtin_immutable_heads()`, and can be overridden as
-  required. See [here](config.md#set-of-immutable-commits) for details.
+* `immutable_heads()`: Resolves to the same set as
+  `builtin_immutable_heads()` by default. It is actually defined as
+  `builtin_immutable_heads()`, and can be overridden as required. See
+  [here](config.md#set-of-immutable-commits) for details.
 
 * `immutable()`: The set of commits that `jj` treats as immutable. This is
   equivalent to `::(immutable_heads() | root())`. It is not recommended to redefine

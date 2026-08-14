@@ -51,7 +51,13 @@ latest(
 
 # If immutable_heads() failed to evaluate, many jj commands wouldn't work. Use
 # present(expr) if symbols in expr might not always exist.
-'builtin_immutable_heads()' = 'trunk() | tags() | untracked_remote_bookmarks()'
+#
+# `changes/*` and `stacks/*` are Vex review refs: remote-only current patchset
+# tips (`changes/832@vex`), not published history. They are untracked, so the
+# stock `untracked_remote_bookmarks()` set would freeze them and `vex edit`
+# would refuse. Name-filter them out so an ordinary untracked `feature@vex` on
+# the same commit still protects that commit.
+'builtin_immutable_heads()' = 'trunk() | tags() | untracked_remote_bookmarks(~(glob:"changes/*" | glob:"refs/changes/*" | glob:"stacks/*" | glob:"refs/stacks/*"))'
 'immutable_heads()' = 'builtin_immutable_heads()'
 'immutable()' = '::(immutable_heads() | root())'
 'mutable()' = '~immutable()'
