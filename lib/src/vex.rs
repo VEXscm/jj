@@ -5602,6 +5602,10 @@ impl VexClient {
             vex_client_stats().record_get_object_cache_hit(kind);
             return Ok(bytes);
         }
+        if let Some(bytes) = kind.implicit_empty_bytes(content_id) {
+            self.write_cached_object(kind, content_id, bytes)?;
+            return Ok(bytes.to_vec());
+        }
         let primary_error = match fetch(self.config.clone(), kind, *content_id).await {
             Ok(bytes) => {
                 self.write_cached_object(kind, content_id, &bytes)?;

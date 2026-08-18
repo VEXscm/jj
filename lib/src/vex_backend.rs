@@ -1288,6 +1288,28 @@ mod tests {
         assert_eq!(tree, crate::backend::Tree::default());
     }
 
+    /// Empty files hash to SHA-256("") and are never stored. Checkout still
+    /// reads them; serve empty bytes locally so an unreachable backend cannot
+    /// fail clone the way a missing finalized blob would.
+    #[test]
+    fn read_file_serves_empty_blob_without_rpc() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let store_dir = repo_dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        sample_config().write_to_repo_path(&repo_dir).unwrap();
+        let backend = VexBackend::load(&store_dir).unwrap();
+
+        let id = FileId::new(sha256_bytes(b"").to_vec());
+        assert_eq!(backend.cached_blob_path(&id), None);
+
+        let mut reader = backend.read_file(RepoPath::root(), &id).block_on().unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).block_on().unwrap();
+        assert!(buf.is_empty());
+        assert!(backend.cached_blob_path(&id).is_some());
+    }
+
     /// Backend loaded from a store path with the blob already in the local
     /// cache: `read_file` must stream from the cache file (the endpoint above
     /// is unreachable, so any RPC attempt would fail) and `cached_blob_path`
