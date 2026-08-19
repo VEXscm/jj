@@ -38,6 +38,12 @@ prefix or [a divergent change ID][divergent-change]. To refer to a
 [hidden](#hidden-revisions) commit or [divergent change][divergent-change], a
 [change offset][change-offset] can be added using `<change ID>/<offset>` syntax.
 
+Change IDs are normally written in the reverse-hex `k-z` alphabet that `vex log`
+prints. The Vex API states the same id in raw hex (`jj_change_id` in
+`vex change show --format json`, CI job payloads), and a full-length hex change
+ID is accepted as well, so an id copied from the server can be pasted straight
+into `-r`. Only the full length is accepted: shorter hex is a commit ID prefix.
+
 Use [single or double quotes][string-literals] to prevent a symbol from being
 interpreted as an expression. For example, `"x-"` is the symbol `x-`, not the
 parents of symbol `x`. Taking shell quoting into account, you may need to use
@@ -283,9 +289,10 @@ revsets (expressions) as arguments.
 * `none()`: No commits. This function is rarely useful; it is provided for
   completeness.
 
-* `change_id(prefix)`: Commits with the given change ID prefix. If the specified
-  change is divergent, this resolves to multiple commits. It is an error to use a
-  non-unique prefix. Unmatched prefix isn't an error.
+* `change_id(prefix)`: Commits with the given change ID prefix, in either the
+  reverse-hex `k-z` alphabet or raw hex. If the specified change is divergent,
+  this resolves to multiple commits. It is an error to use a non-unique prefix.
+  Unmatched prefix isn't an error.
 
 * `commit_id(prefix)`: Commits with the given commit ID prefix. It is an error
   to use a non-unique prefix. Unmatched prefix isn't an error.

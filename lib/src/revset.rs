@@ -908,7 +908,14 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
         let [arg] = function.expect_exact_arguments()?;
         let prefix = revset_parser::catch_aliases(diagnostics, arg, |_diagnostics, arg| {
             let value = revset_parser::expect_string_literal("change ID prefix", arg)?;
+            // The Vex API states change ids in raw hex, so `change_id()` has to
+            // read both spellings — not least because the divergence error
+            // suggests `change_id(<symbol>)` with whichever one the caller
+            // typed. The alphabets are disjoint (`0-9a-f` against `k-z`), so a
+            // string decodes as at most one of them, and no commit id competes
+            // for this argument.
             HexPrefix::try_from_reverse_hex(value)
+                .or_else(|| HexPrefix::try_from_hex(value))
                 .ok_or_else(|| RevsetParseError::expression("Invalid change ID prefix", arg.span))
         })?;
         Ok(RevsetExpression::change_id_prefix(prefix))
@@ -4339,7 +4346,10 @@ mod tests {
             parse("change_id('zk')")?,
             @r#"CommitRef(ChangeId(HexPrefix("0f")))"#);
         insta::assert_debug_snapshot!(
-            parse("change_id(01234)").unwrap_err().kind(),
+            parse("change_id(01234)")?,
+            @r#"CommitRef(ChangeId(HexPrefix("01234")))"#);
+        insta::assert_debug_snapshot!(
+            parse("change_id('zk0')").unwrap_err().kind(),
             @r#"Expression("Invalid change ID prefix")"#);
 
         insta::assert_debug_snapshot!(
