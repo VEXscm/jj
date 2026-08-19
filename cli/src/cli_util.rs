@@ -154,6 +154,7 @@ use tracing::instrument;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
 
+use crate::cli_name::current_cli_name;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::config_error_with_message;
@@ -4011,16 +4012,6 @@ fn resolve_default_command(
         string_args.splice(1..1, default_command);
     }
     Ok(string_args)
-}
-
-pub(crate) fn current_cli_name() -> String {
-    env::args_os()
-        .next()
-        .and_then(|arg0| Path::new(&arg0).file_name().map(|name| name.to_owned()))
-        .and_then(|name| name.into_string().ok())
-        .map(|name| name.strip_suffix(".exe").unwrap_or(&name).to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "jj".to_string())
 }
 
 /// For `vex`, replace a failing bare `main`/`master`/`trunk` `trunk()` override

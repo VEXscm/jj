@@ -212,7 +212,7 @@ new working-copy commit.
         let description = description_template(ui, &tx, intro, &temp_commit)?;
         let description = edit_description(&text_editor, &description)?;
         if description.is_empty() {
-            let cli_name = crate::cli_util::current_cli_name();
+            let cli_name = crate::cli_name::current_cli_name();
             writedoc!(
                 ui.hint_default(),
                 "

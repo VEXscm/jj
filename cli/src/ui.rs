@@ -36,6 +36,8 @@ use jj_lib::config::ConfigGetError;
 use jj_lib::config::StackedConfig;
 use tracing::instrument;
 
+use crate::cli_name::CliNameWriter;
+use crate::cli_name::current_cli_name;
 use crate::command_error::CommandError;
 use crate::config::CommandNameAndArgs;
 use crate::formatter::Formatter;
@@ -268,6 +270,7 @@ pub struct Ui {
     progress_indicator: bool,
     formatter_factory: FormatterFactory,
     output: UiOutput,
+    cli_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, clap::ValueEnum)]
@@ -398,6 +401,7 @@ impl Ui {
             progress_indicator: false,
             formatter_factory: FormatterFactory::plain_text(),
             output: UiOutput::Null,
+            cli_name: current_cli_name(),
         }
     }
 
@@ -409,6 +413,7 @@ impl Ui {
             pager: PagerConfig::from_config(config)?,
             progress_indicator: config.get("ui.progress-indicator")?,
             output: UiOutput::new_terminal(),
+            cli_name: current_cli_name(),
         })
     }
 
@@ -504,8 +509,15 @@ impl Ui {
     }
 
     /// Creates a formatter for the locked stderr stream.
+    ///
+    /// Every hint, warning, and error goes through here, so this is where the
+    /// text that names the binary is made to name the one that is running.
+    /// Stdout is left alone: it carries the command's output, not advice about
+    /// what to run next.
     pub fn stderr_formatter(&self) -> Box<dyn Formatter + '_> {
-        for_outputs!(UiStderr, self.stderr(), w => self.new_formatter(w))
+        for_outputs!(UiStderr, self.stderr(), w => {
+            self.new_formatter(CliNameWriter::new(w, &self.cli_name))
+        })
     }
 
     /// Stderr stream to be attached to a child process.
