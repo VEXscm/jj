@@ -284,11 +284,11 @@ async fn collect_commit_delta_object_closure_with_stops(
                     }
                     None
                 }
-                TreeValue::GitSubmodule(_) => {
-                    return Err(BackendError::Unsupported(
-                        "Home trees contain an unsupported repository entry".to_string(),
-                    ));
-                }
+                // Gitlinks are ordinary member-repo content (a Git submodule
+                // pointer). Home composition does not use them; skipping them
+                // here means we do not fetch the submodule commit from this
+                // store. Nested `.git` / `.jj` metadata is still rejected.
+                TreeValue::GitSubmodule(_) => None,
             };
             if let Some(object) = object
                 && object.1 != implicit_empty
@@ -305,7 +305,10 @@ async fn collect_commit_delta_object_closure_with_stops(
 }
 
 fn reject_nested_repository_artifact(name: &str) -> BackendResult<()> {
-    if [".git", ".jj", ".gitmodules"]
+    // `.git` and `.jj` in a composed Home working copy would be nested
+    // repository metadata. `.gitmodules` is a regular file many Git member
+    // repos carry; forbidding it blocked federated Home clone of those repos.
+    if [".git", ".jj"]
         .iter()
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
     {

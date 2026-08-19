@@ -1342,7 +1342,9 @@ async fn synthesize_federated_home_base(
             .map(|component| CommitId::new(component.selected_revision.as_bytes().to_vec())),
     );
     // This walk proves every selected snapshot is an ordinary native tree and
-    // rejects gitlinks and nested repository artifacts before checkout.
+    // rejects nested `.git` / `.jj` working-copy metadata before checkout.
+    // Member snapshots may contain `.gitmodules` and gitlinks; those are Git
+    // content inside a component, not Home's composition mechanism.
     crate::vex_backend::collect_commit_object_closure(repo.store(), &selected_ids)
         .await
         .map_err(|error| federated_home_init_error(error.to_string()))?;
@@ -2824,6 +2826,43 @@ mod tests {
             message.contains("Home trees cannot contain reserved metadata `.jj`"),
             "unexpected validation error: {message}"
         );
+    }
+
+    #[test]
+    fn flat_snapshot_validation_allows_member_gitmodules_files() {
+        let settings = user_settings();
+        let (_temp_dir, repo) = init_test_vex_repo(&settings).unwrap();
+        let store = repo.store().clone();
+        let commit = async {
+            let path = repo_path("ruview/.gitmodules");
+            let file = write_test_file(
+                &store,
+                &path,
+                b"[submodule \"vendor/midstream\"]\n\tpath = vendor/midstream\n",
+            )
+            .await;
+            let mut builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+            builder
+                .set(
+                    path,
+                    TreeValue::File {
+                        id: file,
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                )
+                .unwrap();
+            let tree = builder.write_tree().await.unwrap();
+            write_test_commit(&store, store.root_commit_id().clone(), tree, 5).await
+        }
+        .block_on();
+
+        crate::vex_backend::collect_commit_object_closure(
+            &store,
+            std::slice::from_ref(commit.id()),
+        )
+        .block_on()
+        .expect("a member .gitmodules file is ordinary Git content");
     }
 
     #[test]
