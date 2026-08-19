@@ -267,6 +267,38 @@ fn test_describe_editor_env() {
 }
 
 #[test]
+fn test_describe_without_terminal() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // Tests run without a terminal, so the built-in default editor would be
+    // launched into a pipe and look like a hang to the caller.
+    let output = work_dir.run_jj(["describe"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: No terminal available to open an editor for the description
+    Hint: Pass the description with -m/--message instead.
+    Hint: Or set $EDITOR (or ui.editor) to an editor that does not need a terminal.
+    [EOF]
+    [exit status: 1]
+    ");
+
+    // An editor the user configured is still launched without a terminal.
+    let output = work_dir
+        .run_jj_with(|cmd| cmd.arg("describe").env("EDITOR", "this-editor-does-not-exist"));
+    insta::assert_snapshot!(
+        output.normalize_stderr_with(|s| s.split_inclusive('\n').take(3).collect()), @"
+    ------- stderr -------
+    Error: Failed to edit description
+    Caused by:
+    1: Failed to run editor 'this-editor-does-not-exist'
+    [EOF]
+    [exit status: 1]
+    ");
+}
+
+#[test]
 fn test_describe_no_matching_revisions() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();

@@ -46,6 +46,25 @@ fn get_recorded_dates(work_dir: &TestWorkDir, revset: &str) -> CommandOutput {
 }
 
 #[test]
+fn test_split_without_terminal() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("file1", "foo");
+    work_dir.write_file("file2", "foo");
+
+    let output = work_dir.run_jj(["split", "file1"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: No terminal available to open an editor for the description
+    Hint: Pass the description with -m/--message instead.
+    Hint: Or set $EDITOR (or ui.editor) to an editor that does not need a terminal.
+    [EOF]
+    [exit status: 1]
+    ");
+}
+
+#[test]
 fn test_split_by_paths() -> TestResult {
     let mut test_env = TestEnvironment::default();
     let edit_script = test_env.set_up_fake_editor();

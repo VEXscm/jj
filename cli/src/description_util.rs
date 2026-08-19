@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::commit_builder::DetachedCommitBuilder;
 use jj_lib::config::ConfigGetError;
+use jj_lib::config::ConfigSource;
 use jj_lib::file_util::IoResultExt as _;
 use jj_lib::file_util::PathError;
 use jj_lib::settings::UserSettings;
@@ -72,12 +74,43 @@ impl TempTextEditError {
 #[derive(Clone, Debug)]
 pub struct TextEditor {
     editor: CommandNameAndArgs,
+    /// Whether `ui.editor` was chosen by the user rather than defaulted.
+    configured: bool,
 }
 
 impl TextEditor {
     pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
         let editor = settings.get("ui.editor")?;
-        Ok(Self { editor })
+        let configured = settings
+            .config()
+            .layers()
+            .iter()
+            .filter(|layer| layer.source != ConfigSource::Default)
+            .any(|layer| matches!(layer.look_up_item("ui.editor"), Ok(Some(_))));
+        Ok(Self { editor, configured })
+    }
+
+    /// Fails instead of opening the editor when there is nowhere to run it.
+    ///
+    /// A terminal editor launched into a pipe does not fail: it paints its UI
+    /// into the pipe and waits for keystrokes that never arrive. Every caller
+    /// that is not a terminal -- agents, scripts, CI -- sees that as a hang
+    /// followed by a screenful of escape sequences, and has to guess whether
+    /// the command half-happened.
+    ///
+    /// An editor the user configured is still honoured, because `EDITOR=true`
+    /// is the established way to say "no editor" and a configured command need
+    /// not be interactive at all.
+    fn require_terminal(&self) -> Result<(), CommandError> {
+        if self.configured || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
+            return Ok(());
+        }
+        let mut err = user_error("No terminal available to open an editor for the description");
+        err.extend_hints([
+            "Pass the description with -m/--message instead.".to_owned(),
+            "Or set $EDITOR (or ui.editor) to an editor that does not need a terminal.".to_owned(),
+        ]);
+        Err(err)
     }
 
     /// Opens the given `path` in editor.
@@ -167,6 +200,8 @@ where
 }
 
 pub fn edit_description(editor: &TextEditor, description: &str) -> Result<String, CommandError> {
+    editor.require_terminal()?;
+
     let mut description = description.to_owned();
     append_blank_line(&mut description);
     description.push_str("JJ: Lines starting with \"JJ:\" (like this one) will be removed.\n");
@@ -185,6 +220,8 @@ pub fn edit_multiple_descriptions(
     tx: &WorkspaceCommandTransaction,
     commits: &[(&CommitId, Commit)],
 ) -> Result<ParsedBulkEditMessage<CommitId>, CommandError> {
+    editor.require_terminal()?;
+
     let mut commits_map = IndexMap::new();
     let mut bulk_message = String::new();
 

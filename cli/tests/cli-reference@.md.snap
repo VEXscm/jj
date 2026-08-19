@@ -129,6 +129,7 @@ This document contains the help content for the `jj` command-line program.
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
 * [`jj workspace forget`↴](#jj-workspace-forget)
+* [`jj workspace gc`↴](#jj-workspace-gc)
 * [`jj workspace list`↴](#jj-workspace-list)
 * [`jj workspace rename`↴](#jj-workspace-rename)
 * [`jj workspace root`↴](#jj-workspace-root)
@@ -3145,6 +3146,9 @@ close the editor, your revision will be split into two commits.
 [diff editor]:
     https://docs.jj-vcs.dev/latest/config/#editing-diffs
 
+Pass `-m` to describe the selected changes on the command line instead of
+being asked for a description in an editor.
+
 By default, the selected changes stay in the original commit, and the
 remaining changes go into a new child commit:
 
@@ -3201,6 +3205,12 @@ achieved with `jj new`.
 
 ###### **Options:**
 
+* `-m`, `--message <MESSAGE>` — The change description to use for the selected changes (don't open editor)
+
+   Sets the description for the revision containing the selected changes. The other revision will keep its original description, if any.
+* `--editor` — Open an editor to edit the change description(s)
+
+   Forces an editor to open when using `--message` to allow the message to be edited afterward.
 * `-i`, `--interactive` — Interactively choose which parts to split
 
    This is the default if no filesets are provided.
@@ -3217,12 +3227,6 @@ achieved with `jj new`.
 * `-B`, `--insert-before <REVSETS>` [alias: `before`] — The revision(s) to insert before (can be repeated to create a merge commit)
 
    Extracts the selected changes into a new commit inserted before the given revision(s). The remaining changes stay in the original commit's location.
-* `-m`, `--message <MESSAGE>` — The change description to use for the selected changes (don't open editor)
-
-   Sets the description for the revision containing the selected changes. The other revision will keep its original description, if any.
-* `--editor` — Open an editor to edit the change description(s)
-
-   Forces an editor to open when using `--message` to allow the message to be edited afterward.
 * `-p`, `--parallel` — Split the revision into two parallel revisions instead of a parent and child
 
 
@@ -3712,6 +3716,7 @@ Each workspace also has own sparse patterns.
 
 * `add` — Add a workspace
 * `forget` — Stop tracking a workspace's working-copy commit in the repo
+* `gc` — Remove stale, empty working-copy commits from no-longer-used workspaces
 * `list` — List workspaces
 * `rename` — Renames the current workspace
 * `root` — Show the workspace root directory
@@ -3768,6 +3773,19 @@ The workspace will not be touched on disk. It can be deleted from disk before or
 ###### **Arguments:**
 
 * `<WORKSPACES>` — Names of the workspaces to forget. By default, forgets only the current workspace
+
+
+
+## `jj workspace gc`
+
+Remove stale, empty working-copy commits from no-longer-used workspaces
+
+**Usage:** `jj workspace gc [OPTIONS]`
+
+###### **Options:**
+
+* `--older-than <DURATION>` — Only clean workspaces older than this duration (for example, 30d, 24h, or 60m)
+* `--dry-run` — Show which workspaces would be cleaned without changing anything
 
 
 

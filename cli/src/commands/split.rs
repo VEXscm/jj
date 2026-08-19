@@ -58,6 +58,9 @@ use crate::ui::Ui;
 /// [diff editor]:
 ///     https://docs.jj-vcs.dev/latest/config/#editing-diffs
 ///
+/// Pass `-m` to describe the selected changes on the command line instead of
+/// being asked for a description in an editor.
+///
 /// By default, the selected changes stay in the original commit, and the
 /// remaining changes go into a new child commit:
 ///
@@ -108,6 +111,21 @@ use crate::ui::Ui;
 #[derive(clap::Args, Clone, Debug)]
 #[command(verbatim_doc_comment)]
 pub(crate) struct SplitArgs {
+    /// The change description to use for the selected changes (don't open
+    /// editor)
+    ///
+    /// Sets the description for the revision containing the selected changes.
+    /// The other revision will keep its original description, if any.
+    #[arg(long = "message", short, value_name = "MESSAGE")]
+    message_paragraphs: Option<Vec<String>>,
+
+    /// Open an editor to edit the change description(s)
+    ///
+    /// Forces an editor to open when using `--message` to allow the message to
+    /// be edited afterward.
+    #[arg(long)]
+    editor: bool,
+
     /// Interactively choose which parts to split
     ///
     /// This is the default if no filesets are provided.
@@ -172,21 +190,6 @@ pub(crate) struct SplitArgs {
     )]
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_mutable))]
     insert_before: Option<Vec<RevisionArg>>,
-
-    /// The change description to use for the selected changes (don't open
-    /// editor)
-    ///
-    /// Sets the description for the revision containing the selected changes.
-    /// The other revision will keep its original description, if any.
-    #[arg(long = "message", short, value_name = "MESSAGE")]
-    message_paragraphs: Option<Vec<String>>,
-
-    /// Open an editor to edit the change description(s)
-    ///
-    /// Forces an editor to open when using `--message` to allow the message to
-    /// be edited afterward.
-    #[arg(long)]
-    editor: bool,
 
     /// Split the revision into two parallel revisions instead of a parent and
     /// child
