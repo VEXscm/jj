@@ -145,7 +145,14 @@ fn rewrite_line<'a>(line: &'a str, cli_name: &str) -> Cow<'a, str> {
 fn opens_command(bytes: &[u8], start: usize, end: usize) -> bool {
     let opened = match start.checked_sub(1) {
         None => true,
-        Some(before) => COMMAND_OPENERS.contains(&bytes[before]),
+        Some(before) => {
+            COMMAND_OPENERS.contains(&bytes[before])
+                // An indented bare command is the other way the CLI offers one
+                // to run: the conflict hint prints "  jj new <change-id>". Only
+                // leading indentation counts — a space anywhere else would make
+                // "the jj repo" a command too.
+                || bytes[..=before].iter().all(u8::is_ascii_whitespace)
+        }
     };
     let takes_argument = bytes.get(end) == Some(&b' ')
         && bytes
@@ -182,6 +189,24 @@ mod tests {
             rewrite("jj currently does not support partial clones."),
             "vex currently does not support partial clones."
         );
+    }
+
+    #[test]
+    fn renames_an_indented_command_the_hint_offers() {
+        // The conflict hint indents the command it wants you to run, so `jj`
+        // is neither at the line start nor after a quote.
+        assert_eq!(rewrite("  jj new tllrstvx"), "  vex new tllrstvx");
+        assert_eq!(rewrite("\tjj squash -m 'x'"), "\tvex squash -m 'x'");
+    }
+
+    #[test]
+    fn leaves_a_mid_sentence_mention_alone() {
+        // Indentation opens a command; a space on its own must not.
+        assert_eq!(
+            rewrite("  the jj repo is at that path"),
+            "  the jj repo is at that path"
+        );
+        assert_eq!(rewrite("Cloned the jj fork"), "Cloned the jj fork");
     }
 
     #[test]
